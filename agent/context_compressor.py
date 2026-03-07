@@ -21,7 +21,10 @@ logger = logging.getLogger(__name__)
 class ContextCompressor:
     """Compresses conversation context when approaching the model's context limit.
 
-    Algorithm: protect first N + last N turns, summarize everything in between.
+    Supports two-tier hybrid compression:
+    1. Sliding window (70% threshold): keep last N turns, drop older turns
+    2. LLM summarization (85% threshold): protect first N + last N, summarize middle
+
     Token tracking uses actual counts from API responses for accuracy.
     """
 
@@ -34,16 +37,23 @@ class ContextCompressor:
         summary_target_tokens: int = 2500,
         quiet_mode: bool = False,
         summary_model_override: str = None,
+        strategy: str = "hybrid",
+        window_size: int = 10,
+        sliding_window_threshold_percent: float = 0.70,
     ):
         self.model = model
         self.threshold_percent = threshold_percent
+        self.sliding_window_threshold_percent = sliding_window_threshold_percent
         self.protect_first_n = protect_first_n
         self.protect_last_n = protect_last_n
         self.summary_target_tokens = summary_target_tokens
         self.quiet_mode = quiet_mode
+        self.strategy = strategy
+        self.window_size = window_size
 
         self.context_length = get_model_context_length(model)
         self.threshold_tokens = int(self.context_length * threshold_percent)
+        self.sliding_window_threshold_tokens = int(self.context_length * sliding_window_threshold_percent)
         self.compression_count = 0
 
         self.last_prompt_tokens = 0
@@ -193,11 +203,82 @@ Write only the summary, starting with "[CONTEXT SUMMARY]:" prefix."""
             logger.debug("Could not build fallback auxiliary client: %s", exc)
             return None, None
 
-    def compress(self, messages: List[Dict[str, Any]], current_tokens: int = None) -> List[Dict[str, Any]]:
-        """Compress conversation messages by summarizing middle turns.
+    def compress_sliding_window(self, messages: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
+        """Compress by keeping only the last N non-system messages plus all system messages.
 
-        Keeps first N + last N turns, summarizes everything in between.
+        This is a free compression (no LLM call). Returns early if insufficient messages.
         """
+        system_messages = [m for m in messages if m.get("role") == "system"]
+        non_system_messages = [m for m in messages if m.get("role") != "system"]
+
+        if len(non_system_messages) <= self.window_size:
+            # Not enough messages to compress
+            return messages
+
+        # Keep all system messages + last window_size non-system messages
+        kept_non_system = non_system_messages[-self.window_size:]
+        compressed = system_messages + kept_non_system
+
+        if not self.quiet_mode:
+            print(f"\n📦 Sliding window compression triggered")
+            print(f"   🪟 Kept last {len(kept_non_system)} messages (window_size={self.window_size})")
+            print(f"   ✂️  Compressed: {len(messages)} → {len(compressed)} messages")
+
+        self.compression_count += 1
+        return compressed
+
+    def compress(self, messages: List[Dict[str, Any]], current_tokens: int = None) -> List[Dict[str, Any]]:
+        """Compress conversation messages using hybrid strategy.
+
+        For strategy='hybrid' (default):
+        1. At 70% threshold: try sliding window first (free, fast)
+        2. At 85% threshold: fall back to LLM summarization (first N + last N protected)
+
+        For strategy='sliding_window': only use sliding window.
+        For strategy='summarization': only use LLM summarization.
+        """
+        display_tokens = current_tokens if current_tokens else self.last_prompt_tokens or estimate_messages_tokens_rough(messages)
+
+        # Dispatch based on strategy
+        if self.strategy == "hybrid":
+            return self._compress_hybrid(messages, display_tokens)
+        elif self.strategy == "sliding_window":
+            return self.compress_sliding_window(messages)
+        elif self.strategy == "summarization":
+            return self._compress_summarization(messages, display_tokens)
+        else:
+            logger.warning(f"Unknown compression strategy '{self.strategy}', falling back to hybrid")
+            return self._compress_hybrid(messages, display_tokens)
+
+    def _compress_hybrid(self, messages: List[Dict[str, Any]], display_tokens: int) -> List[Dict[str, Any]]:
+        """Two-tier hybrid compression: sliding window at 70%, then LLM summarization at 85%."""
+        # Tier 1: At 70% threshold, try sliding window compression (free)
+        if display_tokens >= self.sliding_window_threshold_tokens:
+            if not self.quiet_mode:
+                print(f"\n📦 Context compression triggered ({display_tokens:,} tokens ≥ {self.sliding_window_threshold_tokens:,} sliding window threshold)")
+                print(f"   📊 Model context limit: {self.context_length:,} tokens")
+
+            compressed = self.compress_sliding_window(messages)
+
+            # Check if sliding window was sufficient
+            new_tokens = estimate_messages_tokens_rough(compressed)
+            if new_tokens < self.threshold_tokens:
+                if not self.quiet_mode:
+                    print(f"   ✅ Sliding window sufficient. Now at {new_tokens:,} tokens (below {self.threshold_tokens:,} threshold)")
+                return compressed
+
+            if not self.quiet_mode:
+                print(f"   ⚠️  Sliding window reduced to {new_tokens:,} tokens, still above {self.threshold_tokens:,} threshold")
+                print(f"   🗜️  Falling back to LLM summarization as second tier...")
+
+            # Tier 2: Sliding window alone wasn't enough, try LLM summarization
+            return self._compress_summarization(compressed, new_tokens)
+
+        # Below 70% threshold, no compression needed
+        return messages
+
+    def _compress_summarization(self, messages: List[Dict[str, Any]], display_tokens: int) -> List[Dict[str, Any]]:
+        """LLM-based compression: protect first N + last N, summarize middle."""
         n_messages = len(messages)
         if n_messages <= self.protect_first_n + self.protect_last_n + 1:
             if not self.quiet_mode:
@@ -210,7 +291,6 @@ Write only the summary, starting with "[CONTEXT SUMMARY]:" prefix."""
             return messages
 
         turns_to_summarize = messages[compress_start:compress_end]
-        display_tokens = current_tokens if current_tokens else self.last_prompt_tokens or estimate_messages_tokens_rough(messages)
 
         if not self.quiet_mode:
             print(f"\n📦 Context compression triggered ({display_tokens:,} tokens ≥ {self.threshold_tokens:,} threshold)")

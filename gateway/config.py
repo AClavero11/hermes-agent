@@ -131,25 +131,29 @@ class PlatformConfig:
 class GatewayConfig:
     """
     Main gateway configuration.
-    
+
     Manages all platform connections, session policies, and delivery settings.
     """
     # Platform configurations
     platforms: Dict[Platform, PlatformConfig] = field(default_factory=dict)
-    
+
     # Session reset policies by type
     default_reset_policy: SessionResetPolicy = field(default_factory=SessionResetPolicy)
     reset_by_type: Dict[str, SessionResetPolicy] = field(default_factory=dict)
     reset_by_platform: Dict[Platform, SessionResetPolicy] = field(default_factory=dict)
-    
+
     # Reset trigger commands
     reset_triggers: List[str] = field(default_factory=lambda: ["/new", "/reset"])
-    
+
     # Storage paths
     sessions_dir: Path = field(default_factory=lambda: Path.home() / ".hermes" / "sessions")
-    
+
     # Delivery settings
     always_log_local: bool = True  # Always save cron outputs to local files
+
+    # Heartbeat scheduler settings
+    heartbeat_enabled: bool = True
+    heartbeat_interval: int = 60  # Seconds between ticks
     
     def get_connected_platforms(self) -> List[Platform]:
         """Return list of platforms that are enabled and configured."""
@@ -201,6 +205,8 @@ class GatewayConfig:
             "reset_triggers": self.reset_triggers,
             "sessions_dir": str(self.sessions_dir),
             "always_log_local": self.always_log_local,
+            "heartbeat_enabled": self.heartbeat_enabled,
+            "heartbeat_interval": self.heartbeat_interval,
         }
     
     @classmethod
@@ -241,6 +247,8 @@ class GatewayConfig:
             reset_triggers=data.get("reset_triggers", ["/new", "/reset"]),
             sessions_dir=sessions_dir,
             always_log_local=data.get("always_log_local", True),
+            heartbeat_enabled=data.get("heartbeat_enabled", True),
+            heartbeat_interval=data.get("heartbeat_interval", 60),
         )
 
 

@@ -95,6 +95,7 @@ from agent.trajectory import (
     convert_scratchpad_to_think, has_incomplete_scratchpad,
     save_trajectory as _save_trajectory_to_file,
 )
+from agent.model_router import ModelRouter
 
 
 class AIAgent:
@@ -251,7 +252,10 @@ class AIAgent:
         is_claude = "claude" in self.model.lower()
         self._use_prompt_caching = is_openrouter and is_claude
         self._cache_ttl = "5m"  # Default 5-minute TTL (1.25x write cost)
-        
+
+        # Initialize model router for task-based model selection
+        self.model_router = ModelRouter()
+
         # Persistent error log -- always writes WARNING+ to ~/.hermes/logs/errors.log
         # so tool failures, API errors, etc. are inspectable after the fact.
         from agent.redact import RedactingFormatter
@@ -357,9 +361,13 @@ class AIAgent:
                     print(f"🔑 Using API key: {key_used[:8]}...{key_used[-4:]}")
                 else:
                     print(f"⚠️  Warning: API key appears invalid or missing (got: '{key_used[:20] if key_used else 'none'}...')")
+
+                # Log prompt caching status
+                if self._use_prompt_caching:
+                    print(f"💾 Prompt caching enabled (Anthropic beta, TTL: {self._cache_ttl}) - ~75% input token savings on multi-turn")
         except Exception as e:
             raise RuntimeError(f"Failed to initialize OpenAI client: {e}")
-        
+
         # Get available tools with filtering
         self.tools = get_tool_definitions(
             enabled_toolsets=enabled_toolsets,
@@ -527,7 +535,10 @@ class AIAgent:
         compression_threshold = float(os.getenv("CONTEXT_COMPRESSION_THRESHOLD", "0.85"))
         compression_enabled = os.getenv("CONTEXT_COMPRESSION_ENABLED", "true").lower() in ("true", "1", "yes")
         compression_summary_model = os.getenv("CONTEXT_COMPRESSION_MODEL") or None
-        
+        compression_strategy = os.getenv("CONTEXT_COMPRESSION_STRATEGY", "hybrid")
+        compression_window_size = int(os.getenv("CONTEXT_COMPRESSION_WINDOW_SIZE", "10"))
+        compression_sliding_threshold = float(os.getenv("CONTEXT_COMPRESSION_SLIDING_WINDOW_THRESHOLD", "0.70"))
+
         self.context_compressor = ContextCompressor(
             model=self.model,
             threshold_percent=compression_threshold,
@@ -536,6 +547,9 @@ class AIAgent:
             summary_target_tokens=500,
             summary_model_override=compression_summary_model,
             quiet_mode=self.quiet_mode,
+            strategy=compression_strategy,
+            window_size=compression_window_size,
+            sliding_window_threshold_percent=compression_sliding_threshold,
         )
         self.compression_enabled = compression_enabled
         self._user_turn_count = 0
@@ -2056,7 +2070,14 @@ class AIAgent:
         return result["response"]
 
     def _build_api_kwargs(self, api_messages: list) -> dict:
-        """Build the keyword arguments dict for the active API mode."""
+        """Build the keyword arguments dict for the active API mode.
+
+        Uses model_router to select the best model for the task based on
+        conversation context before building kwargs.
+        """
+        # Route model based on task classification
+        routed_model = self.model_router.route_messages(api_messages)
+
         if self.api_mode == "codex_responses":
             instructions = ""
             payload_messages = api_messages
@@ -2076,7 +2097,7 @@ class AIAgent:
                     reasoning_effort = self.reasoning_config["effort"]
 
             kwargs = {
-                "model": self.model,
+                "model": routed_model,
                 "instructions": instructions,
                 "input": self._chat_messages_to_responses_input(payload_messages),
                 "tools": self._responses_tools(),
@@ -2109,7 +2130,7 @@ class AIAgent:
             provider_preferences["data_collection"] = self.provider_data_collection
 
         api_kwargs = {
-            "model": self.model,
+            "model": routed_model,
             "messages": api_messages,
             "tools": self.tools if self.tools else None,
             "timeout": 900.0,
@@ -2142,6 +2163,14 @@ class AIAgent:
 
         if extra_body:
             api_kwargs["extra_body"] = extra_body
+
+        # Anthropic prompt caching: add beta header for LiteLLM to pass through
+        # to Anthropic's native API. Cache control markers are already in messages
+        # from apply_anthropic_cache_control() call in run_conversation().
+        if self._use_prompt_caching:
+            if "headers" not in api_kwargs:
+                api_kwargs["headers"] = {}
+            api_kwargs["headers"]["anthropic-beta"] = "prompt-caching-2024-07-31"
 
         return api_kwargs
 
@@ -2714,6 +2743,21 @@ class AIAgent:
 
                 summary_response = self.client.chat.completions.create(**summary_kwargs)
 
+                # Log summarization cost
+                if self._session_db and hasattr(summary_response, 'usage') and summary_response.usage:
+                    try:
+                        sum_input = getattr(summary_response.usage, 'prompt_tokens', 0) or 0
+                        sum_output = getattr(summary_response.usage, 'completion_tokens', 0) or 0
+                        self._session_db.log_cost(
+                            session_id=self.session_id,
+                            model=self.model,
+                            input_tokens=sum_input,
+                            output_tokens=sum_output,
+                            workflow="summarization",
+                        )
+                    except Exception as e:
+                        logger.debug(f"Failed to log summarization cost: {e}")
+
                 if summary_response.choices and summary_response.choices[0].message.content:
                     final_response = summary_response.choices[0].message.content
                 else:
@@ -2745,6 +2789,21 @@ class AIAgent:
                         summary_kwargs["extra_body"] = summary_extra_body
 
                     summary_response = self.client.chat.completions.create(**summary_kwargs)
+
+                    # Log retry summarization cost
+                    if self._session_db and hasattr(summary_response, 'usage') and summary_response.usage:
+                        try:
+                            sum_input = getattr(summary_response.usage, 'prompt_tokens', 0) or 0
+                            sum_output = getattr(summary_response.usage, 'completion_tokens', 0) or 0
+                            self._session_db.log_cost(
+                                session_id=self.session_id,
+                                model=self.model,
+                                input_tokens=sum_input,
+                                output_tokens=sum_output,
+                                workflow="summarization_retry",
+                            )
+                        except Exception as e:
+                            logger.debug(f"Failed to log retry summarization cost: {e}")
 
                     if summary_response.choices and summary_response.choices[0].message.content:
                         final_response = summary_response.choices[0].message.content
@@ -3008,6 +3067,8 @@ class AIAgent:
             # input token costs by ~75% on multi-turn conversations.
             if self._use_prompt_caching:
                 api_messages = apply_anthropic_cache_control(api_messages, cache_ttl=self._cache_ttl)
+                if self.verbose_logging:
+                    logger.debug(f"Anthropic prompt caching enabled: {len(api_messages)} messages with cache_control markers (TTL: {self._cache_ttl})")
             
             # Calculate approximate request size for logging
             total_chars = sum(len(str(msg)) for msg in api_messages)
@@ -3237,10 +3298,29 @@ class AIAgent:
                         self.session_completion_tokens += completion_tokens
                         self.session_total_tokens += total_tokens
                         self.session_api_calls += 1
-                        
+
                         if self.verbose_logging:
                             logging.debug(f"Token usage: prompt={usage_dict['prompt_tokens']:,}, completion={usage_dict['completion_tokens']:,}, total={usage_dict['total_tokens']:,}")
-                        
+
+                        # Log cost to database if session DB is available
+                        if self._session_db:
+                            try:
+                                cache_read = getattr(getattr(response.usage, 'prompt_tokens_details', None), 'cached_tokens', 0) or 0
+                                cache_creation = getattr(getattr(response.usage, 'completion_tokens_details', None), 'cache_creation_input_tokens', 0) or 0
+                                latency_ms = int((time.time() - api_start_time) * 1000) if 'api_start_time' in locals() else None
+                                self._session_db.log_cost(
+                                    session_id=self.session_id,
+                                    model=self.model,
+                                    input_tokens=prompt_tokens,
+                                    output_tokens=completion_tokens,
+                                    cache_read_tokens=cache_read,
+                                    cache_creation_tokens=cache_creation,
+                                    latency_ms=latency_ms,
+                                    workflow="main_loop",
+                                )
+                            except Exception as e:
+                                logger.debug(f"Failed to log cost: {e}")
+
                         # Log cache hit stats when prompt caching is active
                         if self._use_prompt_caching:
                             details = getattr(response.usage, 'prompt_tokens_details', None)

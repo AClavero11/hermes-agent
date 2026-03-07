@@ -24,7 +24,26 @@ from typing import Dict, Any, List, Optional
 
 DEFAULT_DB_PATH = Path(os.getenv("HERMES_HOME", Path.home() / ".hermes")) / "state.db"
 
-SCHEMA_VERSION = 2
+SCHEMA_VERSION = 5
+
+# Cost per model: input and output rates per 1M tokens (USD)
+COST_PER_MODEL = {
+    "claude-opus-4": {"input": 15.00, "output": 75.00},
+    "claude-opus-4-20250805": {"input": 15.00, "output": 75.00},
+    "claude-sonnet-4": {"input": 3.00, "output": 15.00},
+    "claude-sonnet-4-20250514": {"input": 3.00, "output": 15.00},
+    "claude-haiku-4-5": {"input": 0.80, "output": 4.00},
+    "claude-haiku-4-5-20251001": {"input": 0.80, "output": 4.00},
+    # OpenAI models (via openrouter)
+    "o1": {"input": 15.00, "output": 60.00},
+    "gpt-4": {"input": 0.03, "output": 0.06},
+    "gpt-4-turbo": {"input": 0.01, "output": 0.03},
+    "gpt-3.5-turbo": {"input": 0.0005, "output": 0.0015},
+    # Nous models
+    "nous-hermes-2-mixtral-8x7b-dpo": {"input": 0.54, "output": 0.81},
+    "nous-hermes-2-vision": {"input": 0.54, "output": 0.81},
+    "nous-hermes-2": {"input": 0.30, "output": 0.40},
+}
 
 SCHEMA_SQL = """
 CREATE TABLE IF NOT EXISTS schema_version (
@@ -62,10 +81,57 @@ CREATE TABLE IF NOT EXISTS messages (
     finish_reason TEXT
 );
 
+CREATE TABLE IF NOT EXISTS cost_log (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    timestamp REAL NOT NULL,
+    session_id TEXT NOT NULL REFERENCES sessions(id),
+    model TEXT NOT NULL,
+    workflow TEXT,
+    input_tokens INTEGER DEFAULT 0,
+    output_tokens INTEGER DEFAULT 0,
+    cache_read_tokens INTEGER DEFAULT 0,
+    cache_creation_tokens INTEGER DEFAULT 0,
+    cost_usd REAL NOT NULL,
+    latency_ms INTEGER
+);
+
 CREATE INDEX IF NOT EXISTS idx_sessions_source ON sessions(source);
 CREATE INDEX IF NOT EXISTS idx_sessions_parent ON sessions(parent_session_id);
 CREATE INDEX IF NOT EXISTS idx_sessions_started ON sessions(started_at DESC);
 CREATE INDEX IF NOT EXISTS idx_messages_session ON messages(session_id, timestamp);
+CREATE INDEX IF NOT EXISTS idx_cost_log_session ON cost_log(session_id, timestamp);
+CREATE INDEX IF NOT EXISTS idx_cost_log_timestamp ON cost_log(timestamp DESC);
+
+CREATE TABLE IF NOT EXISTS batch_queue (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    batch_id TEXT NOT NULL UNIQUE,
+    workflow_name TEXT NOT NULL,
+    model TEXT NOT NULL,
+    status TEXT NOT NULL DEFAULT 'pending',
+    submitted_at REAL NOT NULL,
+    completed_at REAL,
+    result_summary TEXT,
+    metadata TEXT
+);
+
+CREATE INDEX IF NOT EXISTS idx_batch_queue_status ON batch_queue(status);
+CREATE INDEX IF NOT EXISTS idx_batch_queue_submitted ON batch_queue(submitted_at DESC);
+
+CREATE TABLE IF NOT EXISTS tool_sequences (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    sequence_hash TEXT NOT NULL UNIQUE,
+    tool_names TEXT NOT NULL,
+    occurrence_count INTEGER DEFAULT 1,
+    session_ids TEXT NOT NULL DEFAULT '[]',
+    sample_args TEXT NOT NULL DEFAULT '[]',
+    first_seen REAL NOT NULL,
+    last_seen REAL NOT NULL,
+    crystallized INTEGER DEFAULT 0,
+    generated_tool_path TEXT
+);
+
+CREATE UNIQUE INDEX IF NOT EXISTS idx_tool_seq_hash ON tool_sequences(sequence_hash);
+CREATE INDEX IF NOT EXISTS idx_tool_seq_count ON tool_sequences(occurrence_count DESC);
 """
 
 FTS_SQL = """
@@ -133,6 +199,72 @@ class SessionDB:
                 except sqlite3.OperationalError:
                     pass  # Column already exists
                 cursor.execute("UPDATE schema_version SET version = 2")
+            if current_version < 3:
+                # v3: add cost_log table with cache tracking
+                try:
+                    cursor.execute("""
+                        CREATE TABLE IF NOT EXISTS cost_log (
+                            id INTEGER PRIMARY KEY AUTOINCREMENT,
+                            timestamp REAL NOT NULL,
+                            session_id TEXT NOT NULL REFERENCES sessions(id),
+                            model TEXT NOT NULL,
+                            workflow TEXT,
+                            input_tokens INTEGER DEFAULT 0,
+                            output_tokens INTEGER DEFAULT 0,
+                            cache_read_tokens INTEGER DEFAULT 0,
+                            cache_creation_tokens INTEGER DEFAULT 0,
+                            cost_usd REAL NOT NULL,
+                            latency_ms INTEGER
+                        )
+                    """)
+                    cursor.execute("CREATE INDEX IF NOT EXISTS idx_cost_log_session ON cost_log(session_id, timestamp)")
+                    cursor.execute("CREATE INDEX IF NOT EXISTS idx_cost_log_timestamp ON cost_log(timestamp DESC)")
+                except sqlite3.OperationalError:
+                    pass  # Table already exists
+                cursor.execute("UPDATE schema_version SET version = 3")
+            if current_version < 4:
+                # v4: add batch_queue table for Anthropic Batches API
+                try:
+                    cursor.execute("""
+                        CREATE TABLE IF NOT EXISTS batch_queue (
+                            id INTEGER PRIMARY KEY AUTOINCREMENT,
+                            batch_id TEXT NOT NULL UNIQUE,
+                            workflow_name TEXT NOT NULL,
+                            model TEXT NOT NULL,
+                            status TEXT NOT NULL DEFAULT 'pending',
+                            submitted_at REAL NOT NULL,
+                            completed_at REAL,
+                            result_summary TEXT,
+                            metadata TEXT
+                        )
+                    """)
+                    cursor.execute("CREATE INDEX IF NOT EXISTS idx_batch_queue_status ON batch_queue(status)")
+                    cursor.execute("CREATE INDEX IF NOT EXISTS idx_batch_queue_submitted ON batch_queue(submitted_at DESC)")
+                except sqlite3.OperationalError:
+                    pass  # Table already exists
+                cursor.execute("UPDATE schema_version SET version = 4")
+            if current_version < 5:
+                # v5: add tool_sequences table for Foundry sequence detection
+                try:
+                    cursor.execute("""
+                        CREATE TABLE IF NOT EXISTS tool_sequences (
+                            id INTEGER PRIMARY KEY AUTOINCREMENT,
+                            sequence_hash TEXT NOT NULL UNIQUE,
+                            tool_names TEXT NOT NULL,
+                            occurrence_count INTEGER DEFAULT 1,
+                            session_ids TEXT NOT NULL DEFAULT '[]',
+                            sample_args TEXT NOT NULL DEFAULT '[]',
+                            first_seen REAL NOT NULL,
+                            last_seen REAL NOT NULL,
+                            crystallized INTEGER DEFAULT 0,
+                            generated_tool_path TEXT
+                        )
+                    """)
+                    cursor.execute("CREATE UNIQUE INDEX IF NOT EXISTS idx_tool_seq_hash ON tool_sequences(sequence_hash)")
+                    cursor.execute("CREATE INDEX IF NOT EXISTS idx_tool_seq_count ON tool_sequences(occurrence_count DESC)")
+                except sqlite3.OperationalError:
+                    pass  # Table already exists
+                cursor.execute("UPDATE schema_version SET version = 5")
 
 
         # FTS5 setup (separate because CREATE VIRTUAL TABLE can't be in executescript with IF NOT EXISTS reliably)
@@ -526,3 +658,220 @@ class SessionDB:
 
         self._conn.commit()
         return len(session_ids)
+
+    # =========================================================================
+    # Cost tracking
+    # =========================================================================
+
+    @staticmethod
+    def calculate_cost(
+        model: str,
+        input_tokens: int = 0,
+        output_tokens: int = 0,
+        cache_read_tokens: int = 0,
+        cache_creation_tokens: int = 0,
+    ) -> float:
+        """
+        Calculate cost in USD for a given model and token counts.
+
+        Cache tokens are typically cheaper than regular tokens:
+        - cache_read_tokens: 10% of input cost (cached content is cheaper to read)
+        - cache_creation_tokens: 25% of input cost (creating cache is cheaper than regular output)
+
+        Args:
+            model: Model identifier (exact or partial match against COST_PER_MODEL keys)
+            input_tokens: Number of input tokens
+            output_tokens: Number of output tokens
+            cache_read_tokens: Number of cached tokens read
+            cache_creation_tokens: Number of cache creation tokens
+
+        Returns:
+            Cost in USD as a float.
+        """
+        # Find matching model in COST_PER_MODEL (supports partial matches)
+        model_rates = None
+        for key, rates in COST_PER_MODEL.items():
+            if key in model or model in key:
+                model_rates = rates
+                break
+
+        if model_rates is None:
+            # Default to claude-haiku rates if model not found
+            model_rates = COST_PER_MODEL["claude-haiku-4-5"]
+
+        input_rate = model_rates.get("input", 0.80) / 1_000_000
+        output_rate = model_rates.get("output", 4.00) / 1_000_000
+
+        # Regular token cost
+        input_cost = input_tokens * input_rate
+        output_cost = output_tokens * output_rate
+
+        # Cache token cost (10% of input for reads, 25% of input for creation)
+        cache_read_cost = cache_read_tokens * (input_rate * 0.10)
+        cache_creation_cost = cache_creation_tokens * (input_rate * 0.25)
+
+        total_cost = input_cost + output_cost + cache_read_cost + cache_creation_cost
+        return round(total_cost, 6)
+
+    def log_cost(
+        self,
+        session_id: str,
+        model: str,
+        input_tokens: int = 0,
+        output_tokens: int = 0,
+        cache_read_tokens: int = 0,
+        cache_creation_tokens: int = 0,
+        latency_ms: int = None,
+        workflow: str = None,
+    ) -> int:
+        """
+        Log a single API call cost to the cost_log table.
+
+        Args:
+            session_id: Session ID for this API call
+            model: Model used
+            input_tokens: Number of input tokens
+            output_tokens: Number of output tokens
+            cache_read_tokens: Number of cached tokens read
+            cache_creation_tokens: Number of cache creation tokens
+            latency_ms: API call latency in milliseconds (optional)
+            workflow: Workflow name (optional, e.g., "main_loop", "summarization")
+
+        Returns:
+            The row ID of the inserted cost_log entry.
+        """
+        cost_usd = self.calculate_cost(
+            model=model,
+            input_tokens=input_tokens,
+            output_tokens=output_tokens,
+            cache_read_tokens=cache_read_tokens,
+            cache_creation_tokens=cache_creation_tokens,
+        )
+
+        cursor = self._conn.execute(
+            """INSERT INTO cost_log
+               (timestamp, session_id, model, workflow, input_tokens, output_tokens,
+                cache_read_tokens, cache_creation_tokens, cost_usd, latency_ms)
+               VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
+            (
+                time.time(),
+                session_id,
+                model,
+                workflow,
+                input_tokens,
+                output_tokens,
+                cache_read_tokens,
+                cache_creation_tokens,
+                cost_usd,
+                latency_ms,
+            ),
+        )
+        cost_id = cursor.lastrowid
+        self._conn.commit()
+        return cost_id
+
+    def get_cost_summary(self, days: int = 1, session_id: str = None) -> Dict[str, Any]:
+        """
+        Get cost summary for the last N days.
+
+        Args:
+            days: Number of days to summarize (default 1 = today)
+            session_id: Optional session ID to filter by
+
+        Returns:
+            Dict with keys:
+                - total_cost_usd: Total cost in USD
+                - total_input_tokens: Sum of input tokens
+                - total_output_tokens: Sum of output tokens
+                - total_cache_read_tokens: Sum of cache read tokens
+                - total_cache_creation_tokens: Sum of cache creation tokens
+                - call_count: Number of API calls logged
+                - avg_cost_per_call: Average cost per API call
+                - models: Dict mapping model names to their cost
+                - calls_by_workflow: Dict mapping workflow names to call counts
+        """
+        cutoff = time.time() - (days * 86400)
+
+        if session_id:
+            cursor = self._conn.execute(
+                """SELECT
+                    SUM(cost_usd) as total_cost,
+                    SUM(input_tokens) as total_input,
+                    SUM(output_tokens) as total_output,
+                    SUM(cache_read_tokens) as total_cache_read,
+                    SUM(cache_creation_tokens) as total_cache_create,
+                    COUNT(*) as call_count
+                   FROM cost_log
+                   WHERE timestamp >= ? AND session_id = ?""",
+                (cutoff, session_id),
+            )
+        else:
+            cursor = self._conn.execute(
+                """SELECT
+                    SUM(cost_usd) as total_cost,
+                    SUM(input_tokens) as total_input,
+                    SUM(output_tokens) as total_output,
+                    SUM(cache_read_tokens) as total_cache_read,
+                    SUM(cache_creation_tokens) as total_cache_create,
+                    COUNT(*) as call_count
+                   FROM cost_log
+                   WHERE timestamp >= ?""",
+                (cutoff,),
+            )
+
+        row = cursor.fetchone()
+        summary = {
+            "total_cost_usd": row["total_cost"] or 0.0,
+            "total_input_tokens": row["total_input"] or 0,
+            "total_output_tokens": row["total_output"] or 0,
+            "total_cache_read_tokens": row["total_cache_read"] or 0,
+            "total_cache_creation_tokens": row["total_cache_create"] or 0,
+            "call_count": row["call_count"] or 0,
+        }
+
+        if summary["call_count"] > 0:
+            summary["avg_cost_per_call"] = round(
+                summary["total_cost_usd"] / summary["call_count"], 6
+            )
+        else:
+            summary["avg_cost_per_call"] = 0.0
+
+        # Cost by model
+        if session_id:
+            cursor = self._conn.execute(
+                """SELECT model, SUM(cost_usd) as cost
+                   FROM cost_log
+                   WHERE timestamp >= ? AND session_id = ?
+                   GROUP BY model""",
+                (cutoff, session_id),
+            )
+        else:
+            cursor = self._conn.execute(
+                """SELECT model, SUM(cost_usd) as cost
+                   FROM cost_log
+                   WHERE timestamp >= ?
+                   GROUP BY model""",
+                (cutoff,),
+            )
+        summary["models"] = {row["model"]: row["cost"] for row in cursor.fetchall()}
+
+        # Call count by workflow
+        if session_id:
+            cursor = self._conn.execute(
+                """SELECT workflow, COUNT(*) as count
+                   FROM cost_log
+                   WHERE timestamp >= ? AND session_id = ? AND workflow IS NOT NULL
+                   GROUP BY workflow""",
+                (cutoff, session_id),
+            )
+        else:
+            cursor = self._conn.execute(
+                """SELECT workflow, COUNT(*) as count
+                   FROM cost_log
+                   WHERE timestamp >= ? AND workflow IS NOT NULL
+                   GROUP BY workflow""",
+                (cutoff,),
+            )
+        summary["calls_by_workflow"] = {row["workflow"]: row["count"] for row in cursor.fetchall()}
+
+        return summary

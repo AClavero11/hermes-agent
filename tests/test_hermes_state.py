@@ -365,8 +365,109 @@ class TestSchemaInit:
         assert "sessions" in tables
         assert "messages" in tables
         assert "schema_version" in tables
+        assert "cost_log" in tables
 
     def test_schema_version(self, db):
         cursor = db._conn.execute("SELECT version FROM schema_version")
         version = cursor.fetchone()[0]
-        assert version == 2
+        assert version == 5
+
+
+# =========================================================================
+# Cost tracking
+# =========================================================================
+
+class TestCostTracking:
+    def test_calculate_cost_haiku(self, db):
+        # Haiku: $0.80 input, $4.00 output per 1M tokens
+        cost = db.calculate_cost("claude-haiku-4-5", input_tokens=1_000_000, output_tokens=1_000_000)
+        assert cost == pytest.approx(4.80, rel=0.01)
+
+    def test_calculate_cost_sonnet(self, db):
+        # Sonnet: $3.00 input, $15.00 output per 1M tokens
+        cost = db.calculate_cost("claude-sonnet-4", input_tokens=1_000_000, output_tokens=1_000_000)
+        assert cost == pytest.approx(18.00, rel=0.01)
+
+    def test_calculate_cost_with_cache(self, db):
+        # Cache tokens are discounted: 10% of input for reads, 25% of input for creation
+        cost = db.calculate_cost(
+            "claude-haiku-4-5",
+            input_tokens=1_000_000,
+            output_tokens=1_000_000,
+            cache_read_tokens=100_000,
+            cache_creation_tokens=100_000,
+        )
+        # Regular: 0.80 + 4.00 = 4.80
+        # Cache read: 100k * (0.80/1M * 0.10) = 0.008
+        # Cache creation: 100k * (0.80/1M * 0.25) = 0.020
+        expected = 4.80 + 0.008 + 0.020
+        assert cost == pytest.approx(expected, rel=0.01)
+
+    def test_log_cost(self, db):
+        db.create_session(session_id="s1", source="cli")
+        cost_id = db.log_cost(
+            session_id="s1",
+            model="claude-opus-4",
+            input_tokens=100,
+            output_tokens=50,
+            latency_ms=1234,
+            workflow="test",
+        )
+        assert cost_id > 0
+
+        # Verify it was stored
+        cursor = db._conn.execute("SELECT * FROM cost_log WHERE id = ?", (cost_id,))
+        row = dict(cursor.fetchone())
+        assert row["session_id"] == "s1"
+        assert row["model"] == "claude-opus-4"
+        assert row["input_tokens"] == 100
+        assert row["output_tokens"] == 50
+        assert row["latency_ms"] == 1234
+        assert row["workflow"] == "test"
+        assert row["cost_usd"] > 0
+
+    def test_get_cost_summary(self, db):
+        db.create_session(session_id="s1", source="cli")
+
+        # Log multiple costs
+        db.log_cost(
+            session_id="s1",
+            model="claude-haiku-4-5",
+            input_tokens=1000,
+            output_tokens=500,
+            workflow="main",
+        )
+        db.log_cost(
+            session_id="s1",
+            model="claude-opus-4",
+            input_tokens=2000,
+            output_tokens=1000,
+            workflow="summary",
+        )
+
+        summary = db.get_cost_summary(days=1)
+        assert summary["call_count"] == 2
+        assert summary["total_input_tokens"] == 3000
+        assert summary["total_output_tokens"] == 1500
+        assert summary["total_cost_usd"] > 0
+        assert "models" in summary
+        assert len(summary["models"]) == 2
+        assert "calls_by_workflow" in summary
+        assert summary["calls_by_workflow"]["main"] == 1
+        assert summary["calls_by_workflow"]["summary"] == 1
+
+    def test_get_cost_summary_by_session(self, db):
+        db.create_session(session_id="s1", source="cli")
+        db.create_session(session_id="s2", source="cli")
+
+        # Log costs for different sessions
+        db.log_cost(session_id="s1", model="claude-haiku-4-5", input_tokens=1000, output_tokens=500)
+        db.log_cost(session_id="s2", model="claude-sonnet-4", input_tokens=2000, output_tokens=1000)
+
+        summary_s1 = db.get_cost_summary(days=1, session_id="s1")
+        summary_s2 = db.get_cost_summary(days=1, session_id="s2")
+
+        assert summary_s1["call_count"] == 1
+        assert summary_s2["call_count"] == 1
+        assert "claude-haiku-4-5" in summary_s1["models"]
+        assert "claude-sonnet-4" in summary_s2["models"]

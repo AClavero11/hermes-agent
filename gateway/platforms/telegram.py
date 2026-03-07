@@ -18,6 +18,7 @@ try:
         Application,
         CommandHandler,
         MessageHandler as TelegramMessageHandler,
+        CallbackQueryHandler,
         ContextTypes,
         filters,
     )
@@ -120,7 +121,8 @@ class TelegramAdapter(BasePlatformAdapter):
                 filters.PHOTO | filters.VIDEO | filters.AUDIO | filters.VOICE | filters.Document.ALL | filters.Sticker.ALL,
                 self._handle_media_message
             ))
-            
+            self._app.add_handler(CallbackQueryHandler(self._handle_callback_query))
+
             # Start polling in background
             await self._app.initialize()
             await self._app.start()
@@ -617,7 +619,34 @@ class TelegramAdapter(BasePlatformAdapter):
                 print(f"[Telegram] Failed to cache document: {e}", flush=True)
 
         await self.handle_message(event)
-    
+
+    async def _handle_callback_query(self, update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+        """Handle inline button callbacks (e.g., ILS quote approve/reject)."""
+        query = update.callback_query
+        if not query or not query.data:
+            return
+
+        # Route ILS quote callbacks to the ILS notification handler
+        if query.data.startswith("ilsq_"):
+            try:
+                # Add hermes root to path for services import
+                _hermes_root = str(_Path(__file__).resolve().parents[2])
+                if _hermes_root not in sys.path:
+                    sys.path.insert(0, _hermes_root)
+
+                from services.ils_notifications import handle_callback
+                await handle_callback(update, context)
+            except ImportError as e:
+                print(f"[{self.name}] ILS notifications module not found: {e}", flush=True)
+                await query.answer(text="Handler not available", show_alert=True)
+            except Exception as e:
+                print(f"[{self.name}] ILS callback error: {e}", flush=True)
+                await query.answer(text=f"Error: {e}", show_alert=True)
+            return
+
+        # Unknown callback - acknowledge to remove spinner
+        await query.answer()
+
     async def _handle_sticker(self, msg: Message, event: "MessageEvent") -> None:
         """
         Describe a Telegram sticker via vision analysis, with caching.

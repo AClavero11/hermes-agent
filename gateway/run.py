@@ -84,6 +84,9 @@ if _config_path.exists():
                 "enabled": "CONTEXT_COMPRESSION_ENABLED",
                 "threshold": "CONTEXT_COMPRESSION_THRESHOLD",
                 "summary_model": "CONTEXT_COMPRESSION_MODEL",
+                "strategy": "CONTEXT_COMPRESSION_STRATEGY",
+                "window_size": "CONTEXT_COMPRESSION_WINDOW_SIZE",
+                "sliding_window_threshold": "CONTEXT_COMPRESSION_SLIDING_WINDOW_THRESHOLD",
             }
             for _cfg_key, _env_var in _compression_env_map.items():
                 if _cfg_key in _compression_cfg:
@@ -2330,55 +2333,97 @@ class GatewayRunner:
         return response
 
 
-def _start_cron_ticker(stop_event: threading.Event, adapters=None, interval: int = 60):
+def _run_ils_poll(adapters=None, main_loop=None):
+    """Poll ILS for new RFQs and process them. Runs in cron ticker thread."""
+    import sys
+    from pathlib import Path
+
+    # Ensure services directory is importable
+    services_dir = str(Path.home() / ".hermes")
+    if services_dir not in sys.path:
+        sys.path.insert(0, services_dir)
+
+    try:
+        from services.ils_auto_quote import AutoQuoteEngine
+    except ImportError as e:
+        logger.debug("ILS auto-quote not available: %s", e)
+        return
+
+    engine = AutoQuoteEngine()
+    results = engine.poll_and_process()
+
+    if not results:
+        return
+
+    # Send Telegram notifications for successful quotes
+    successful = [r for r in results if r.success]
+    if not successful:
+        return
+
+    logger.info("ILS poll: %d new quote(s) to notify", len(successful))
+
+    # Get the Telegram bot from the adapter for sending notifications
+    telegram_bot = None
+    if adapters:
+        from gateway.config import Platform
+        tg_adapter = adapters.get(Platform.TELEGRAM)
+        if tg_adapter and hasattr(tg_adapter, '_bot'):
+            telegram_bot = tg_adapter._bot
+
+    if not telegram_bot:
+        logger.warning("No Telegram bot available for ILS notifications")
+        return
+
+    if not main_loop or main_loop.is_closed():
+        logger.warning("No event loop available for ILS notifications")
+        return
+
+    import asyncio
+    from services.ils_notifications import send_quote_notification
+
+    for result in successful:
+        try:
+            future = asyncio.run_coroutine_threadsafe(
+                send_quote_notification(result, bot=telegram_bot),
+                main_loop
+            )
+            future.result(timeout=30)
+        except Exception as e:
+            logger.error("Failed to send ILS notification: %s", e)
+
+
+def _start_cron_ticker(stop_event: threading.Event, adapters=None, interval: int = 60, main_loop=None):
     """
-    Background thread that ticks the cron scheduler at a regular interval.
-    
+    Background thread that ticks the heartbeat scheduler at a regular interval.
+
     Runs inside the gateway process so cronjobs fire automatically without
     needing a separate `hermes cron daemon` or system cron entry.
 
-    Also refreshes the channel directory every 5 minutes and prunes the
-    image/audio/document cache once per hour.
+    Uses HeartbeatScheduler for config-driven task management. Includes default
+    tasks for cron ticking, channel directory refresh, ILS polling, and cache cleanup.
     """
-    from cron.scheduler import tick as cron_tick
-    from gateway.platforms.base import cleanup_image_cache, cleanup_document_cache
+    from gateway.heartbeat import HeartbeatScheduler
 
-    IMAGE_CACHE_EVERY = 60   # ticks — once per hour at default 60s interval
-    CHANNEL_DIR_EVERY = 5    # ticks — every 5 minutes
+    scheduler = HeartbeatScheduler()
 
-    logger.info("Cron ticker started (interval=%ds)", interval)
+    logger.info("Heartbeat scheduler started (interval=%ds, tasks=%d)", interval, len(scheduler.tasks))
     tick_count = 0
     while not stop_event.is_set():
         try:
-            cron_tick(verbose=False)
+            # Tick the heartbeat scheduler, passing context to handlers
+            scheduler.tick(
+                tick_count=tick_count,
+                adapters=adapters,
+                main_loop=main_loop,
+                max_age_hours=24,  # For cleanup functions
+            )
         except Exception as e:
-            logger.debug("Cron tick error: %s", e)
+            logger.error("Heartbeat tick error: %s", e, exc_info=True)
 
         tick_count += 1
-
-        if tick_count % CHANNEL_DIR_EVERY == 0 and adapters:
-            try:
-                from gateway.channel_directory import build_channel_directory
-                build_channel_directory(adapters)
-            except Exception as e:
-                logger.debug("Channel directory refresh error: %s", e)
-
-        if tick_count % IMAGE_CACHE_EVERY == 0:
-            try:
-                removed = cleanup_image_cache(max_age_hours=24)
-                if removed:
-                    logger.info("Image cache cleanup: removed %d stale file(s)", removed)
-            except Exception as e:
-                logger.debug("Image cache cleanup error: %s", e)
-            try:
-                removed = cleanup_document_cache(max_age_hours=24)
-                if removed:
-                    logger.info("Document cache cleanup: removed %d stale file(s)", removed)
-            except Exception as e:
-                logger.debug("Document cache cleanup error: %s", e)
-
         stop_event.wait(timeout=interval)
-    logger.info("Cron ticker stopped")
+
+    logger.info("Heartbeat scheduler stopped")
 
 
 async def start_gateway(config: Optional[GatewayConfig] = None) -> bool:
@@ -2441,7 +2486,7 @@ async def start_gateway(config: Optional[GatewayConfig] = None) -> bool:
     cron_thread = threading.Thread(
         target=_start_cron_ticker,
         args=(cron_stop,),
-        kwargs={"adapters": runner.adapters},
+        kwargs={"adapters": runner.adapters, "main_loop": loop},
         daemon=True,
         name="cron-ticker",
     )
