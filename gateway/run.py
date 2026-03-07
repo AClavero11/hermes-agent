@@ -201,6 +201,19 @@ class GatewayRunner:
         # DM pairing store for code-based user authorization
         from gateway.pairing import PairingStore
         self.pairing_store = PairingStore()
+
+        # Lobster workflow engine for deterministic YAML workflows
+        self._workflow_engine = None
+        try:
+            from gateway.workflow_engine import WorkflowEngine
+            self._workflow_engine = WorkflowEngine()
+            self._workflow_engine.load_all()
+            if self._workflow_engine.workflows:
+                logger.info("Loaded %d workflow(s): %s",
+                            len(self._workflow_engine.workflows),
+                            list(self._workflow_engine.workflows.keys()))
+        except Exception as e:
+            logger.debug("Workflow engine init failed (non-fatal): %s", e)
         
         # Event hook system
         from gateway.hooks import HookRegistry
@@ -885,6 +898,26 @@ class GatewayRunner:
                     )
                 message_text = f"{context_note}\n\n{message_text}"
 
+        # Lobster: check if message matches a deterministic YAML workflow
+        if self._workflow_engine and message_text:
+            try:
+                matched_workflow = self._workflow_engine.match(message_text)
+                if matched_workflow:
+                    logger.info("Workflow matched: %s for message: %s", matched_workflow.name, message_text[:50])
+                    execution = self._workflow_engine.execute(matched_workflow, context={"message": message_text})
+                    if execution.success:
+                        workflow_response = f"[Workflow: {matched_workflow.name}]\n"
+                        for step_exec in execution.steps:
+                            status = "✓" if step_exec.success else "✗"
+                            workflow_response += f"  {status} {step_exec.step.action} ({step_exec.duration_ms:.0f}ms)\n"
+                        if execution.context.get("result"):
+                            workflow_response += f"\n{execution.context['result']}"
+                        return workflow_response
+                    # If workflow failed, fall through to agent
+                    logger.warning("Workflow %s failed, falling through to agent: %s", matched_workflow.name, execution.error)
+            except Exception as e:
+                logger.debug("Workflow matching failed (non-fatal): %s", e)
+
         try:
             # Emit agent:start hook
             hook_ctx = {
@@ -894,7 +927,7 @@ class GatewayRunner:
                 "message": message_text[:500],
             }
             await self.hooks.emit("agent:start", hook_ctx)
-            
+
             # Run the agent
             agent_result = await self._run_agent(
                 message=message_text,

@@ -96,6 +96,7 @@ from agent.trajectory import (
     save_trajectory as _save_trajectory_to_file,
 )
 from agent.model_router import ModelRouter
+from agent.sequence_detector import SequenceDetector
 
 
 class AIAgent:
@@ -255,6 +256,22 @@ class AIAgent:
 
         # Initialize model router for task-based model selection
         self.model_router = ModelRouter()
+
+        # Initialize sequence detector for Foundry self-crystallizing tools
+        self._sequence_detector = None
+        try:
+            self._sequence_detector = SequenceDetector()
+        except Exception as e:
+            logger.debug("Sequence detector init failed (non-fatal): %s", e)
+
+        # Initialize tiered memory retriever for system prompt enrichment
+        self._memory_retriever = None
+        self._last_user_message = ""
+        try:
+            from tools.memory_retrieval import MemoryRetriever
+            self._memory_retriever = MemoryRetriever()
+        except Exception as e:
+            logger.debug("Memory retriever init failed (non-fatal): %s", e)
 
         # Persistent error log -- always writes WARNING+ to ~/.hermes/logs/errors.log
         # so tool failures, API errors, etc. are inspectable after the fact.
@@ -1363,6 +1380,19 @@ class AIAgent:
                 user_block = self._memory_store.format_for_system_prompt("user")
                 if user_block:
                     prompt_parts.append(user_block)
+
+        # Inject tiered memory retrieval (semantic/episodic/procedural)
+        if self._memory_retriever and self._last_user_message:
+            try:
+                from tools.memory_retrieval import format_memory_context
+                memories = self._memory_retriever.retrieve_relevant_memories(
+                    self._last_user_message, top_k=3
+                )
+                mem_context = format_memory_context(memories)
+                if mem_context:
+                    prompt_parts.append(mem_context)
+            except Exception as e:
+                logger.debug("Tiered memory retrieval failed (non-fatal): %s", e)
 
         has_skills_tools = any(name in self.valid_tool_names for name in ['skills_list', 'skill_view', 'skill_manage'])
         skills_prompt = build_skills_system_prompt() if has_skills_tools else ""
@@ -2666,6 +2696,25 @@ class AIAgent:
             if self.tool_delay > 0 and i < len(assistant_message.tool_calls):
                 time.sleep(self.tool_delay)
 
+        # Foundry: observe tool-call sequence for crystallization detection
+        if self._sequence_detector and hasattr(assistant_message, 'tool_calls') and assistant_message.tool_calls:
+            try:
+                tool_calls_data = []
+                for tc in assistant_message.tool_calls:
+                    tc_entry = {"name": tc.function.name}
+                    try:
+                        tc_entry["arguments"] = json.loads(tc.function.arguments)
+                    except (json.JSONDecodeError, AttributeError):
+                        tc_entry["arguments"] = {}
+                    tool_calls_data.append(tc_entry)
+                ready = self._sequence_detector.observe(tool_calls_data, session_id=self.session_id)
+                if ready:
+                    crystallized = self._sequence_detector.crystallize()
+                    if crystallized:
+                        logger.info("Foundry crystallized %d new tool(s): %s", len(crystallized), crystallized)
+            except Exception as e:
+                logger.debug("Sequence detector observe failed (non-fatal): %s", e)
+
     def _handle_max_iterations(self, messages: list, api_call_count: int) -> str:
         """Request a summary when max iterations are reached. Returns the final response text."""
         print(f"⚠️  Reached maximum iterations ({self.max_iterations}). Requesting summary...")
@@ -2873,6 +2922,12 @@ class AIAgent:
         # Preserve the original user message before nudge injection.
         # Honcho should receive the actual user input, not system nudges.
         original_user_message = user_message
+
+        # Store for tiered memory retrieval in _build_system_prompt
+        self._last_user_message = user_message
+        # Invalidate cached system prompt so memory retrieval uses current query
+        if self._memory_retriever:
+            self._cached_system_prompt = None
 
         # Periodic memory nudge: remind the model to consider saving memories.
         # Counter resets whenever the memory tool is actually used.
