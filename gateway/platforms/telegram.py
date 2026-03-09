@@ -21,6 +21,7 @@ try:
         Application,
         CommandHandler,
         MessageHandler as TelegramMessageHandler,
+        CallbackQueryHandler,
         ContextTypes,
         filters,
     )
@@ -34,6 +35,7 @@ except ImportError:
     Application = Any
     CommandHandler = Any
     TelegramMessageHandler = Any
+    CallbackQueryHandler = Any
     filters = None
     ParseMode = None
     ChatType = None
@@ -136,7 +138,13 @@ class TelegramAdapter(BasePlatformAdapter):
                 filters.PHOTO | filters.VIDEO | filters.AUDIO | filters.VOICE | filters.Document.ALL | filters.Sticker.ALL,
                 self._handle_media_message
             ))
-            
+
+            # Register ILS quote approval/rejection button callbacks
+            self._app.add_handler(CallbackQueryHandler(
+                self._handle_ils_callback,
+                pattern=r"^ilsq_"
+            ))
+
             # Start polling in background
             await self._app.initialize()
             await self._app.start()
@@ -704,6 +712,25 @@ class TelegramAdapter(BasePlatformAdapter):
                 f"a sticker with emoji {emoji}" if emoji else "a sticker",
                 emoji, set_name,
             )
+
+    async def _handle_ils_callback(self, update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+        """
+        Handle ILS quote approval/rejection button callbacks.
+
+        Invoked when user clicks Approve/Reject buttons on ILS notification messages.
+        Routes to the ils_notifications handler.
+        """
+        try:
+            from services.ils_notifications import handle_callback
+            await handle_callback(update, context)
+        except Exception as e:
+            logger.error("ILS callback handler error: %s", e, exc_info=True)
+            query = update.callback_query
+            if query:
+                try:
+                    await query.answer("Error processing callback", show_alert=True)
+                except Exception:
+                    pass
 
     def _build_message_event(self, message: Message, msg_type: MessageType) -> MessageEvent:
         """Build a MessageEvent from a Telegram message."""
