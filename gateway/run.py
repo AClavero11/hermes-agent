@@ -30,6 +30,7 @@ sys.path.insert(0, str(Path(__file__).parent.parent))
 
 # Resolve Hermes home directory (respects HERMES_HOME override)
 _hermes_home = Path(os.getenv("HERMES_HOME", Path.home() / ".hermes"))
+sys.path.insert(0, str(_hermes_home))  # Make ~/.hermes/services importable
 
 # Load environment variables from ~/.hermes/.env first
 from dotenv import load_dotenv
