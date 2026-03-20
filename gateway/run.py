@@ -77,6 +77,7 @@ sys.path.insert(0, str(Path(__file__).parent.parent))
 
 # Resolve Hermes home directory (respects HERMES_HOME override)
 _hermes_home = Path(os.getenv("HERMES_HOME", Path.home() / ".hermes"))
+sys.path.insert(0, str(_hermes_home))  # Make ~/.hermes/services importable
 
 # Load environment variables from ~/.hermes/.env first.
 # User-managed env files should override stale shell exports on restart.
@@ -4922,6 +4923,51 @@ class GatewayRunner:
             response["already_sent"] = True
         
         return response
+
+
+def _run_ils_poll() -> None:
+    """
+    Scheduled heartbeat task: Poll ILS for new RFQs and create V11 draft quotes.
+
+    Called every 5 minutes (5 ticks) by the cron ticker.
+    Runs synchronously in the background thread.
+    """
+    import asyncio
+
+    try:
+        from services.ils_auto_quote import AutoQuoteEngine
+        from services.ils_notifications import send_quote_notification
+
+        engine = AutoQuoteEngine()
+        results = engine.poll_and_process()
+
+        if not results:
+            logger.debug("ILS poll: no quotes to send")
+            return
+
+        logger.info("ILS poll: %d quote(s) to notify", len(results))
+
+        async def _notify_all():
+            for result in results:
+                if result.success:
+                    try:
+                        await send_quote_notification(result)
+                    except Exception as e:
+                        logger.error("Failed to send quote notification: %s", e)
+
+        try:
+            loop = asyncio.get_event_loop()
+            if loop.is_closed():
+                loop = asyncio.new_event_loop()
+                asyncio.set_event_loop(loop)
+        except RuntimeError:
+            loop = asyncio.new_event_loop()
+            asyncio.set_event_loop(loop)
+
+        loop.run_until_complete(_notify_all())
+
+    except Exception as e:
+        logger.error("ILS poll error: %s", e, exc_info=True)
 
 
 def _start_cron_ticker(stop_event: threading.Event, adapters=None, interval: int = 60):
