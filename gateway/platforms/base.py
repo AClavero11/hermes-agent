@@ -829,6 +829,14 @@ class BasePlatformAdapter(ABC):
             print(f"[{self.name}] Error handling message: {e}")
             import traceback
             traceback.print_exc()
+            # Notify the user so the bot doesn't appear to silently ignore them
+            try:
+                await self.send(
+                    chat_id=event.source.chat_id,
+                    content="Sorry, something went wrong processing your message. Try again or use /reset.",
+                )
+            except Exception:
+                pass  # Best-effort — don't mask the original error
         finally:
             # Stop typing indicator
             typing_task.cancel()

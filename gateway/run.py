@@ -30,7 +30,10 @@ sys.path.insert(0, str(Path(__file__).parent.parent))
 
 # Resolve Hermes home directory (respects HERMES_HOME override)
 _hermes_home = Path(os.getenv("HERMES_HOME", Path.home() / ".hermes"))
-sys.path.insert(0, str(_hermes_home))  # Make ~/.hermes/services importable
+# Make ~/.hermes/services importable but AFTER project packages — inserting
+# at position 0 would shadow project modules like cron/, gateway/, tools/
+# if ~/.hermes happens to contain same-named directories.
+sys.path.append(str(_hermes_home))
 
 # Load environment variables from ~/.hermes/.env first
 from dotenv import load_dotenv
@@ -2323,12 +2326,27 @@ class GatewayRunner:
                         break
         
         interrupt_monitor = asyncio.create_task(monitor_for_interrupt())
-        
+
         try:
-            # Run in thread pool to not block
+            # Run in thread pool to not block.
+            # Apply a hard timeout so the bot doesn't go permanently silent
+            # if the agent hangs (e.g., unresponsive API, stuck tool).
             loop = asyncio.get_event_loop()
-            response = await loop.run_in_executor(None, run_sync)
-            
+            try:
+                response = await asyncio.wait_for(
+                    loop.run_in_executor(None, run_sync),
+                    timeout=600,  # 10 minutes hard limit
+                )
+            except asyncio.TimeoutError:
+                logger.error("Agent execution timed out after 600s for session %s", session_key)
+                response = {
+                    "final_response": "⚠️ Request timed out after 10 minutes. Try again or use /reset.",
+                    "messages": [],
+                    "api_calls": 0,
+                    "tools": tools_holder[0] or [],
+                    "history_offset": 0,
+                }
+
             # Check if we were interrupted and have a pending message
             result = result_holder[0]
             adapter = self.adapters.get(source.platform)
