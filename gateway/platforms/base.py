@@ -333,15 +333,21 @@ class BasePlatformAdapter(ABC):
     - Handling media
     """
     
+    # Maximum time (seconds) a session can stay in _active_sessions before
+    # being considered stale and auto-cleared.  Prevents the bot from going
+    # permanently silent when an agent hangs or crashes without cleanup.
+    SESSION_TIMEOUT_SECONDS = 600  # 10 minutes
+
     def __init__(self, config: PlatformConfig, platform: Platform):
         self.config = config
         self.platform = platform
         self._message_handler: Optional[MessageHandler] = None
         self._running = False
-        
+
         # Track active message handlers per session for interrupt support
         # Key: session_key (e.g., chat_id), Value: (event, asyncio.Event for interrupt)
         self._active_sessions: Dict[str, asyncio.Event] = {}
+        self._active_session_start: Dict[str, float] = {}  # monotonic timestamps
         self._pending_messages: Dict[str, MessageEvent] = {}
     
     @property
@@ -636,25 +642,39 @@ class BasePlatformAdapter(ABC):
     async def handle_message(self, event: MessageEvent) -> None:
         """
         Process an incoming message.
-        
+
         This method returns quickly by spawning background tasks.
         This allows new messages to be processed even while an agent is running,
         enabling interruption support.
         """
         if not self._message_handler:
             return
-        
+
         session_key = event.source.chat_id
-        
+
         # Check if there's already an active handler for this session
         if session_key in self._active_sessions:
-            # Store this as a pending message - it will interrupt the running agent
-            print(f"[{self.name}] ⚡ New message while session {session_key} is active - triggering interrupt")
-            self._pending_messages[session_key] = event
-            # Signal the interrupt (the processing task checks this)
-            self._active_sessions[session_key].set()
-            return  # Don't process now - will be handled after current task finishes
-        
+            # Check for stale sessions — if the session has been active for too
+            # long, force-clear it so the bot doesn't go permanently silent.
+            import time
+            start_time = self._active_session_start.get(session_key, 0)
+            if time.monotonic() - start_time > self.SESSION_TIMEOUT_SECONDS:
+                logger.warning(
+                    "[%s] Session %s has been active for >%ds — force-clearing stale session",
+                    self.name, session_key, self.SESSION_TIMEOUT_SECONDS,
+                )
+                del self._active_sessions[session_key]
+                self._active_session_start.pop(session_key, None)
+                self._pending_messages.pop(session_key, None)
+                # Fall through to process this message fresh
+            else:
+                # Store this as a pending message - it will interrupt the running agent
+                print(f"[{self.name}] ⚡ New message while session {session_key} is active - triggering interrupt")
+                self._pending_messages[session_key] = event
+                # Signal the interrupt (the processing task checks this)
+                self._active_sessions[session_key].set()
+                return  # Don't process now - will be handled after current task finishes
+
         # Spawn background task to process this message
         asyncio.create_task(self._process_message_background(event, session_key))
     
@@ -681,9 +701,12 @@ class BasePlatformAdapter(ABC):
 
     async def _process_message_background(self, event: MessageEvent, session_key: str) -> None:
         """Background task that actually processes the message."""
+        import time
+
         # Create interrupt event for this session
         interrupt_event = asyncio.Event()
         self._active_sessions[session_key] = interrupt_event
+        self._active_session_start[session_key] = time.monotonic()
         
         # Start continuous typing indicator (refreshes every 2 seconds)
         typing_task = asyncio.create_task(self._keep_typing(event.source.chat_id))
@@ -792,6 +815,7 @@ class BasePlatformAdapter(ABC):
                 # Clean up current session before processing pending
                 if session_key in self._active_sessions:
                     del self._active_sessions[session_key]
+                self._active_session_start.pop(session_key, None)
                 typing_task.cancel()
                 try:
                     await typing_task
@@ -815,6 +839,7 @@ class BasePlatformAdapter(ABC):
             # Clean up session tracking
             if session_key in self._active_sessions:
                 del self._active_sessions[session_key]
+            self._active_session_start.pop(session_key, None)
     
     def has_pending_interrupt(self, session_key: str) -> bool:
         """Check if there's a pending interrupt for a session."""

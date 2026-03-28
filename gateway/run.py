@@ -2393,13 +2393,20 @@ def _run_ils_poll() -> None:
 
     Called every 5 minutes (5 ticks) by the cron ticker.
     Runs synchronously in the background thread.
+
+    Requires ~/.hermes/services/ils_auto_quote.py and ils_notifications.py.
+    Silently skips if the services module is not installed.
     """
     import asyncio
 
     try:
         from services.ils_auto_quote import AutoQuoteEngine
         from services.ils_notifications import send_quote_notification
+    except ImportError:
+        # Services not installed — skip silently (not an error)
+        return
 
+    try:
         # Run the polling engine
         engine = AutoQuoteEngine()
         results = engine.poll_and_process()
@@ -2419,18 +2426,14 @@ def _run_ils_poll() -> None:
                     except Exception as e:
                         logger.error("Failed to send quote notification: %s", e)
 
-        # Run async notification handler in a new event loop
-        # (this is a sync function called from the cron ticker thread)
+        # Run async notifications in a dedicated event loop for this thread.
+        # NEVER use asyncio.get_event_loop() here — it can grab the main
+        # thread's loop and deadlock or corrupt its state.
+        loop = asyncio.new_event_loop()
         try:
-            loop = asyncio.get_event_loop()
-            if loop.is_closed():
-                loop = asyncio.new_event_loop()
-                asyncio.set_event_loop(loop)
-        except RuntimeError:
-            loop = asyncio.new_event_loop()
-            asyncio.set_event_loop(loop)
-
-        loop.run_until_complete(_notify_all())
+            loop.run_until_complete(_notify_all())
+        finally:
+            loop.close()
 
     except Exception as e:
         logger.error("ILS poll error: %s", e, exc_info=True)
