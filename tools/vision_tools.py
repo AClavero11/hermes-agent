@@ -28,7 +28,6 @@ Usage:
     )
 """
 
-import asyncio
 import base64
 import json
 import logging
@@ -38,12 +37,35 @@ from pathlib import Path
 from typing import Any, Awaitable, Dict, Optional
 from urllib.parse import urlparse
 import httpx
-from agent.auxiliary_client import async_call_llm
+from agent.auxiliary_client import async_call_llm, extract_content_or_reasoning
 from tools.debug_helpers import DebugSession
+from tools.website_policy import check_website_access
 
 logger = logging.getLogger(__name__)
 
 _debug = DebugSession("vision_tools", env_var="VISION_TOOLS_DEBUG")
+
+# Configurable HTTP download timeout for _download_image().
+# Separate from auxiliary.vision.timeout which governs the LLM API call.
+# Resolution: config.yaml auxiliary.vision.download_timeout → env var → 30s default.
+def _resolve_download_timeout() -> float:
+    env_val = os.getenv("HERMES_VISION_DOWNLOAD_TIMEOUT", "").strip()
+    if env_val:
+        try:
+            return float(env_val)
+        except ValueError:
+            pass
+    try:
+        from hermes_cli.config import load_config
+        cfg = load_config()
+        val = cfg.get("auxiliary", {}).get("vision", {}).get("download_timeout")
+        if val is not None:
+            return float(val)
+    except Exception:
+        pass
+    return 30.0
+
+_VISION_DOWNLOAD_TIMEOUT = _resolve_download_timeout()
 
 
 def _validate_image_url(url: str) -> bool:
@@ -69,7 +91,34 @@ def _validate_image_url(url: str) -> bool:
     if not parsed.netloc:
         return False
 
-    return True  # Allow all well-formed HTTP/HTTPS URLs for flexibility
+    # Block private/internal addresses to prevent SSRF
+    from tools.url_safety import is_safe_url
+    if not is_safe_url(url):
+        return False
+
+    return True
+
+
+def _detect_image_mime_type(image_path: Path) -> Optional[str]:
+    """Return a MIME type when the file looks like a supported image."""
+    with image_path.open("rb") as f:
+        header = f.read(64)
+
+    if header.startswith(b"\x89PNG\r\n\x1a\n"):
+        return "image/png"
+    if header.startswith(b"\xff\xd8\xff"):
+        return "image/jpeg"
+    if header.startswith((b"GIF87a", b"GIF89a")):
+        return "image/gif"
+    if header.startswith(b"BM"):
+        return "image/bmp"
+    if len(header) >= 12 and header[:4] == b"RIFF" and header[8:12] == b"WEBP":
+        return "image/webp"
+    if image_path.suffix.lower() == ".svg":
+        head = image_path.read_text(encoding="utf-8", errors="ignore")[:4096].lower()
+        if "<svg" in head:
+            return "image/svg+xml"
+    return None
 
 
 async def _download_image(image_url: str, destination: Path, max_retries: int = 3) -> Path:
@@ -92,12 +141,37 @@ async def _download_image(image_url: str, destination: Path, max_retries: int = 
     # Create parent directories if they don't exist
     destination.parent.mkdir(parents=True, exist_ok=True)
     
+    async def _ssrf_redirect_guard(response):
+        """Re-validate each redirect target to prevent redirect-based SSRF.
+
+        Without this, an attacker can host a public URL that 302-redirects
+        to http://169.254.169.254/ and bypass the pre-flight is_safe_url check.
+
+        Must be async because httpx.AsyncClient awaits event hooks.
+        """
+        if response.is_redirect and response.next_request:
+            redirect_url = str(response.next_request.url)
+            from tools.url_safety import is_safe_url
+            if not is_safe_url(redirect_url):
+                raise ValueError(
+                    f"Blocked redirect to private/internal address: {redirect_url}"
+                )
+
     last_error = None
     for attempt in range(max_retries):
         try:
+            blocked = check_website_access(image_url)
+            if blocked:
+                raise PermissionError(blocked["message"])
+
             # Download the image with appropriate headers using async httpx
             # Enable follow_redirects to handle image CDNs that redirect (e.g., Imgur, Picsum)
-            async with httpx.AsyncClient(timeout=30.0, follow_redirects=True) as client:
+            # SSRF: event_hooks validates each redirect target against private IP ranges
+            async with httpx.AsyncClient(
+                timeout=_VISION_DOWNLOAD_TIMEOUT,
+                follow_redirects=True,
+                event_hooks={"response": [_ssrf_redirect_guard]},
+            ) as client:
                 response = await client.get(
                     image_url,
                     headers={
@@ -106,6 +180,11 @@ async def _download_image(image_url: str, destination: Path, max_retries: int = 
                     },
                 )
                 response.raise_for_status()
+
+                final_url = str(response.url)
+                blocked = check_website_access(final_url)
+                if blocked:
+                    raise PermissionError(blocked["message"])
                 
                 # Save the image content
                 destination.write_bytes(response.content)
@@ -126,6 +205,10 @@ async def _download_image(image_url: str, destination: Path, max_retries: int = 
                     exc_info=True,
                 )
     
+    if last_error is None:
+        raise RuntimeError(
+            f"_download_image exited retry loop without attempting (max_retries={max_retries})"
+        )
     raise last_error
 
 
@@ -232,6 +315,7 @@ async def vision_analyze_tool(
     # Track whether we should clean up the file after processing.
     # Local files (e.g. from the image cache) should NOT be deleted.
     should_cleanup = True
+    detected_mime_type = None
     
     try:
         from tools.interrupt import is_interrupted
@@ -242,7 +326,7 @@ async def vision_analyze_tool(
         logger.info("User prompt: %s", user_prompt[:100])
         
         # Determine if this is a local file path or a remote URL
-        local_path = Path(image_url)
+        local_path = Path(os.path.expanduser(image_url))
         if local_path.is_file():
             # Local file path (e.g. from platform image cache) -- skip download
             logger.info("Using local image file: %s", image_url)
@@ -250,6 +334,9 @@ async def vision_analyze_tool(
             should_cleanup = False  # Don't delete cached/local files
         elif _validate_image_url(image_url):
             # Remote URL -- download to a temporary location
+            blocked = check_website_access(image_url)
+            if blocked:
+                raise PermissionError(blocked["message"])
             logger.info("Downloading image from URL...")
             temp_dir = Path("./temp_vision_images")
             temp_image_path = temp_dir / f"temp_image_{uuid.uuid4()}.jpg"
@@ -264,10 +351,14 @@ async def vision_analyze_tool(
         image_size_bytes = temp_image_path.stat().st_size
         image_size_kb = image_size_bytes / 1024
         logger.info("Image ready (%.1f KB)", image_size_kb)
+
+        detected_mime_type = _detect_image_mime_type(temp_image_path)
+        if not detected_mime_type:
+            raise ValueError("Only real image files are supported for vision analysis.")
         
         # Convert image to base64 data URL
         logger.info("Converting image to base64...")
-        image_data_url = _image_to_base64_data_url(temp_image_path)
+        image_data_url = _image_to_base64_data_url(temp_image_path, mime_type=detected_mime_type)
         # Calculate size in KB for better readability
         data_size_kb = len(image_data_url) / 1024
         logger.info("Image converted to base64 (%.1f KB)", data_size_kb)
@@ -298,19 +389,38 @@ async def vision_analyze_tool(
         
         logger.info("Processing image with vision model...")
         
-        # Call the vision API via centralized router
+        # Call the vision API via centralized router.
+        # Read timeout from config.yaml (auxiliary.vision.timeout), default 120s.
+        # Local vision models (llama.cpp, ollama) can take well over 30s.
+        vision_timeout = 120.0
+        try:
+            from hermes_cli.config import load_config
+            _cfg = load_config()
+            _vt = _cfg.get("auxiliary", {}).get("vision", {}).get("timeout")
+            if _vt is not None:
+                vision_timeout = float(_vt)
+        except Exception:
+            pass
         call_kwargs = {
             "task": "vision",
             "messages": messages,
             "temperature": 0.1,
             "max_tokens": 2000,
+            "timeout": vision_timeout,
         }
         if model:
             call_kwargs["model"] = model
         response = await async_call_llm(**call_kwargs)
         
-        # Extract the analysis
-        analysis = response.choices[0].message.content.strip()
+        # Extract the analysis — fall back to reasoning if content is empty
+        analysis = extract_content_or_reasoning(response)
+
+        # Retry once on empty content (reasoning-only response)
+        if not analysis:
+            logger.warning("Vision LLM returned empty content, retrying once")
+            response = await async_call_llm(**call_kwargs)
+            analysis = extract_content_or_reasoning(response)
+
         analysis_length = len(analysis)
         
         logger.info("Image analysis completed (%s characters)", analysis_length)
@@ -338,6 +448,13 @@ async def vision_analyze_tool(
         # so it can inform the user instead of a cryptic API error.
         err_str = str(e).lower()
         if any(hint in err_str for hint in (
+            "402", "insufficient", "payment required", "credits", "billing",
+        )):
+            analysis = (
+                "Insufficient credits or payment required. Please top up your "
+                f"API provider account and try again. Error: {e}"
+            )
+        elif any(hint in err_str for hint in (
             "does not support", "not support image", "invalid_request",
             "content_policy", "image_url", "multimodal",
             "unrecognized request argument", "image input",

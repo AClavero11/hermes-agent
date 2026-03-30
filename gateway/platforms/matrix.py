@@ -17,6 +17,7 @@ Environment variables:
 from __future__ import annotations
 
 import asyncio
+import io
 import json
 import logging
 import mimetypes
@@ -24,7 +25,7 @@ import os
 import re
 import time
 from pathlib import Path
-from typing import Any, Dict, List, Optional, Set
+from typing import Any, Dict, Optional, Set
 
 from gateway.config import Platform, PlatformConfig
 from gateway.platforms.base import (
@@ -41,7 +42,9 @@ logger = logging.getLogger(__name__)
 MAX_MESSAGE_LENGTH = 4000
 
 # Store directory for E2EE keys and sync state.
-_STORE_DIR = Path.home() / ".hermes" / "matrix" / "store"
+# Uses get_hermes_home() so each profile gets its own Matrix store.
+from hermes_constants import get_hermes_dir as _get_hermes_dir
+_STORE_DIR = _get_hermes_dir("platforms/matrix/store", "matrix/store")
 
 # Grace period: ignore messages older than this many seconds before startup.
 _STARTUP_GRACE_SECONDS = 5
@@ -103,6 +106,23 @@ class MatrixAdapter(BasePlatformAdapter):
         self._dm_rooms: Dict[str, bool] = {}
         # Set of room IDs we've joined
         self._joined_rooms: Set[str] = set()
+        # Event deduplication (bounded deque keeps newest entries)
+        from collections import deque
+        self._processed_events: deque = deque(maxlen=1000)
+        self._processed_events_set: set = set()
+
+    def _is_duplicate_event(self, event_id) -> bool:
+        """Return True if this event was already processed. Tracks the ID otherwise."""
+        if not event_id:
+            return False
+        if event_id in self._processed_events_set:
+            return True
+        if len(self._processed_events) == self._processed_events.maxlen:
+            evicted = self._processed_events[0]
+            self._processed_events_set.discard(evicted)
+        self._processed_events.append(event_id)
+        self._processed_events_set.add(event_id)
+        return False
 
     # ------------------------------------------------------------------
     # Required overrides
@@ -145,22 +165,49 @@ class MatrixAdapter(BasePlatformAdapter):
         # Authenticate.
         if self._access_token:
             client.access_token = self._access_token
-            # Resolve user_id if not set.
-            if not self._user_id:
-                resp = await client.whoami()
-                if isinstance(resp, nio.WhoamiResponse):
-                    self._user_id = resp.user_id
-                    client.user_id = resp.user_id
-                    logger.info("Matrix: authenticated as %s", self._user_id)
-                else:
-                    logger.error(
-                        "Matrix: whoami failed — check MATRIX_ACCESS_TOKEN and MATRIX_HOMESERVER"
+
+            # With access-token auth, always resolve whoami so we validate the
+            # token and learn the device_id. The device_id matters for E2EE:
+            # without it, matrix-nio can send plain messages but may fail to
+            # decrypt inbound encrypted events or encrypt outbound room sends.
+            resp = await client.whoami()
+            if isinstance(resp, nio.WhoamiResponse):
+                resolved_user_id = getattr(resp, "user_id", "") or self._user_id
+                resolved_device_id = getattr(resp, "device_id", "")
+                if resolved_user_id:
+                    self._user_id = resolved_user_id
+
+                # restore_login() is the matrix-nio path that binds the access
+                # token to a specific device and loads the crypto store.
+                if resolved_device_id and hasattr(client, "restore_login"):
+                    client.restore_login(
+                        self._user_id or resolved_user_id,
+                        resolved_device_id,
+                        self._access_token,
                     )
-                    await client.close()
-                    return False
+                else:
+                    if self._user_id:
+                        client.user_id = self._user_id
+                    if resolved_device_id:
+                        client.device_id = resolved_device_id
+                    client.access_token = self._access_token
+                    if self._encryption:
+                        logger.warning(
+                            "Matrix: access-token login did not restore E2EE state; "
+                            "encrypted rooms may fail until a device_id is available"
+                        )
+
+                logger.info(
+                    "Matrix: using access token for %s%s",
+                    self._user_id or "(unknown user)",
+                    f" (device {resolved_device_id})" if resolved_device_id else "",
+                )
             else:
-                client.user_id = self._user_id
-                logger.info("Matrix: using access token for %s", self._user_id)
+                logger.error(
+                    "Matrix: whoami failed — check MATRIX_ACCESS_TOKEN and MATRIX_HOMESERVER"
+                )
+                await client.close()
+                return False
         elif self._password and self._user_id:
             resp = await client.login(
                 self._password,
@@ -178,17 +225,21 @@ class MatrixAdapter(BasePlatformAdapter):
             return False
 
         # If E2EE is enabled, load the crypto store.
-        if self._encryption and hasattr(client, "olm"):
+        if self._encryption and getattr(client, "olm", None):
             try:
                 if client.should_upload_keys:
                     await client.keys_upload()
                 logger.info("Matrix: E2EE crypto initialized")
             except Exception as exc:
                 logger.warning("Matrix: crypto init issue: %s", exc)
+        elif self._encryption:
+            logger.warning(
+                "Matrix: E2EE requested but crypto store is not loaded; "
+                "encrypted rooms may fail"
+            )
 
         # Register event callbacks.
         client.add_event_callback(self._on_room_message, nio.RoomMessageText)
-        client.add_event_callback(self._on_room_message_media, nio.RoomMessageMedia)
         client.add_event_callback(self._on_room_message_media, nio.RoomMessageImage)
         client.add_event_callback(self._on_room_message_media, nio.RoomMessageAudio)
         client.add_event_callback(self._on_room_message_media, nio.RoomMessageVideo)
@@ -215,6 +266,7 @@ class MatrixAdapter(BasePlatformAdapter):
             )
             # Build DM room cache from m.direct account data.
             await self._refresh_dm_cache()
+            await self._run_e2ee_maintenance()
         else:
             logger.warning("Matrix: initial sync returned %s", type(resp).__name__)
 
@@ -286,13 +338,48 @@ class MatrixAdapter(BasePlatformAdapter):
                     relates_to["m.in_reply_to"] = {"event_id": reply_to}
                 msg_content["m.relates_to"] = relates_to
 
-            resp = await self._client.room_send(
-                chat_id,
-                "m.room.message",
-                msg_content,
-            )
+            async def _room_send_once(*, ignore_unverified_devices: bool = False):
+                return await asyncio.wait_for(
+                    self._client.room_send(
+                        chat_id,
+                        "m.room.message",
+                        msg_content,
+                        ignore_unverified_devices=ignore_unverified_devices,
+                    ),
+                    timeout=45,
+                )
+
+            try:
+                resp = await _room_send_once(ignore_unverified_devices=False)
+            except Exception as exc:
+                retryable = isinstance(exc, asyncio.TimeoutError)
+                olm_unverified = getattr(nio, "OlmUnverifiedDeviceError", None)
+                send_retry = getattr(nio, "SendRetryError", None)
+                if isinstance(olm_unverified, type) and isinstance(exc, olm_unverified):
+                    retryable = True
+                if isinstance(send_retry, type) and isinstance(exc, send_retry):
+                    retryable = True
+
+                if not retryable:
+                    logger.error("Matrix: failed to send to %s: %s", chat_id, exc)
+                    return SendResult(success=False, error=str(exc))
+
+                logger.warning(
+                    "Matrix: initial encrypted send to %s failed (%s); "
+                    "retrying after E2EE maintenance with ignored unverified devices",
+                    chat_id,
+                    exc,
+                )
+                await self._run_e2ee_maintenance()
+                try:
+                    resp = await _room_send_once(ignore_unverified_devices=True)
+                except Exception as retry_exc:
+                    logger.error("Matrix: failed to send to %s after retry: %s", chat_id, retry_exc)
+                    return SendResult(success=False, error=str(retry_exc))
+
             if isinstance(resp, nio.RoomSendResponse):
                 last_event_id = resp.event_id
+                logger.info("Matrix: sent event %s to %s", last_event_id, chat_id)
             else:
                 err = getattr(resp, "message", str(resp))
                 logger.error("Matrix: failed to send to %s: %s", chat_id, err)
@@ -427,8 +514,11 @@ class MatrixAdapter(BasePlatformAdapter):
         reply_to: Optional[str] = None,
         metadata: Optional[Dict[str, Any]] = None,
     ) -> SendResult:
-        """Upload an audio file as a voice message."""
-        return await self._send_local_file(chat_id, audio_path, "m.audio", caption, reply_to, metadata=metadata)
+        """Upload an audio file as a voice message (MSC3245 native voice)."""
+        return await self._send_local_file(
+            chat_id, audio_path, "m.audio", caption, reply_to, 
+            metadata=metadata, is_voice=True
+        )
 
     async def send_video(
         self,
@@ -461,13 +551,16 @@ class MatrixAdapter(BasePlatformAdapter):
         caption: Optional[str] = None,
         reply_to: Optional[str] = None,
         metadata: Optional[Dict[str, Any]] = None,
+        is_voice: bool = False,
     ) -> SendResult:
         """Upload bytes to Matrix and send as a media message."""
         import nio
 
         # Upload to homeserver.
-        resp = await self._client.upload(
-            data,
+        # nio expects a DataProvider (callable) or file-like object, not raw bytes.
+        # nio.upload() returns a tuple (UploadResponse|UploadError, Optional[Dict])
+        resp, maybe_encryption_info = await self._client.upload(
+            io.BytesIO(data),
             content_type=content_type,
             filename=filename,
         )
@@ -488,6 +581,10 @@ class MatrixAdapter(BasePlatformAdapter):
                 "size": len(data),
             },
         }
+
+        # Add MSC3245 voice flag for native voice messages.
+        if is_voice:
+            msg_content["org.matrix.msc3245.voice"] = {}
 
         if reply_to:
             msg_content["m.relates_to"] = {
@@ -516,6 +613,7 @@ class MatrixAdapter(BasePlatformAdapter):
         reply_to: Optional[str] = None,
         file_name: Optional[str] = None,
         metadata: Optional[Dict[str, Any]] = None,
+        is_voice: bool = False,
     ) -> SendResult:
         """Read a local file and upload it."""
         p = Path(file_path)
@@ -528,7 +626,7 @@ class MatrixAdapter(BasePlatformAdapter):
         ct = mimetypes.guess_type(fname)[0] or "application/octet-stream"
         data = p.read_bytes()
 
-        return await self._upload_and_send(room_id, data, fname, ct, msgtype, caption, reply_to, metadata)
+        return await self._upload_and_send(room_id, data, fname, ct, msgtype, caption, reply_to, metadata, is_voice)
 
     # ------------------------------------------------------------------
     # Sync loop
@@ -536,9 +634,23 @@ class MatrixAdapter(BasePlatformAdapter):
 
     async def _sync_loop(self) -> None:
         """Continuously sync with the homeserver."""
+        import nio
+
         while not self._closing:
             try:
-                await self._client.sync(timeout=30000)
+                resp = await self._client.sync(timeout=30000)
+                if isinstance(resp, nio.SyncError):
+                    if self._closing:
+                        return
+                    logger.warning(
+                        "Matrix: sync returned %s: %s — retrying in 5s",
+                        type(resp).__name__,
+                        getattr(resp, "message", resp),
+                    )
+                    await asyncio.sleep(5)
+                    continue
+
+                await self._run_e2ee_maintenance()
             except asyncio.CancelledError:
                 return
             except Exception as exc:
@@ -546,6 +658,38 @@ class MatrixAdapter(BasePlatformAdapter):
                     return
                 logger.warning("Matrix: sync error: %s — retrying in 5s", exc)
                 await asyncio.sleep(5)
+
+    async def _run_e2ee_maintenance(self) -> None:
+        """Run matrix-nio E2EE housekeeping between syncs.
+
+        Hermes uses a custom sync loop instead of matrix-nio's sync_forever(),
+        so we need to explicitly drive the key management work that sync_forever()
+        normally handles for encrypted rooms.
+        """
+        client = self._client
+        if not client or not self._encryption or not getattr(client, "olm", None):
+            return
+
+        tasks = [asyncio.create_task(client.send_to_device_messages())]
+
+        if client.should_upload_keys:
+            tasks.append(asyncio.create_task(client.keys_upload()))
+
+        if client.should_query_keys:
+            tasks.append(asyncio.create_task(client.keys_query()))
+
+        if client.should_claim_keys:
+            users = client.get_users_for_key_claiming()
+            if users:
+                tasks.append(asyncio.create_task(client.keys_claim(users)))
+
+        for task in asyncio.as_completed(tasks):
+            try:
+                await task
+            except asyncio.CancelledError:
+                raise
+            except Exception as exc:
+                logger.warning("Matrix: E2EE maintenance task failed: %s", exc)
 
     # ------------------------------------------------------------------
     # Event callbacks
@@ -557,6 +701,10 @@ class MatrixAdapter(BasePlatformAdapter):
 
         # Ignore own messages.
         if event.sender == self._user_id:
+            return
+
+        # Deduplicate by event ID (nio can fire the same event more than once).
+        if self._is_duplicate_event(getattr(event, "event_id", None)):
             return
 
         # Startup grace: ignore old messages from initial sync.
@@ -648,6 +796,10 @@ class MatrixAdapter(BasePlatformAdapter):
         if event.sender == self._user_id:
             return
 
+        # Deduplicate by event ID.
+        if self._is_duplicate_event(getattr(event, "event_id", None)):
+            return
+
         # Startup grace.
         event_ts = getattr(event, "server_timestamp", 0) / 1000.0
         if event_ts and event_ts < self._startup_ts - _STARTUP_GRACE_SECONDS:
@@ -669,17 +821,43 @@ class MatrixAdapter(BasePlatformAdapter):
         event_mimetype = (content_info.get("info") or {}).get("mimetype", "")
         media_type = "application/octet-stream"
         msg_type = MessageType.DOCUMENT
+        is_voice_message = False
+        
         if isinstance(event, nio.RoomMessageImage):
             msg_type = MessageType.PHOTO
             media_type = event_mimetype or "image/png"
         elif isinstance(event, nio.RoomMessageAudio):
-            msg_type = MessageType.AUDIO
+            # Check for MSC3245 voice flag: org.matrix.msc3245.voice: {}
+            source_content = getattr(event, "source", {}).get("content", {})
+            if source_content.get("org.matrix.msc3245.voice") is not None:
+                is_voice_message = True
+                msg_type = MessageType.VOICE
+            else:
+                msg_type = MessageType.AUDIO
             media_type = event_mimetype or "audio/ogg"
         elif isinstance(event, nio.RoomMessageVideo):
             msg_type = MessageType.VIDEO
             media_type = event_mimetype or "video/mp4"
         elif event_mimetype:
             media_type = event_mimetype
+
+        # For images, download and cache locally so vision tools can access them.
+        # Matrix MXC URLs require authentication, so direct URL access fails.
+        cached_path = None
+        if msg_type == MessageType.PHOTO and url:
+            try:
+                ext_map = {
+                    "image/jpeg": ".jpg", "image/png": ".png",
+                    "image/gif": ".gif", "image/webp": ".webp",
+                }
+                ext = ext_map.get(event_mimetype, ".jpg")
+                download_resp = await self._client.download(url)
+                if isinstance(download_resp, nio.DownloadResponse):
+                    from gateway.platforms.base import cache_image_from_bytes
+                    cached_path = cache_image_from_bytes(download_resp.body, ext=ext)
+                    logger.info("[Matrix] Cached user image at %s", cached_path)
+            except Exception as e:
+                logger.warning("[Matrix] Failed to cache image: %s", e)
 
         is_dm = self._dm_rooms.get(room.room_id, False)
         if not is_dm and room.member_count == 2:
@@ -693,6 +871,31 @@ class MatrixAdapter(BasePlatformAdapter):
         if relates_to.get("rel_type") == "m.thread":
             thread_id = relates_to.get("event_id")
 
+        # For voice messages, cache audio locally for transcription tools.
+        # Use the authenticated nio client to download (Matrix requires auth for media).
+        media_urls = [http_url] if http_url else None
+        media_types = [media_type] if http_url else None
+        
+        if is_voice_message and url and url.startswith("mxc://"):
+            try:
+                import nio
+                from gateway.platforms.base import cache_audio_from_bytes
+                
+                resp = await self._client.download(mxc=url)
+                if isinstance(resp, nio.MemoryDownloadResponse):
+                    # Extract extension from mimetype or default to .ogg
+                    ext = ".ogg"
+                    if media_type and "/" in media_type:
+                        subtype = media_type.split("/")[1]
+                        ext = f".{subtype}" if subtype else ".ogg"
+                    local_path = cache_audio_from_bytes(resp.body, ext)
+                    media_urls = [local_path]
+                    logger.debug("Matrix: cached voice message to %s", local_path)
+                else:
+                    logger.warning("Matrix: failed to download voice: %s", getattr(resp, "message", resp))
+            except Exception as e:
+                logger.warning("Matrix: failed to cache voice message, using HTTP URL: %s", e)
+
         source = self.build_source(
             chat_id=room.room_id,
             chat_type=chat_type,
@@ -701,14 +904,19 @@ class MatrixAdapter(BasePlatformAdapter):
             thread_id=thread_id,
         )
 
+        # Use cached local path for images (voice messages already handled above).
+        if cached_path:
+            media_urls = [cached_path]
+        media_types = [media_type] if media_urls else None
+
         msg_event = MessageEvent(
             text=body,
             message_type=msg_type,
             source=source,
             raw_message=getattr(event, "source", {}),
             message_id=event.event_id,
-            media_urls=[http_url] if http_url else None,
-            media_types=[media_type] if http_url else None,
+            media_urls=media_urls,
+            media_types=media_types,
         )
 
         await self.handle_message(msg_event)

@@ -5,7 +5,8 @@ Hermes Plugin System
 Discovers, loads, and manages plugins from three sources:
 
 1. **User plugins**   – ``~/.hermes/plugins/<name>/``
-2. **Project plugins** – ``./.hermes/plugins/<name>/``
+2. **Project plugins** – ``./.hermes/plugins/<name>/`` (opt-in via
+   ``HERMES_ENABLE_PROJECT_PLUGINS``)
 3. **Pip plugins**     – packages that expose the ``hermes_agent.plugins``
    entry-point group.
 
@@ -60,6 +61,22 @@ VALID_HOOKS: Set[str] = {
 ENTRY_POINTS_GROUP = "hermes_agent.plugins"
 
 _NS_PARENT = "hermes_plugins"
+
+
+def _env_enabled(name: str) -> bool:
+    """Return True when an env var is set to a truthy opt-in value."""
+    return os.getenv(name, "").strip().lower() in {"1", "true", "yes", "on"}
+
+
+def _get_disabled_plugins() -> set:
+    """Read the disabled plugins list from config.yaml."""
+    try:
+        from hermes_cli.config import load_config
+        config = load_config()
+        disabled = config.get("plugins", {}).get("disabled", [])
+        return set(disabled) if isinstance(disabled, list) else set()
+    except Exception:
+        return set()
 
 
 # ---------------------------------------------------------------------------
@@ -135,6 +152,34 @@ class PluginContext:
         self._manager._plugin_tool_names.add(name)
         logger.debug("Plugin %s registered tool: %s", self.manifest.name, name)
 
+    # -- message injection --------------------------------------------------
+
+    def inject_message(self, content: str, role: str = "user") -> bool:
+        """Inject a message into the active conversation.
+
+        If the agent is idle (waiting for user input), this starts a new turn.
+        If the agent is running, this interrupts and injects the message.
+
+        This enables plugins (e.g. remote control viewers, messaging bridges)
+        to send messages into the conversation from external sources.
+
+        Returns True if the message was queued successfully.
+        """
+        cli = self._manager._cli_ref
+        if cli is None:
+            logger.warning("inject_message: no CLI reference (not available in gateway mode)")
+            return False
+
+        msg = content if role == "user" else f"[{role}] {content}"
+
+        if getattr(cli, "_agent_running", False):
+            # Agent is mid-turn — interrupt with the message
+            cli._interrupt_queue.put(msg)
+        else:
+            # Agent is idle — queue as next input
+            cli._pending_input.put(msg)
+        return True
+
     # -- hook registration --------------------------------------------------
 
     def register_hook(self, hook_name: str, callback: Callable) -> None:
@@ -167,6 +212,7 @@ class PluginManager:
         self._hooks: Dict[str, List[Callable]] = {}
         self._plugin_tool_names: Set[str] = set()
         self._discovered: bool = False
+        self._cli_ref = None  # Set by CLI after plugin discovery
 
     # -----------------------------------------------------------------------
     # Public
@@ -186,14 +232,22 @@ class PluginManager:
         manifests.extend(self._scan_directory(user_dir, source="user"))
 
         # 2. Project plugins (./.hermes/plugins/)
-        project_dir = Path.cwd() / ".hermes" / "plugins"
-        manifests.extend(self._scan_directory(project_dir, source="project"))
+        if _env_enabled("HERMES_ENABLE_PROJECT_PLUGINS"):
+            project_dir = Path.cwd() / ".hermes" / "plugins"
+            manifests.extend(self._scan_directory(project_dir, source="project"))
 
         # 3. Pip / entry-point plugins
         manifests.extend(self._scan_entry_points())
 
-        # Load each manifest
+        # Load each manifest (skip user-disabled plugins)
+        disabled = _get_disabled_plugins()
         for manifest in manifests:
+            if manifest.name in disabled:
+                loaded = LoadedPlugin(manifest=manifest, enabled=False)
+                loaded.error = "disabled via config"
+                self._plugins[manifest.name] = loaded
+                logger.debug("Skipping disabled plugin '%s'", manifest.name)
+                continue
             self._load_plugin(manifest)
 
         if manifests:
@@ -378,16 +432,23 @@ class PluginManager:
     # Hook invocation
     # -----------------------------------------------------------------------
 
-    def invoke_hook(self, hook_name: str, **kwargs: Any) -> None:
+    def invoke_hook(self, hook_name: str, **kwargs: Any) -> List[Any]:
         """Call all registered callbacks for *hook_name*.
 
         Each callback is wrapped in its own try/except so a misbehaving
         plugin cannot break the core agent loop.
+
+        Returns a list of non-``None`` return values from callbacks.
+        This allows hooks like ``pre_llm_call`` to contribute context
+        that the agent core can collect and inject.
         """
         callbacks = self._hooks.get(hook_name, [])
+        results: List[Any] = []
         for cb in callbacks:
             try:
-                cb(**kwargs)
+                ret = cb(**kwargs)
+                if ret is not None:
+                    results.append(ret)
             except Exception as exc:
                 logger.warning(
                     "Hook '%s' callback %s raised: %s",
@@ -395,6 +456,7 @@ class PluginManager:
                     getattr(cb, "__name__", repr(cb)),
                     exc,
                 )
+        return results
 
     # -----------------------------------------------------------------------
     # Introspection
@@ -439,11 +501,59 @@ def discover_plugins() -> None:
     get_plugin_manager().discover_and_load()
 
 
-def invoke_hook(hook_name: str, **kwargs: Any) -> None:
-    """Invoke a lifecycle hook on all loaded plugins."""
-    get_plugin_manager().invoke_hook(hook_name, **kwargs)
+def invoke_hook(hook_name: str, **kwargs: Any) -> List[Any]:
+    """Invoke a lifecycle hook on all loaded plugins.
+
+    Returns a list of non-``None`` return values from plugin callbacks.
+    """
+    return get_plugin_manager().invoke_hook(hook_name, **kwargs)
 
 
 def get_plugin_tool_names() -> Set[str]:
     """Return the set of tool names registered by plugins."""
     return get_plugin_manager()._plugin_tool_names
+
+
+def get_plugin_toolsets() -> List[tuple]:
+    """Return plugin toolsets as ``(key, label, description)`` tuples.
+
+    Used by the ``hermes tools`` TUI so plugin-provided toolsets appear
+    alongside the built-in ones and can be toggled on/off per platform.
+    """
+    manager = get_plugin_manager()
+    if not manager._plugin_tool_names:
+        return []
+
+    try:
+        from tools.registry import registry
+    except Exception:
+        return []
+
+    # Group plugin tool names by their toolset
+    toolset_tools: Dict[str, List[str]] = {}
+    toolset_plugin: Dict[str, LoadedPlugin] = {}
+    for tool_name in manager._plugin_tool_names:
+        entry = registry._tools.get(tool_name)
+        if not entry:
+            continue
+        ts = entry.toolset
+        toolset_tools.setdefault(ts, []).append(entry.name)
+
+    # Map toolsets back to the plugin that registered them
+    for _name, loaded in manager._plugins.items():
+        for tool_name in loaded.tools_registered:
+            entry = registry._tools.get(tool_name)
+            if entry and entry.toolset in toolset_tools:
+                toolset_plugin.setdefault(entry.toolset, loaded)
+
+    result = []
+    for ts_key in sorted(toolset_tools):
+        plugin = toolset_plugin.get(ts_key)
+        label = f"🔌 {ts_key.replace('_', ' ').title()}"
+        if plugin and plugin.manifest.description:
+            desc = plugin.manifest.description
+        else:
+            desc = ", ".join(sorted(toolset_tools[ts_key]))
+        result.append((ts_key, label, desc))
+
+    return result
