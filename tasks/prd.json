@@ -1,0 +1,541 @@
+{
+  "project": "czar-to-hermes-migration",
+  "branchName": "ralph/czar-migration-e",
+  "description": "Migrate CZAR auto-quote pipeline from EC2 to Nous Hermes on Mac Studio (Option E: full port with channel-level cutover)",
+  "metadata": {
+    "created": "2026-03-17",
+    "author": "Tech Lead (Swarm)",
+    "reviewedBy": "Inspector (Claude Opus 4.6)",
+    "reviewDate": "2026-03-17",
+    "reviewVerdict": "APPROVED",
+    "source": "swarm-review.md (Inspector-corrected plan)",
+    "estimatedTotalHours": 115,
+    "estimatedWeeks": "3-4 (one person full-time)",
+    "criticalPath": "[PM-001 | PM-002] -> PM-003 -> E-001 -> E-002 -> E-004 -> E-005 -> E-006 -> E-009 -> E-010 -> F-001 (parallel tracks: D-001->D-002->D-003 runs alongside PM-003->E-001; E-003 parallels E-002; E-007 and E-008 parallel E-005/E-006)",
+    "hardInvariants": [
+      "Email gate (E-003) must be ported BEFORE any email-sending service (E-006, E-007)",
+      "DRY_RUN=true until backtest passes >70% within 10%",
+      "Heartbeat tasks HARDCODED into _start_cron_ticker() in gateway/run.py, NOT config.yaml",
+      "Channel-level cutover: disable in CZAR before enabling in Hermes, one at a time",
+      "All git commits on EC2 require AC manual execution (YubiKey signing)",
+      "V11 is PRODUCTION - zero tolerance for unaudited writes"
+    ],
+    "ec2": {
+      "instance": "i-0d1db6d949476a02e",
+      "ip": "34.227.101.211",
+      "sshKey": "~/Downloads/odoo-v11-key.pem",
+      "czarPath": "/home/ubuntu/hermes_bot"
+    },
+    "hermesRoot": "~/.hermes",
+    "gatewayRoot": "~/.hermes/hermes-agent/gateway",
+    "servicesRoot": "~/.hermes/services"
+  },
+  "userStories": [
+    {
+      "id": "PM-001",
+      "title": "Verify bot token identity and resolve conflict",
+      "description": "Both CZAR and Hermes use Telegram bot tokens that may conflict. The Hermes .env bot token (see ~/.hermes/.env) shares a bot ID prefix with the CZAR bug token. Must verify both tokens, confirm which bot each belongs to, and implement Option 2 (CZAR sends only, Hermes polls) if they share the same bot. NOTE: the dead token originally embedded in this description was confirmed 401 Unauthorized on 2026-04-10 and has been redacted.",
+      "acceptanceCriteria": [
+        "Hermes .env token validated via Telegram getMe API -- bot username confirmed",
+        "CZAR EC2 token retrieved from AWS SSM or .env and validated via getMe API",
+        "If same bot: CZAR polling stopped (only bot.send_message() outbound), documented in czar_bot config",
+        "If different bots: callback routing documented (which bot handles quote approvals)",
+        "Token identity and resolution documented in ~/.hermes/memories/working/czar_bot-progress.md"
+      ],
+      "tests": ["T-PRE-001", "T-PRE-002"],
+      "priority": "P0",
+      "estimated_hours": 2,
+      "depends_on": [],
+      "files_to_create": [],
+      "files_to_modify": [
+        "~/.hermes/memories/working/czar_bot-progress.md"
+      ],
+      "source_files": [],
+      "passes": false,
+      "notes": "CZAR progress notes document token mismatch bug: a dead token (redacted) was in use that returned 401 Unauthorized and belonged to the MONITORS bot rather than the Hermes bot. This must be resolved before any migration work. Token string removed from this PRD on 2026-04-10 after confirming the 401 via getMe."
+    },
+    {
+      "id": "PM-002",
+      "title": "Create certs directory and copy credentials from EC2",
+      "description": "Hermes services that send email (Gmail SA) and check payments (Teller mTLS) need credential files that currently only exist on EC2. Create the certs directory on Mac Studio and SCP the files over.",
+      "acceptanceCriteria": [
+        "Directory ~/.hermes/services/certs/ exists",
+        "~/.hermes/services/certs/gmail-sa.json copied from EC2 /home/ubuntu/hermes_bot/gmail-sa.json",
+        "~/.hermes/services/certs/teller_certificate.pem copied from EC2 /home/ubuntu/czar_bot/certs/teller_certificate.pem",
+        "~/.hermes/services/certs/teller_private_key.pem copied from EC2 /home/ubuntu/czar_bot/certs/teller_private_key.pem",
+        "File permissions set to 600 (owner read/write only) on all cert files",
+        "certs/ directory added to .gitignore if not already present"
+      ],
+      "tests": ["T-PRE-004", "T-E3-011"],
+      "priority": "P0",
+      "estimated_hours": 1,
+      "depends_on": [],
+      "files_to_create": [
+        "~/.hermes/services/certs/gmail-sa.json",
+        "~/.hermes/services/certs/teller_certificate.pem",
+        "~/.hermes/services/certs/teller_private_key.pem"
+      ],
+      "files_to_modify": [],
+      "source_files": [
+        "/home/ubuntu/hermes_bot/gmail-sa.json",
+        "/home/ubuntu/czar_bot/certs/teller_certificate.pem",
+        "/home/ubuntu/czar_bot/certs/teller_private_key.pem"
+      ],
+      "passes": false,
+      "notes": "Requires SSH access to EC2 (key at ~/Downloads/odoo-v11-key.pem). Files owned by uid 501:staff on Mac -- must sudo cp + chown after SCP."
+    },
+    {
+      "id": "PM-003",
+      "title": "Add missing env vars to ~/.hermes/.env",
+      "description": "Several CZAR services require environment variables not yet present in the Hermes .env file. Read CZAR's .env on EC2, extract the needed values, and add them to the local Hermes .env.",
+      "acceptanceCriteria": [
+        "AEROXCHANGE_USER and AEROXCHANGE_PASSWORD added to ~/.hermes/.env",
+        "GMAIL_SERVICE_ACCOUNT path set to ~/.hermes/services/certs/gmail-sa.json",
+        "TELLER_APP_ID added",
+        "TELLER_CERT_PATH set to ~/.hermes/services/certs/teller_certificate.pem",
+        "TELLER_KEY_PATH set to ~/.hermes/services/certs/teller_private_key.pem",
+        "TURSO_DATABASE_URL and TURSO_AUTH_TOKEN added",
+        "AUTO_QUOTE_DRY_RUN=true added (explicit safety flag)",
+        "CHAT_ID_AC=496461229 added",
+        "CHAT_ID_SHOP=-1002259366703 added",
+        "CHAT_ID_HQ=-1003584780969 added",
+        "All values verified by loading .env and checking for parse errors (no unescaped characters)"
+      ],
+      "tests": ["T-E5-009", "T-E10-011"],
+      "priority": "P0",
+      "estimated_hours": 2,
+      "depends_on": ["PM-002"],
+      "files_to_create": [],
+      "files_to_modify": [
+        "~/.hermes/.env"
+      ],
+      "source_files": [
+        "/home/ubuntu/hermes_bot/.env",
+        "/home/ubuntu/czar_bot/.env"
+      ],
+      "passes": false,
+      "notes": "Read values from EC2 via SSH. NEVER commit .env to git. Credential values come from EC2 or AWS SSM, not from memory or logs."
+    },
+    {
+      "id": "D-001",
+      "title": "Add FEATURES dict and feature flags to CZAR config.py",
+      "description": "Add a FEATURES dictionary to CZAR's config.py on EC2 that controls which subsystems are active. This enables per-channel cutover by flipping individual flags to False as each channel migrates to Hermes.",
+      "acceptanceCriteria": [
+        "FEATURES dict added to /home/ubuntu/hermes_bot/config.py with keys: auto_quote_ils, auto_quote_aex, auto_quote_email, email_gate, win_alerts, payment_alerts, quote_delivery -- all defaulting to True",
+        "Git tag pre-strip-v1 created (AC signs with YubiKey -- provide exact commit message and tag command)",
+        "config.py importable without errors: python3 -c 'from config import FEATURES; print(FEATURES)' succeeds on EC2"
+      ],
+      "tests": [],
+      "priority": "P0",
+      "estimated_hours": 1,
+      "depends_on": ["PM-001"],
+      "files_to_create": [],
+      "files_to_modify": [
+        "/home/ubuntu/hermes_bot/config.py"
+      ],
+      "source_files": [],
+      "passes": false,
+      "notes": "AC must run git tag -s pre-strip-v1 with YubiKey. Ralph prepares the code change and commit message, AC executes the git commands."
+    },
+    {
+      "id": "D-002",
+      "title": "Guard noise imports and scheduled jobs in hermes_v4.py",
+      "description": "Wrap CZAR's noise subsystem imports (SKYNET, Localist, campaigns, reports, trip handler) and their scheduled jobs in hermes_v4.py behind FEATURES flags. This strips CZAR to core-only operation without deleting code.",
+      "acceptanceCriteria": [
+        "All noise imports in hermes_v4.py wrapped with if FEATURES.get('feature_name', False) guards",
+        "Scheduled jobs for noise subsystems (skynet, localist, campaigns) wrapped with same guards",
+        "CZAR starts cleanly with all noise features disabled: systemctl restart hermes && journalctl -u hermes --no-pager -n 20 shows no ImportError",
+        "Core operations still functional: auto-quote pipeline (ILS, AeroXchange, email) processes normally",
+        "No noise-related log entries appear after restart"
+      ],
+      "tests": [],
+      "priority": "P0",
+      "estimated_hours": 2,
+      "depends_on": ["D-001"],
+      "files_to_create": [],
+      "files_to_modify": [
+        "/home/ubuntu/hermes_bot/hermes_v4.py"
+      ],
+      "source_files": [],
+      "passes": false,
+      "notes": "Guard, don't delete. The code stays for reference during porting. Only wrap imports and scheduler registrations."
+    },
+    {
+      "id": "D-003",
+      "title": "Test stripped CZAR and git tag",
+      "description": "Validate that the stripped CZAR runs correctly with only core operations active. Run the full test suite, verify the auto-quote pipeline processes an RFQ end-to-end, and create a git tag marking the post-strip state.",
+      "acceptanceCriteria": [
+        "python3 -c 'import hermes_v4' succeeds without errors on EC2",
+        "hermes.service restarts cleanly and stays running for 5+ minutes",
+        "Test suite passes: python3 -m pytest tests/ reports 99/99 (or documents any new failures)",
+        "Logs show auto-quote heartbeat ticks running (ILS poll, AeroXchange poll, email scan)",
+        "No SKYNET, Localist, or campaign log entries in the last 100 lines of output",
+        "Git tag post-strip-v1 created (AC signs with YubiKey)"
+      ],
+      "tests": [],
+      "priority": "P0",
+      "estimated_hours": 1,
+      "depends_on": ["D-002"],
+      "files_to_create": [],
+      "files_to_modify": [],
+      "source_files": [],
+      "passes": false,
+      "notes": "AC must run git tag -s post-strip-v1 with YubiKey after verification."
+    },
+    {
+      "id": "E-001",
+      "title": "Extract V11Client + add retry logic",
+      "description": "Extract the V11Client class from ils_auto_quote.py into a standalone shared module. Add exponential backoff retry (3 attempts) for XML-RPC calls to handle V11 transient failures. Update ils_auto_quote.py to import from the new module.",
+      "acceptanceCriteria": [
+        "~/.hermes/services/v11_client.py exists with V11Client class (~250 lines)",
+        "V11Client includes retry decorator: 3 attempts, exponential backoff (1s, 2s, 4s), catches xmlrpc.client.Fault and ConnectionError",
+        "V11Client includes basic circuit breaker: after 5 consecutive failures in 60s, skip calls for 30s cooldown",
+        "All public methods from original V11Client preserved: authenticate(), search_read(), create_sale_order(), cancel_draft_quote()",
+        "ils_auto_quote.py updated to import V11Client from v11_client (not inline class)",
+        "ILS poll cycle completes without errors: trigger one poll, verify V11 query + quote creation flow works",
+        "No duplicate V11Client class definitions remain in the codebase"
+      ],
+      "tests": ["T-E1-001", "T-E1-002", "T-E1-003", "T-E1-004", "T-E1-005", "T-E1-006", "T-E1-007", "T-E1-008", "T-E1-009", "T-E1-010", "T-E1-011", "T-E1-012", "T-E1-013", "T-E1-014"],
+      "priority": "P0",
+      "estimated_hours": 6,
+      "depends_on": ["PM-003"],
+      "files_to_create": [
+        "~/.hermes/services/v11_client.py"
+      ],
+      "files_to_modify": [
+        "~/.hermes/services/ils_auto_quote.py"
+      ],
+      "source_files": [
+        "~/.hermes/services/ils_auto_quote.py",
+        "/home/ubuntu/hermes_bot/services/resilience.py"
+      ],
+      "passes": false,
+      "notes": "Reference CZAR's services/resilience.py (465 lines) for circuit breaker patterns. Do not over-engineer -- basic retry + circuit breaker is sufficient for Phase E."
+    },
+    {
+      "id": "E-002",
+      "title": "Port pricing intelligence + calibrate + backtest",
+      "description": "Port the FMV waterfall pricing engine from CZAR to Hermes. Fix the 3 known root causes of the 148% mean error (age adjustment, customer weighting, floor stacking). Connect to Turso pricing DB. Run backtest against 50 V11 SOs. Keep behind DRY_RUN until backtest passes >70% within 10%.",
+      "acceptanceCriteria": [
+        "~/.hermes/services/pricing_intelligence.py exists (~800 lines) ported from CZAR services/pricing_intelligence.py",
+        "~/.hermes/tests/test_pricing_intelligence.py exists (~500 lines) ported from CZAR tests/test_pricing_intelligence.py",
+        "Age adjustment fix: inflation factor capped or replaced with linear depreciation (not exponential)",
+        "Customer weighting fix: same-customer historical sales weighted 3x over market average",
+        "Floor stacking fix: TIER_MARGIN_FLOORS applied to cost basis only, not to FMV output",
+        "Turso DB connection works: pricing_intelligence.py reads from TURSO_DATABASE_URL successfully",
+        "Backtest script runs: python3 scripts/backtest_pricing.py completes against 50 V11 SOs",
+        "Backtest result >70% within 10% of actual sale price OR documented as pending with DRY_RUN=true enforced",
+        "Red flags <5% of total lines OR documented with mitigation plan",
+        "Existing compute_price() in ils_auto_quote.py NOT replaced until backtest passes",
+        "All ported tests pass: python3 -m pytest tests/test_pricing_intelligence.py"
+      ],
+      "tests": ["T-E2-001", "T-E2-002", "T-E2-003", "T-E2-004", "T-E2-005", "T-E2-006", "T-E2-007", "T-E2-008", "T-E2-009", "T-E2-010", "T-E2-011", "T-E2-012", "T-E2-013", "T-E2-014", "T-E2-015", "T-E2-016", "T-E2-017"],
+      "priority": "P0",
+      "estimated_hours": 20,
+      "depends_on": ["E-001"],
+      "files_to_create": [
+        "~/.hermes/services/pricing_intelligence.py",
+        "~/.hermes/tests/test_pricing_intelligence.py",
+        "~/.hermes/scripts/backtest_pricing.py"
+      ],
+      "files_to_modify": [],
+      "source_files": [
+        "/home/ubuntu/hermes_bot/services/pricing_intelligence.py",
+        "/home/ubuntu/hermes_bot/tests/test_pricing_intelligence.py",
+        "/home/ubuntu/hermes_bot/scripts/backtest_pricing.py"
+      ],
+      "passes": false,
+      "notes": "This is the highest-risk story. The CZAR pricing engine has a 148.5% mean absolute error. Only 2.4% of quotes are within 10% of actual. Root causes are documented in czar_bot-progress.md. Budget extra time for calibration iterations. If backtest fails after 3 calibration rounds, fall back to Hermes's simpler compute_price() as default."
+    },
+    {
+      "id": "E-003",
+      "title": "Port email gate (HARD INVARIANT)",
+      "description": "Port the email gate from CZAR. This is the HARD INVARIANT: every outbound email must pass through the gate for Telegram APPROVE/REJECT approval before sending. No other service may call Gmail API directly. This MUST be ported before any email-sending service (E-006, E-007).",
+      "acceptanceCriteria": [
+        "~/.hermes/services/email_gate.py exists (~300 lines) with queue_email(), handle_callback(), send_approved_email() functions",
+        "SQLite DB at ~/.hermes/data/email_gate.db tracks queued/approved/rejected emails",
+        "queue_email() sends Telegram message with APPROVE/REJECT inline keyboard to AC DMs (chat_id=496461229)",
+        "CallbackQueryHandler with pattern r'^emailgate_' registered in gateway/platforms/telegram.py",
+        "APPROVE callback triggers Gmail API send via service account (gmail-sa.json)",
+        "REJECT callback logs rejection, does not send email, notifies AC of rejection",
+        "Test: queue a test email, verify Telegram buttons appear, verify approve sends email, verify reject blocks email",
+        "Gmail API authentication works using ~/.hermes/services/certs/gmail-sa.json",
+        "No other file in ~/.hermes/services/ imports or calls Gmail API directly (grep confirms)"
+      ],
+      "tests": ["T-E3-001", "T-E3-002", "T-E3-003", "T-E3-004", "T-E3-005", "T-E3-006", "T-E3-007", "T-E3-008", "T-E3-009", "T-E3-010", "T-E3-011", "T-E3-012", "T-E3-013", "T-E3-014", "T-E3-015", "T-E3-016"],
+      "priority": "P0",
+      "estimated_hours": 8,
+      "depends_on": ["PM-002", "PM-003", "E-001"],
+      "files_to_create": [
+        "~/.hermes/services/email_gate.py",
+        "~/.hermes/data/email_gate.db"
+      ],
+      "files_to_modify": [
+        "~/.hermes/hermes-agent/gateway/platforms/telegram.py"
+      ],
+      "source_files": [
+        "/home/ubuntu/hermes_bot/services/email_gate.py"
+      ],
+      "passes": false,
+      "notes": "HARD INVARIANT. This is the trust layer for outbound email. Must be battle-tested before E-006 (email RFQ) or E-007 (quote delivery) can proceed. The email gate SQLite DB is separate from the quote DB. DB path: ~/.hermes/data/email_gate.db (not ~/.hermes/services/data/)."
+    },
+    {
+      "id": "E-004",
+      "title": "Enhance ILS auto-quote + add notification dedup + cutover",
+      "description": "Upgrade the existing ILS auto-quote in Hermes: wire in the FMV waterfall pricing (if E-002 backtest passed), port notification dedup from CZAR, and add the AeroXchange poll function stub to gateway/run.py. Then perform channel-level cutover: disable ILS in CZAR, enable in Hermes, monitor 24h.",
+      "acceptanceCriteria": [
+        "If E-002 backtest passed: compute_price() in ils_auto_quote.py calls pricing_intelligence.py FMV waterfall",
+        "If E-002 backtest failed: compute_price() unchanged, FMV waterfall behind feature flag for later",
+        "~/.hermes/services/notification_dedup.py exists (~200 lines) with dedup logic ported from CZAR notification_gate.py",
+        "Notification dedup prevents duplicate Telegram messages for same RFQ within 1h window",
+        "ILS poll heartbeat continues working in _start_cron_ticker() (already exists)",
+        "CZAR FEATURES['auto_quote_ils'] set to False on EC2",
+        "Hermes ILS auto-quote processes at least one real ILS RFQ end-to-end (DRY_RUN=true is fine)",
+        "24h monitoring period: zero duplicate quotes, zero missed RFQs compared to CZAR baseline",
+        "Rollback documented: re-enable CZAR ILS flag, comment out Hermes changes"
+      ],
+      "tests": ["T-E4-001", "T-E4-002", "T-E4-003", "T-E4-004", "T-E4-005", "T-E4-006", "T-E4-007", "T-E4-008", "T-E4-009", "T-E4-010", "T-E4-011", "T-E4-012", "T-E4-013", "T-E4-014", "T-E4-015"],
+      "priority": "P1",
+      "estimated_hours": 8,
+      "depends_on": ["E-002", "E-003"],
+      "files_to_create": [
+        "~/.hermes/services/notification_dedup.py"
+      ],
+      "files_to_modify": [
+        "~/.hermes/services/ils_auto_quote.py",
+        "/home/ubuntu/hermes_bot/config.py"
+      ],
+      "source_files": [
+        "/home/ubuntu/hermes_bot/services/notification_gate.py"
+      ],
+      "passes": false,
+      "notes": "First channel-level cutover. Disable in CZAR BEFORE enabling in Hermes. Never run both simultaneously on the same channel. Monitor Advanced Shop Telegram group for 24h after cutover."
+    },
+    {
+      "id": "E-005",
+      "title": "Port AeroXchange auto-quote + cutover",
+      "description": "Port the AeroXchange auto-quote pipeline from CZAR to Hermes. Create the AeroXchange service, notifications module, and register callback handlers. Add the AeroXchange poll function to the hardcoded cron ticker. Perform channel-level cutover.",
+      "acceptanceCriteria": [
+        "~/.hermes/services/aex_auto_quote.py exists (~500 lines) with AeroXchange RFQ polling, pricing, and V11 draft creation",
+        "~/.hermes/services/aex_notifications.py exists (~150 lines) following ILS notifications pattern",
+        "CallbackQueryHandler with pattern r'^aexq_' registered in gateway/platforms/telegram.py",
+        "_run_aex_poll() function added to gateway/run.py",
+        "_run_aex_poll() called inside _start_cron_ticker() hardcoded while loop (NOT in config.yaml heartbeat tasks)",
+        "AeroXchange credentials (AEROXCHANGE_USER, AEROXCHANGE_PASSWORD) loaded from .env",
+        "CZAR FEATURES['auto_quote_aex'] set to False on EC2",
+        "Hermes AeroXchange poll processes at least one RFQ (DRY_RUN=true is fine)",
+        "24h monitoring: zero errors in gateway.log related to aex_poll"
+      ],
+      "tests": ["T-E5-001", "T-E5-002", "T-E5-003", "T-E5-004", "T-E5-005", "T-E5-006", "T-E5-007", "T-E5-008", "T-E5-009", "T-E5-010", "T-E5-011", "T-E5-012", "T-E5-013", "T-E5-014"],
+      "priority": "P1",
+      "estimated_hours": 10,
+      "depends_on": ["E-004"],
+      "files_to_create": [
+        "~/.hermes/services/aex_auto_quote.py",
+        "~/.hermes/services/aex_notifications.py"
+      ],
+      "files_to_modify": [
+        "~/.hermes/hermes-agent/gateway/run.py",
+        "~/.hermes/hermes-agent/gateway/platforms/telegram.py",
+        "/home/ubuntu/hermes_bot/config.py"
+      ],
+      "source_files": [
+        "/home/ubuntu/hermes_bot/services/aeroxchange_auto_quote.py"
+      ],
+      "passes": false,
+      "notes": "Heartbeat tasks are HARDCODED into _start_cron_ticker(). Do NOT add to config.yaml heartbeat_tasks section. Follow the exact same pattern as _run_ils_poll() in gateway/run.py."
+    },
+    {
+      "id": "E-006",
+      "title": "Port email RFQ auto-quote + cutover",
+      "description": "Port the email RFQ scanner from CZAR to Hermes. This scans Gmail for incoming RFQs, parses them, prices, and creates V11 drafts. Requires the email gate (E-003) to be active. Perform channel-level cutover.",
+      "acceptanceCriteria": [
+        "~/.hermes/services/email_rfq_scanner.py exists (~500 lines) with Gmail inbox scan, RFQ detection, pricing, V11 draft creation",
+        "~/.hermes/services/rfq_parser.py exists (~250 lines) with email body parsing, part number extraction, quantity detection",
+        "~/.hermes/services/email_rfq_notifications.py exists (~150 lines) following ILS notifications pattern",
+        "CallbackQueryHandler with pattern r'^emailq_' registered in gateway/platforms/telegram.py",
+        "_run_email_rfq_poll() function added to gateway/run.py",
+        "_run_email_rfq_poll() called inside _start_cron_ticker() hardcoded while loop",
+        "Email RFQ scanner uses email_gate.queue_email() for any outbound email (never Gmail API directly)",
+        "CZAR FEATURES['auto_quote_email'] set to False on EC2",
+        "Hermes email scanner processes at least one RFQ (DRY_RUN=true is fine)",
+        "24h monitoring: zero errors, no missed RFQs compared to CZAR email channel baseline"
+      ],
+      "tests": ["T-E6-001", "T-E6-002", "T-E6-003", "T-E6-004", "T-E6-005", "T-E6-006", "T-E6-007", "T-E6-008", "T-E6-009", "T-E6-010", "T-E6-011", "T-E6-012", "T-E6-013", "T-E6-014"],
+      "priority": "P1",
+      "estimated_hours": 10,
+      "depends_on": ["E-003", "E-005"],
+      "files_to_create": [
+        "~/.hermes/services/email_rfq_scanner.py",
+        "~/.hermes/services/rfq_parser.py",
+        "~/.hermes/services/email_rfq_notifications.py"
+      ],
+      "files_to_modify": [
+        "~/.hermes/hermes-agent/gateway/run.py",
+        "~/.hermes/hermes-agent/gateway/platforms/telegram.py",
+        "/home/ubuntu/hermes_bot/config.py"
+      ],
+      "source_files": [
+        "/home/ubuntu/hermes_bot/services/auto_quote.py",
+        "/home/ubuntu/hermes_bot/services/rfq/parser.py"
+      ],
+      "passes": false,
+      "notes": "Depends on E-003 (email gate) as HARD INVARIANT. All outbound email MUST go through email_gate.queue_email(). Also check if CZAR's auto_quote_flow.py exists on EC2 and port from that if it's the unified pipeline."
+    },
+    {
+      "id": "E-007",
+      "title": "Port quote delivery + PDF generation",
+      "description": "Port quote delivery (email send with PDF attachment) and quote PDF generation from CZAR. Quote delivery must use email_gate.queue_email() for all outbound. PDF generation uses V11's sale.report_saleorder (never website_quote.report_quote).",
+      "acceptanceCriteria": [
+        "~/.hermes/services/quote_delivery.py exists (~600 lines) with deliver_quote(), attach_pdf(), format_email_body()",
+        "~/.hermes/services/auto_send.py exists (~300 lines) with 7 send gates: grade, confidence, rate limit, stock, high-value, condition, anomaly",
+        "Quote PDF generated using V11 sale.report_saleorder endpoint (NOT website_quote.report_quote)",
+        "All outbound email uses email_gate.queue_email() -- zero direct Gmail API calls",
+        "Test: generate a quote PDF from a real V11 SO, verify PDF renders correctly",
+        "Test: queue a quote delivery email, verify Telegram approve/reject flow works",
+        "auto_send gates each independently testable: pass a mock quote through each gate"
+      ],
+      "tests": ["T-E7-001", "T-E7-002", "T-E7-003", "T-E7-004", "T-E7-005", "T-E7-006", "T-E7-007", "T-E7-008", "T-E7-009", "T-E7-010", "T-E7-011"],
+      "priority": "P1",
+      "estimated_hours": 10,
+      "depends_on": ["E-003", "E-004"],
+      "files_to_create": [
+        "~/.hermes/services/quote_delivery.py",
+        "~/.hermes/services/auto_send.py"
+      ],
+      "files_to_modify": [],
+      "source_files": [
+        "/home/ubuntu/hermes_bot/services/quote_delivery.py",
+        "/home/ubuntu/hermes_bot/services/quote_pdf.py",
+        "/home/ubuntu/hermes_bot/services/auto_send.py"
+      ],
+      "passes": false,
+      "notes": "V11 PDF endpoint: sale.report_saleorder. NEVER use website_quote.report_quote (per feedback_v11_forms.md). The auto_send.py gates determine if a quote should be auto-sent or held for manual review."
+    },
+    {
+      "id": "E-008",
+      "title": "Port win/payment alerts",
+      "description": "Port win alerts (new order confirmed in V11) and payment alerts (Teller bank deposit detection) from CZAR to Hermes. Add heartbeat functions for periodic checks. Verify Teller mTLS works from Mac Studio.",
+      "acceptanceCriteria": [
+        "~/.hermes/services/win_alerts.py exists (~200 lines) with check_new_wins(), format_win_alert()",
+        "~/.hermes/services/payment_alerts.py exists (~200 lines) with check_deposits(), format_payment_alert()",
+        "~/.hermes/services/sales_tracker.py exists (~300 lines) with track_sales(), get_daily_summary()",
+        "_run_win_check() function added to gateway/run.py (every 15 ticks in cron ticker)",
+        "_run_payment_check() function added to gateway/run.py (every 30 ticks in cron ticker)",
+        "Both functions called inside _start_cron_ticker() hardcoded while loop",
+        "Win alerts sent to Advanced Shop chat (-1002259366703)",
+        "Payment alerts sent to Family chat (-322782753) for deposits >= $500",
+        "Teller mTLS authentication works from Mac Studio using local cert files",
+        "If Teller mTLS fails from Mac Studio: payment_alerts.py gracefully skips with warning log, does not crash"
+      ],
+      "tests": ["T-E8-001", "T-E8-002", "T-E8-003", "T-E8-004", "T-E8-005", "T-E8-006", "T-E8-007", "T-E8-008", "T-E8-009", "T-E8-010", "T-E8-011", "T-E8-012", "T-E8-013", "T-E8-014", "T-E8-015"],
+      "priority": "P1",
+      "estimated_hours": 8,
+      "depends_on": ["E-001", "PM-002"],
+      "files_to_create": [
+        "~/.hermes/services/win_alerts.py",
+        "~/.hermes/services/payment_alerts.py",
+        "~/.hermes/services/sales_tracker.py"
+      ],
+      "files_to_modify": [
+        "~/.hermes/hermes-agent/gateway/run.py"
+      ],
+      "source_files": [
+        "/home/ubuntu/hermes_bot/services/nudges/win_alerts.py",
+        "/home/ubuntu/hermes_bot/services/payment_alerts.py",
+        "/home/ubuntu/hermes_bot/services/sales_tracker.py",
+        "/home/ubuntu/hermes_bot/services/teller_sync.py"
+      ],
+      "passes": false,
+      "notes": "Check if payment_alerts.py depends on teller_sync.py. If yes, port teller_sync.py too. Teller mTLS may not work from Mac Studio if the cert was issued for EC2's IP. Test early and have a fallback plan (keep payment alerts on CZAR)."
+    },
+    {
+      "id": "E-009",
+      "title": "Wire all quote approval callbacks",
+      "description": "Verify and wire all Telegram callback query handlers for quote approval/rejection across all channels. Merge relevant quote intelligence and outcome tracking from CZAR into Hermes's existing quote_memory.py.",
+      "acceptanceCriteria": [
+        "All 4 callback patterns registered in telegram.py: ilsq_, aexq_, emailq_, emailgate_",
+        "Each callback handler correctly routes to the right service module",
+        "Approve callback on ILS quote: creates V11 sale order, sends confirmation to Advanced Shop",
+        "Approve callback on AeroXchange quote: creates V11 sale order, sends confirmation",
+        "Approve callback on email quote: creates V11 sale order, sends confirmation",
+        "Reject callback on all types: cancels V11 draft, logs rejection reason",
+        "Email gate approve: sends email via Gmail API",
+        "Email gate reject: blocks email, logs rejection",
+        "Quote outcome tracking merged into ~/.hermes/services/quote_memory.py from CZAR quote_outcomes.py",
+        "Click-test all 4 callback types manually: each produces expected V11 action + Telegram response"
+      ],
+      "tests": ["T-E10-009"],
+      "priority": "P1",
+      "estimated_hours": 6,
+      "depends_on": ["E-004", "E-005", "E-006", "E-007"],
+      "files_to_create": [],
+      "files_to_modify": [
+        "~/.hermes/hermes-agent/gateway/platforms/telegram.py",
+        "~/.hermes/services/quote_memory.py"
+      ],
+      "source_files": [
+        "/home/ubuntu/hermes_bot/services/quote_intelligence.py",
+        "/home/ubuntu/hermes_bot/services/quote_outcomes.py"
+      ],
+      "passes": false,
+      "notes": "This is the integration story. All individual services should work by this point -- this wires them together at the callback level. Test with DRY_RUN=true first."
+    },
+    {
+      "id": "E-010",
+      "title": "Integration testing + 48h clean run",
+      "description": "Run full integration tests across all channels and services. Validate end-to-end pipelines with DRY_RUN=true. Monitor for 48 hours with zero errors. Verify no duplicate quotes in V11. Confirm pricing backtest passes.",
+      "acceptanceCriteria": [
+        "ILS RFQ -> V11 draft -> Telegram notification -> Approve/Reject: full pipeline verified",
+        "AeroXchange RFQ -> V11 draft -> Telegram notification -> Approve/Reject: full pipeline verified",
+        "Email RFQ -> V11 draft -> Telegram notification -> Approve/Reject: full pipeline verified",
+        "Email gate: queue -> Telegram -> Approve -> Gmail send: verified with test email",
+        "Win alert: new SO in V11 -> Telegram notification in Advanced Shop: verified",
+        "Payment alert: verified with Teller data (or documented skip if mTLS fails)",
+        "48-hour clean run completed: grep -c ERROR ~/.hermes/logs/gateway.log shows zero new errors",
+        "No duplicate quotes in V11: manual audit of draft SOs created during 48h period",
+        "Pricing backtest passes >70% within 10% (or DRY_RUN stays true with documented plan)",
+        "All 4 callback types click-tested during 48h period",
+        "Gateway process stays running for full 48h without crash or restart"
+      ],
+      "tests": ["T-E10-001", "T-E10-002", "T-E10-003", "T-E10-004", "T-E10-005", "T-E10-006", "T-E10-007", "T-E10-008", "T-E10-009", "T-E10-010", "T-E10-011", "T-E10-012", "T-E10-013", "T-E10-014", "T-E10-015", "T-E10-016"],
+      "priority": "P1",
+      "estimated_hours": 16,
+      "depends_on": ["E-008", "E-009"],
+      "files_to_create": [],
+      "files_to_modify": [],
+      "source_files": [],
+      "passes": false,
+      "notes": "This is a monitoring/validation story, not a coding story. Set up log monitoring, check V11 for anomalies, and verify Telegram callbacks. The 48h period is real wall-clock time. Document any issues found and their resolution."
+    },
+    {
+      "id": "F-001",
+      "title": "Flip DRY_RUN, monitor, kill CZAR",
+      "description": "Final cutover: set AUTO_QUOTE_DRY_RUN=false in Hermes, monitor first 10 real quotes across all channels, verify all cutover criteria, stop CZAR hermes.service on EC2, keep EC2 as cold backup for 2 weeks.",
+      "acceptanceCriteria": [
+        "AUTO_QUOTE_DRY_RUN=false set in ~/.hermes/.env",
+        "Gateway restarted with new env: launchctl kickstart -k gui/$(id -u)/ai.hermes.gateway",
+        "First 10 real quotes monitored: pricing within expected range, V11 SOs created correctly",
+        "All channels producing real quotes: ILS, AeroXchange, email",
+        "No duplicate quotes in V11 after DRY_RUN=false (check within 4h)",
+        "Email gate functioning: at least one real email sent via approve flow",
+        "CZAR hermes.service stopped on EC2: sudo systemctl stop hermes",
+        "CZAR hermes.service disabled: sudo systemctl disable hermes",
+        "EC2 instance kept running as cold backup (do NOT terminate)",
+        "Rollback plan documented: re-enable CZAR service, set DRY_RUN=true in Hermes",
+        "After 2 weeks clean operation: archive CZAR to S3, document archive location"
+      ],
+      "tests": [],
+      "priority": "P2",
+      "estimated_hours": 4,
+      "depends_on": ["E-010"],
+      "files_to_create": [],
+      "files_to_modify": [
+        "~/.hermes/.env"
+      ],
+      "source_files": [],
+      "passes": false,
+      "notes": "Point of no return. Only execute after 48h clean run with zero errors. Keep EC2 alive for 2 weeks as cold backup. Nuclear rollback: comment out all new calls in _start_cron_ticker(), re-enable all CZAR FEATURES, restart CZAR service. Time to nuclear rollback: 15 minutes."
+    }
+  ]
+}
