@@ -84,3 +84,11 @@ Branch: ralph/summit-domain-addons
 - False positive filter for TBD/TBA/N/A/NONE/UNKNOWN
 - Worker efficiency: 6 tool uses
 ---
+
+## 2026-04-10 - SDA-005: Incremental quote append detector - COMPLETE
+- tools/quote_append_detector.py
+- tests/tools/test_quote_append_detector.py (23 tests, 6 classes)
+- Match signals HIGH/MED/LOW with cross-customer collision suppression
+- PN family = prefix before last dash
+- Worker efficiency: 7 tool uses
+---

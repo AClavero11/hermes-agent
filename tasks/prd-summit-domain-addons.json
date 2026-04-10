@@ -252,8 +252,8 @@
         "gateway/platforms/telegram.py"
       ],
       "source_files": [],
-      "passes": false,
-      "notes": "Replaces hard-block duplicate detection with append-offer. Depends on SDA-006 for customer_quote_ref extraction. | REFRAMED 2026-04-10: detector lives in tools/; telegram.py adds append-offer UI with three buttons. The actual V11 append API call is deferred to post-migration wiring (can't modify ~/.hermes/services/ils_auto_quote.py from inside hermes-agent worktree)."
+      "passes": true,
+      "notes": "Replaces hard-block duplicate detection with append-offer. Depends on SDA-006 for customer_quote_ref extraction. | REFRAMED 2026-04-10: detector lives in tools/; telegram.py adds append-offer UI with three buttons. The actual V11 append API call is deferred to post-migration wiring (can't modify ~/.hermes/services/ils_auto_quote.py from inside hermes-agent worktree). | COMPLETED 2026-04-10. 23 unit tests passing."
     },
     {
       "id": "SDA-006",
