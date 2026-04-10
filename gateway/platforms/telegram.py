@@ -159,6 +159,12 @@ class TelegramAdapter(BasePlatformAdapter):
                 pattern=r"^cc_"
             ))
 
+            # Register SDA flow callbacks (SWA-003): no-price, solicit, append, IDG
+            self._app.add_handler(CallbackQueryHandler(
+                self._handle_sda_callback,
+                pattern=r"^sda_"
+            ))
+
             # Start polling in background
             await self._app.initialize()
             await self._app.start()
@@ -973,6 +979,39 @@ class TelegramAdapter(BasePlatformAdapter):
             if query:
                 try:
                     await query.answer("Error processing CC callback", show_alert=True)
+                except Exception:
+                    pass
+
+    async def _handle_sda_callback(self, update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+        """Handle SDA flow callbacks (no-price, solicit, append, IDG)."""
+        query = update.callback_query
+        if not query or not query.data:
+            return
+        try:
+            await query.answer()
+            from tools.telegram_sda_flows import dispatch_sda_callback
+            # Real deps wired at call time; for now we surface the result text only.
+            # Downstream side-effect wiring happens in SWA-004's integration pass.
+            def _noop(*args, **kwargs): return None
+            result = dispatch_sda_callback(query.data, deps={
+                "mark_noprice_resolved": _noop,
+                "get_pending_solicit": lambda sid: None,
+                "send_solicit_email": _noop,
+                "enqueue_manual_price": _noop,
+                "v11_append_line": lambda q, r: {},
+                "v11_create_new_quote": lambda r: {},
+                "mark_append_rejected": _noop,
+                "mark_idg_acknowledged": _noop,
+            })
+            if result.requires_confirmation and result.warning:
+                await query.answer(result.warning, show_alert=True)
+            elif query.message:
+                await query.message.reply_text(result.message)
+        except Exception as e:
+            logger.error("SDA callback handler error: %s", e, exc_info=True)
+            if query:
+                try:
+                    await query.answer("Error processing SDA callback", show_alert=True)
                 except Exception:
                     pass
 

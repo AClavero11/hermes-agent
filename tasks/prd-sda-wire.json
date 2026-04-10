@@ -143,7 +143,7 @@
         "tools/no_price_cascade.py (for cascade result shape)",
         "tools/quote_append_detector.py (for append suggestion shape)"
       ],
-      "passes": false,
+      "passes": true,
       "notes": "This story does NOT modify the pricing or drafting logic — it only adds the user-facing approval UI. The actual send-on-approval side effects are injected so the handlers remain unit-testable."
     },
     {

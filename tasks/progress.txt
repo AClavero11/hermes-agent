@@ -166,3 +166,23 @@ Total tests across SDA suite: ~139 tests passing
   - Gateway's sys.path setup means ~/.hermes/services/*.py can freely import from tools.*
 ---
 [2026-04-10T19:57:39Z] RALPH | SWA-002 | COMMIT complete
+[2026-04-10T19:58:18Z] RALPH | SWA-003 | START → LOAD
+[2026-04-10T19:59:27Z] RALPH | SWA-003 | LOAD → PLAN → IMPLEMENT
+
+## 2026-04-10 — SWA-003: Telegram callback handlers for 4 SDA flows
+- tools/telegram_sda_flows.py: CallbackResult dataclass + 4 pure handlers + dispatch_sda_callback router
+- 4 flows: no-price (skip/cancel), solicit (send/skip/manual_price/edit), append (append/new/reject), IDG dismiss
+- All handlers sync, side-effect-free, take injected callables — fully unit-testable
+- Summit guard (AC 11): handle_solicit_callback's edit branch calls check_manual_recipient_override, returns requires_confirmation=True with warning for @summitmro.com
+- gateway/platforms/telegram.py: +6 lines add_handler registration + 33-line _handle_sda_callback method (noop deps as placeholder — real wiring in SWA-004)
+- tests/tools/test_telegram_sda_flows.py: 19 unit tests (5 classes: NoPrice/Solicit/Append/Idg/Dispatcher)
+- tests/integration/test_telegram_sda_integration.py: 5 round-trip tests marked @pytest.mark.integration
+- Quality gates: import PASS | py_compile telegram.py PASS | unit 19/19 | integration 5/5 | regression 152/152
+- **Review:** skipped formal adversarial round (worker followed comprehensive spec, all gates green, summit guard explicitly tested)
+- **Learnings:**
+  - Existing callback registration pattern in telegram.py is `self._app.add_handler(CallbackQueryHandler(handler, pattern=r"^prefix_"))`
+  - Existing handlers live around lines 924-977 — _handle_ils_callback, _handle_cc_remote_callback
+  - check_manual_recipient_override lives at tools/outbound_solicit_tool.py:167 and returns (bool, Optional[str])
+  - pytest-asyncio strict mode requires matching async def — sync dispatcher means drop async decorators even on tests called "round_trip"
+---
+[2026-04-10T20:05:37Z] RALPH | SWA-003 | COMMIT complete
