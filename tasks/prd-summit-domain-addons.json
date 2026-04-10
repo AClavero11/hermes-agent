@@ -74,8 +74,8 @@
       "source_files": [
         "/Users/ac/data/summit-8140-pricing.xlsx"
       ],
-      "passes": false,
-      "notes": "Foundation for SDA-002 (consignment detection) and SDA-003 (no-price cascade). The sheet file already exists on disk as of 2026-04-09 with Jorge email context added as cell comments (non-destructive enrichment). | VERIFIED 2026-04-10: tools/summit_sheet_tool.py registers via tools/registry.py self-registration pattern, exports from tools/__init__.py, and is added to _HERMES_CORE_TOOLS in toolsets.py."
+      "passes": true,
+      "notes": "Foundation for SDA-002 (consignment detection) and SDA-003 (no-price cascade). The sheet file already exists on disk as of 2026-04-09 with Jorge email context added as cell comments (non-destructive enrichment). | VERIFIED 2026-04-10: tools/summit_sheet_tool.py registers via tools/registry.py self-registration pattern, exports from tools/__init__.py, and is added to _HERMES_CORE_TOOLS in toolsets.py. | COMPLETED 2026-04-10 by Ralph. 14 unit tests + 2 integration tests passing. Fixed provenance leak and Gmail query injection during review round."
     },
     {
       "id": "SDA-002",

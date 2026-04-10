@@ -23,3 +23,20 @@ Branch: ralph/summit-domain-addons
 - Summit-sourced lines always cite '145 trace, Summit Aerospace tags'
 
 ---
+
+## 2026-04-10 - SDA-001: Summit 8140 pricing sheet lookup tool - COMPLETE
+- tools/summit_sheet_tool.py (649 lines): local-only XLSX reader + Jorge email merge + privacy wall
+- tests/tools/test_summit_sheet_tool.py (220 lines, 14 tests passing)
+- tests/integration/test_summit_sheet_integration.py (50 lines, 2 tests passing)
+- tools/__init__.py: +11 lines exporting summit_sheet_lookup, check_summit_requirements, PrivacyWallViolation
+- toolsets.py: +1 line adding summit_sheet_lookup to _HERMES_CORE_TOOLS
+- Quality gates: import ok, 14/14 unit tests, 2/2 integration tests
+- Review: 1 round. CHANGES_REQUESTED on provenance leak (real bug, fixed) and regex claim (false positive, verified by running against all 5 Jorge phrasings — r'\$' matches correctly). Applied 4 fixes proactively: provenance reset, PN sanitization for gmail query, sender domain restriction, TOCTOU wrap on openpyxl.load_workbook.
+- Learnings:
+  - hermes-agent tools self-register via tools.registry at module import time (wrap in try/except ImportError for test safety)
+  - tools/__init__.py exports are the package API; new tools must be added here
+  - toolsets.py _HERMES_CORE_TOOLS list gates which tools the agent can invoke
+  - pytest with `-m 'not integration'` default in pyproject.toml — integration tests need @pytest.mark.integration decorator
+  - Cache-shared mutable state (dataclasses held in dict) requires full reset of computed fields on every access
+  - Regex reviewer claims can be false positives — always verify with real Python execution before fixing
+---
