@@ -1,0 +1,12 @@
+{
+  "rfq_with_ref": {
+    "body": "Please quote the following parts. Ref: PROD-2026-0847\n\n1. 3605812-17 qty 2 SV\n2. 273T1102-8 qty 1 OH",
+    "customer_id": "cust-123",
+    "pn_list": ["3605812-17", "273T1102-8"]
+  },
+  "rfq_without_ref": {
+    "body": "Need quote on 3605812-17 qty 1 SV",
+    "customer_id": "cust-456",
+    "pn_list": ["3605812-17"]
+  }
+}

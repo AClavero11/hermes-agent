@@ -80,5 +80,6 @@ include = ["tools", "hermes_cli", "gateway", "cron", "honcho_integration"]
 testpaths = ["tests"]
 markers = [
     "integration: marks tests requiring external services (API keys, Modal, etc.)",
+    "domain_rules: marks the 5-rule domain compliance suite",
 ]
 addopts = "-m 'not integration'"

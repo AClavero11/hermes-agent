@@ -1,0 +1,31 @@
+{
+  "sru_tight_compliant": {
+    "ar_price": 96.0,
+    "sv_price": 100.0,
+    "comment": "4% delta — compliant for SRU"
+  },
+  "lru_wide_compliant": {
+    "ar_price": 92.0,
+    "sv_price": 100.0,
+    "comment": "8% delta — compliant for LRU"
+  },
+  "sru_non_compliant": {
+    "ar_price": 88.0,
+    "sv_price": 100.0,
+    "comment": "12% delta — too wide for SRU (not compressing)"
+  },
+  "lifo_compliant": {
+    "selected_lot_id": "LOT-NEW",
+    "lots_available": [
+      {"lot_id": "LOT-OLD", "in_date": "2025-01-15", "teardown_cost": 250.0},
+      {"lot_id": "LOT-NEW", "in_date": "2026-03-01", "teardown_cost": 300.0}
+    ]
+  },
+  "lifo_non_compliant_fifo": {
+    "selected_lot_id": "LOT-OLD",
+    "lots_available": [
+      {"lot_id": "LOT-OLD", "in_date": "2025-01-15", "teardown_cost": 250.0},
+      {"lot_id": "LOT-NEW", "in_date": "2026-03-01", "teardown_cost": 300.0}
+    ]
+  }
+}
