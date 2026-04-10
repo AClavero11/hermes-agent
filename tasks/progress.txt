@@ -56,3 +56,13 @@ Branch: ralph/summit-domain-addons
   - Reply chains re-embed prior messages; parsers must strip quoted sections
   - Paragraph-scoped search (split on blank lines) is the natural boundary for multi-item lists in email
 ---
+
+## 2026-04-10 - SDA-003: No-price cascade orchestrator - COMPLETE
+- tools/no_price_cascade.py (pure function, dependency injection pattern)
+- tests/tools/test_no_price_cascade.py (12 tests passing)
+- Cascade: V11 engine -> Summit sheet -> Gmail history -> (solicit | manual)
+- Summit-associated PNs SKIP solicit per AC directive
+- Dependencies injected as callables for isolation testing
+- Quality gates: import ok, 12/12 tests pass
+- Worker efficiency: 7 tool uses, no review round needed
+---

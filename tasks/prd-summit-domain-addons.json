@@ -156,8 +156,8 @@
       ],
       "files_to_modify": [],
       "source_files": [],
-      "passes": false,
-      "notes": "SDA-004 is a SOFT dependency -- if SDA-004 is not yet merged, step 4 falls through to step 5 manual entry with a log warning. Cascade still functions correctly, just with a reduced automation surface for non-Summit parts. | REFRAMED 2026-04-10: Standalone module in hermes-agent/tools/. Integration with the auto-quote pipeline at ~/.hermes/services/ils_auto_quote.py is deferred to a post-migration wiring task once that code lives in a git-tracked location. This PRD delivers tested, importable logic; wiring is out of scope."
+      "passes": true,
+      "notes": "SDA-004 is a SOFT dependency -- if SDA-004 is not yet merged, step 4 falls through to step 5 manual entry with a log warning. Cascade still functions correctly, just with a reduced automation surface for non-Summit parts. | REFRAMED 2026-04-10: Standalone module in hermes-agent/tools/. Integration with the auto-quote pipeline at ~/.hermes/services/ils_auto_quote.py is deferred to a post-migration wiring task once that code lives in a git-tracked location. This PRD delivers tested, importable logic; wiring is out of scope. | COMPLETED 2026-04-10. 12 unit tests passing. Pure function with injected dependencies; real source wiring deferred."
     },
     {
       "id": "SDA-004",
