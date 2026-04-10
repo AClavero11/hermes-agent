@@ -172,7 +172,7 @@
       ],
       "files_to_modify": [],
       "source_files": [],
-      "passes": false,
+      "passes": true,
       "notes": "This is the acceptance test for the whole SDA-WIRE PRD. If this passes, the feature is genuinely integrated end-to-end and ready for production traffic behind DRY_RUN."
     },
     {
