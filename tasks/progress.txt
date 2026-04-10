@@ -92,3 +92,13 @@ Branch: ralph/summit-domain-addons
 - PN family = prefix before last dash
 - Worker efficiency: 7 tool uses
 ---
+
+## 2026-04-10 - SDA-007: Engine capability verification - COMPLETE
+- scripts/verify_engine_capabilities.py (366 lines, CLI + library API)
+- scripts/__init__.py (new package marker)
+- tests/scripts/test_verify_engine_capabilities.py (19 tests, 5 classes)
+- Probes for SRU/LRU compression and LIFO teardown selection
+- Auto-generates atlas PRD addendum stubs for missing capabilities
+- Idempotent: existing stub files are preserved
+- Worker efficiency: 13 tool uses
+---

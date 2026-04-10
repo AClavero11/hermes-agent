@@ -319,8 +319,8 @@
       ],
       "files_to_modify": [],
       "source_files": [],
-      "passes": false,
-      "notes": "Surfaces the two V11-side engine gaps (condition compression for piece parts, LIFO lot selection) as atlas PRD addendum candidates without invading the atlas PRD or advanced-parts repo. Atlas execution track owns the actual engine changes. | VERIFIED 2026-04-10: hermes-agent/scripts/ directory exists; verify_engine_capabilities.py as a standalone CLI script is the correct target."
+      "passes": true,
+      "notes": "Surfaces the two V11-side engine gaps (condition compression for piece parts, LIFO lot selection) as atlas PRD addendum candidates without invading the atlas PRD or advanced-parts repo. Atlas execution track owns the actual engine changes. | VERIFIED 2026-04-10: hermes-agent/scripts/ directory exists; verify_engine_capabilities.py as a standalone CLI script is the correct target. | COMPLETED 2026-04-10. 19 unit tests passing. CLI + addendum generator verified idempotent."
     },
     {
       "id": "SDA-008",
