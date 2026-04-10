@@ -40,3 +40,19 @@ Branch: ralph/summit-domain-addons
   - Cache-shared mutable state (dataclasses held in dict) requires full reset of computed fields on every access
   - Regex reviewer claims can be false positives — always verify with real Python execution before fixing
 ---
+
+## 2026-04-10 - SDA-002: Summit consignment trace flag emission - COMPLETE
+- tools/summit_trace_flags.py (135 lines): pure-function TraceFlags emitter
+- tests/tools/test_trace_flags.py (167 lines, 12 tests passing)
+- tests/integration/test_summit_trace_flow.py (53 lines, 3 tests passing)
+- Consumes SDA-001 summit_sheet_lookup, emits soft signals only
+- Explicitly asserts NO requires_summit_approval field ever exists
+- gateway/platforms/telegram.py wiring deferred to downstream pipeline task
+- Quality gates: import ok, 12/12 unit, 3/3 integration
+- Review: inline self-review, no round needed. Worker was tight (11 tool uses).
+- Hotfix needed on SDA-001 parser during SDA-002 integration check — real Jorge email data exposed cross-PN pollution and quoted reply chain attribution bugs. Committed separately as ad75837.
+- Learnings:
+  - Real email data > synthetic test fixtures for catching parser bugs
+  - Reply chains re-embed prior messages; parsers must strip quoted sections
+  - Paragraph-scoped search (split on blank lines) is the natural boundary for multi-item lists in email
+---

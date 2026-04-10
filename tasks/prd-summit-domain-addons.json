@@ -116,8 +116,8 @@
         "gateway/platforms/telegram.py"
       ],
       "source_files": [],
-      "passes": false,
-      "notes": "AC directive 2026-04-09: Jorge standing green light removes hard approval lock. IDG piece parts remain a softer exception (yellow warning, not a block). Reference: project_summit_green_light memory file. | REFRAMED 2026-04-10: core logic now lives in tools/summit_trace_flags.py (pure module, not a registered tool). The gateway/platforms/telegram.py change is only to render the yellow-banner UX for idg_piece_part_warning and per_line_check_required. Integration with ~/.hermes/services/ils_auto_quote.py is deferred to a post-migration wiring task."
+      "passes": true,
+      "notes": "AC directive 2026-04-09: Jorge standing green light removes hard approval lock. IDG piece parts remain a softer exception (yellow warning, not a block). Reference: project_summit_green_light memory file. | REFRAMED 2026-04-10: core logic now lives in tools/summit_trace_flags.py (pure module, not a registered tool). The gateway/platforms/telegram.py change is only to render the yellow-banner UX for idg_piece_part_warning and per_line_check_required. Integration with ~/.hermes/services/ils_auto_quote.py is deferred to a post-migration wiring task. | COMPLETED 2026-04-10. 12 unit + 3 integration tests passing. gateway/platforms/telegram.py wiring deferred per reframe."
     },
     {
       "id": "SDA-003",
