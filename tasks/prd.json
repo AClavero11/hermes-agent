@@ -51,7 +51,7 @@
         "~/.hermes/memories/working/czar_bot-progress.md"
       ],
       "source_files": [],
-      "passes": false,
+      "passes": true,
       "notes": "CZAR progress notes document token mismatch bug: a dead token (redacted) was in use that returned 401 Unauthorized and belonged to the MONITORS bot rather than the Hermes bot. This must be resolved before any migration work. Token string removed from this PRD on 2026-04-10 after confirming the 401 via getMe."
     },
     {

@@ -1,0 +1,375 @@
+{
+  "project": "summit-domain-addons",
+  "branchName": "ralph/summit-domain-addons",
+  "description": "Post-migration addendum PRD that layers Summit 8140 pricing sheet integration, Jorge-green-light consignment handling, no-price cascade, non-Summit outbound solicit, incremental quote append, customer quote reference tracking, and engine capability verification on top of the completed czar-to-hermes migration. Run AFTER tasks/prd.json (czar-to-hermes-migration) reaches F-001 complete. None of these stories build infrastructure already owned by the migration PRD -- they only add the domain rules and pricing sources that AC elaborated on 2026-04-09.",
+  "metadata": {
+    "created": "2026-04-10",
+    "author": "Claude Opus 4.6 + AC session 2026-04-09",
+    "source": "Session transcript 2026-04-09: /last30days -> /council -> /prd sequence, Jorge Fernandez email thread 'Need 8130s' msgId 19d746142898ba2e, Summit-8140-Pricing-Jorge.xlsx dated 2026-04-09",
+    "dependsOnPrd": "tasks/prd.json (czar-to-hermes-migration) must reach F-001 complete before this PRD runs",
+    "estimatedTotalHours": 34,
+    "hardInvariants": [
+      "Privacy wall: Summit sheet content and Gmail history never leave Mac Studio (never sent to Claude or any remote model)",
+      "V11 pricing engine is immutable ground truth. LLM never generates a numeric price.",
+      "Summit contacts (Jorge Fernandez, Kent Kendrick, any @summitmro.com sender) are excluded from the default outbound solicit path per AC directive 2026-04-09",
+      "IDG Summit piece parts produce a yellow warning banner in Telegram but never a hard approval lock",
+      "AR-condition lines never carry '8130 on request' language (per AC 8130 condition rule); SV/OH/NE/NS/New use '8130-3 on request'",
+      "Summit-sourced lines always cite '145 trace, Summit Aerospace tags' in customer-facing drafts"
+    ],
+    "authorizingEmail": {
+      "from": "Jorge Fernandez <Jorge.Fernandez@summitmro.com>",
+      "to": "Anthony Clavero <ac@advanced.aero>",
+      "date": "2026-04-09",
+      "subject": "Re: Need 8130s",
+      "messageId": "19d746142898ba2e",
+      "summary": "Standing green light for non-IDG Summit consignment sales at 70/30 default split. Per-PN cost guidance provided for 5 parts (3605812-17, 273T1102-8, 273T6301-5, 273T6101-9, 2206405-1). 767270 clarified as Hamilton commercial, not Summit stock."
+    },
+    "dataSources": {
+      "summit_8140_sheet": "/Users/ac/data/summit-8140-pricing.xlsx (enriched copy with 2026-04-09 Jorge cell comments; canonical source for 8140 warehouse inventory)",
+      "summit_8140_sheet_original": "/Users/ac/Downloads/Summit-8140-Pricing-Jorge.xlsx (untouched original, Kent/Meimin working file)"
+    }
+  },
+  "userStories": [
+    {
+      "id": "SDA-001",
+      "title": "Summit 8140 pricing sheet lookup tool with Jorge email enrichment",
+      "description": "Build a local-only tool that reads the Summit 8140 pricing XLSX, merges it with the most-recent cost/guidance emails from Jorge Fernandez and Kent Kendrick, and exposes a unified per-PN pricing lookup. The sheet is the authoritative inventory master (131 parts as of 2026-04-09); Jorge's emails override stale sheet rows. Both sources are private and must never leave the Mac Studio.",
+      "acceptanceCriteria": [
+        "Tool file tools/summit_sheet_tool.py exists and is registered in tools/registry.py as summit_sheet_lookup",
+        "Tool accepts {pn: string} input and returns {pn, description, aircraft, conditions, quantity, cost_basis, cost_source, summit_guidance, guidance_source, kent_ext_cost, may_buy_price, jf_price, our_quote_sell, ils_sellers, ils_qty, aac_on_ils, summit_on_ils, ils_price_range, sheet_stale, provenance}",
+        "Sheet path is configurable via HERMES_SUMMIT_SHEET_PATH env var. Default: /Users/ac/data/summit-8140-pricing.xlsx",
+        "Read strategy: openpyxl in data_only mode, read-only. The tool NEVER modifies the XLSX file.",
+        "Sheet layout (verified 2026-04-09): sheet '8140 Pricing', header row 3, data rows 4+. Columns A=PN, B=Description, C=A/C, D=CN, E=Qty, F=Kent_Ext_Cost, G=May_Buy_Price, H=Meimin_Date, I=Our_Quote_Sell, J=Num_Quotes, K=ILS_Sellers, L=ILS_Qty, M=AAC_On_ILS, N=Summit_On_ILS, O=ILS_OH_Price_Range, P=JF_Prices",
+        "Compound conditions (AR/OH, AR/NE/SV, AR/NE/OH, AR/FP, NE/NS, etc.) are supported by splitting on '/' and exposing each condition with the same price basis",
+        "Jorge email enrichment: the tool consults services/ils_notifications.py or equivalent Gmail history retrieval to find the most recent email from Jorge.Fernandez@summitmro.com touching the queried PN. If found AND email_date > Meimin_Date, the Jorge email's cost_basis and guidance OVERRIDE the sheet values and sheet_stale=true.",
+        "Jorge email parsing: extract cost from patterns 'Summit Cost $X' or 'Summit cost, $X' or 'over your cost X'; extract guidance as '70_30' when email says 'max the sale 70/30' or equivalent, 'over_cost' when says 'over your cost', 'other' for ambiguous, null when no guidance phrase",
+        "Privacy wall: task tag read_summit_sheet is registered with privacy=high, quality=deterministic, volume=low in tools/registry.py. Any attempt to pass the sheet payload to a remote provider raises PrivacyWallViolation before network call.",
+        "Cache: normalized view held in an in-memory dict keyed by PN, rebuilt on XLSX mtime change or on new Jorge/Kent email detection. Cold-start rebuild under 500ms for 131-row sheet.",
+        "Unit test tests/tools/test_summit_sheet_tool.py: 2026-04-09 snapshot parses 131 rows and returns exact Kent_Ext_Cost for the 6 Jorge-email PNs: 3605812-17 (444.95), 273T1102-8 (4397.09), 273T6301-5 (520.51), 273T6101-9 (5383.94), 2206405-1 (5000.0), 2206407-1 (6500.0)",
+        "Unit test: compound condition 'AR/NE/OH' on any PN expands to 3 entries sharing cost basis",
+        "Unit test (staleness override): mock Jorge email dated 2026-04-09 with 'over your cost 22,500' on 273T1102-8 yields cost_basis=22500 (NOT the sheet's May_Buy 32500) and sheet_stale=true",
+        "Unit test: no Jorge email for a PN falls through to Kent_Ext_Cost and sheet_stale=false",
+        "Unit test: PN 767270 is NOT in the 8140 sheet and the lookup returns a clean miss (None) rather than a fuzzy match",
+        "Unit test (privacy wall violation): attempting to route a sheet-derived payload through the Anthropic provider raises PrivacyWallViolation before any network call",
+        "Integration test tests/integration/test_summit_sheet_integration.py: merge pass over the real sheet at /Users/ac/data/summit-8140-pricing.xlsx + mock Jorge mailbox containing the 2026-04-09 thread produces expected merged output for all 6 cross-referenced PNs",
+        "pytest passes on tests/tools/test_summit_sheet_tool.py and tests/integration/test_summit_sheet_integration.py",
+        "Tool is discoverable via the tool registry and can be invoked by name from pipelines or direct calls"
+      ],
+      "tests": [
+        "test_summit_sheet_tool",
+        "test_summit_sheet_integration"
+      ],
+      "priority": 1,
+      "estimated_hours": 6,
+      "depends_on": [],
+      "files_to_create": [
+        "tools/summit_sheet_tool.py",
+        "tests/tools/test_summit_sheet_tool.py",
+        "tests/integration/test_summit_sheet_integration.py"
+      ],
+      "files_to_modify": [
+        "tools/registry.py",
+        "tools/__init__.py"
+      ],
+      "source_files": [
+        "/Users/ac/data/summit-8140-pricing.xlsx"
+      ],
+      "passes": false,
+      "notes": "Foundation for SDA-002 (consignment detection) and SDA-003 (no-price cascade). The sheet file already exists on disk as of 2026-04-09 with Jorge email context added as cell comments (non-destructive enrichment)."
+    },
+    {
+      "id": "SDA-002",
+      "title": "Summit consignment detection, trace flag emission, and Telegram UX",
+      "description": "Extend the pricing pipeline to emit per-line Summit trace flags derived from the SDA-001 sheet tool output. The Telegram approval UX surfaces soft signals (IDG warning, per-line check caveats) but never hard-locks the approve button. Jorge's 2026-04-09 standing green light removes the previous per-deal Summit consent gate.",
+      "acceptanceCriteria": [
+        "After the pricing step emits per-line cost basis, a new pipeline step emit_trace_flags runs the SDA-001 summit_sheet_lookup tool for each PN and produces per-line {summit_consignment: bool, trace_type: '145'|'8130'|null, tag_source: 'Summit Aerospace'|null, summit_cost_recent: number|null, summit_guidance: '70_30'|'over_cost'|'other'|null, idg_piece_part_warning: bool, per_line_check_required: string|null}",
+        "trace_type='145' when summit_consignment=true regardless of condition (Summit Aerospace is FAA Repair Station 145)",
+        "trace_type='8130' when summit_consignment=false AND condition in {SV, OH, New, NS}; trace_type=null when condition is AR (per AC 8130 condition rule: AR needs trace, not 8130)",
+        "idg_piece_part_warning=true when summit_consignment=true AND the part is categorized as IDG (V11 part tier HOT_IDG or equivalent)",
+        "per_line_check_required is populated from Gmail history mining when a prior thread on the same PN contains explicit caveats like 'check with <name>' (example: 767270 'check w/ Sergio' from thread 'Need 8130s' 2026-04-09). Null when no such caveat exists.",
+        "NO requires_summit_approval field on v1 events. The existing services/ils_auto_quote.py or equivalent SUMMIT_INTERNAL check still fires in the atlas layer for bookkeeping, but the Telegram gate does not disable its approve button based on it.",
+        "Telegram approval flow (existing in gateway/platforms/telegram.py) renders: green when all-standard-non-Summit-high-conviction, yellow when any Summit line or idg_piece_part_warning or fallback-drafted, red never (no hard locks in v1)",
+        "Telegram message body inline-notes the per_line_check_required value above the approve button when non-null",
+        "Draft_quote step (existing) enforces: any Summit-sourced line draft MUST contain the literal tokens '145' and 'Summit' in the relevant line description; rejected and regenerated if missing",
+        "Unit test tests/tools/test_trace_flags.py: Summit-consignment HOT_IDG line emits idg_piece_part_warning=true; non-Summit HOT_IDG line does not",
+        "Unit test: non-Summit AR line emits trace_type=null; non-Summit SV line emits trace_type='8130'; Summit line emits trace_type='145'",
+        "Unit test: per_line_check_required extraction pulls 'check with Sergio' from a mocked mine_gmail caveat result",
+        "Unit test: no event ever carries a requires_summit_approval field",
+        "Integration test tests/integration/test_summit_trace_flow.py: mock RFQ with 3 lines (1 Summit non-IDG, 1 Summit IDG piece part, 1 standard SV) produces trace_flags correctly and draft_quote output cites '145 trace, Summit Aerospace tags' for both Summit lines",
+        "pytest passes on new tests"
+      ],
+      "tests": [
+        "test_trace_flags",
+        "test_summit_trace_flow"
+      ],
+      "priority": 2,
+      "estimated_hours": 4,
+      "depends_on": [
+        "SDA-001"
+      ],
+      "files_to_create": [
+        "tests/tools/test_trace_flags.py",
+        "tests/integration/test_summit_trace_flow.py"
+      ],
+      "files_to_modify": [
+        "services/ils_auto_quote.py",
+        "gateway/platforms/telegram.py"
+      ],
+      "source_files": [],
+      "passes": false,
+      "notes": "AC directive 2026-04-09: Jorge standing green light removes hard approval lock. IDG piece parts remain a softer exception (yellow warning, not a block). Reference: project_summit_green_light memory file."
+    },
+    {
+      "id": "SDA-003",
+      "title": "No-price cascade orchestrator (engine -> sheet -> history -> solicit -> manual)",
+      "description": "Build a cascade orchestrator that tries every pricing source in order before falling through to manual Telegram entry. Cascade: V11 engine -> Summit 8140 sheet (SDA-001) -> Gmail history recency-weighted -> non-Summit outbound solicit (SDA-004, optional) -> manual Telegram entry. Summit-associated PNs skip the solicit step and go straight to manual.",
+      "acceptanceCriteria": [
+        "New module services/no_price_cascade.py implements a cascade function that accepts (pn, customer, context) and returns (cost_basis, provenance, confidence_flag, source_step)",
+        "Cascade step 1: call V11 engine. If engine returns a price, short-circuit and return immediately with provenance=v11_engine, confidence=green",
+        "Cascade step 2 (only on step 1 miss): call SDA-001 summit_sheet_lookup. If cost_basis is non-null, return with provenance=summit_sheet[+jorge_email_if_used], confidence=green",
+        "Cascade step 3 (only on step 2 miss): call mine_gmail for recency-weighted history on the PN. If 2+ historical quotes in last 12 months, return with weighted_median, provenance=gmail_history, confidence=yellow",
+        "Cascade step 4 (only on step 3 miss): branch on Summit association. (a) If PN has ANY Summit association (sheet entry, any prior email from @summitmro.com, stock_source=SUMMIT), SKIP the solicit and jump to step 5 manual Telegram entry. (b) If PN has NO Summit association, delegate to SDA-004 outbound_solicit_tool.",
+        "Cascade step 5: manual Telegram entry. Sends prompt with PN, customer, qty, condition, top 5 Gmail history matches (even below threshold), Summit sheet entry if any, Kent_Ext_Cost. Bot listens for AC reply with numeric value (formats: 1250, $1,250, 1250.00). Returns with provenance=ac_telegram_manual, confidence=yellow.",
+        "Each step short-circuits on success. A hit in step 1 never runs step 2+.",
+        "Downstream draft_quote treats prices from ALL cascade steps as immutable ground truth (same rules as engine prices).",
+        "Unit test tests/services/test_no_price_cascade.py: PN present in Summit sheet returns step-2 result and never calls Gmail history or solicit",
+        "Unit test: PN missing from sheet with 3 Gmail matches returns step-3 weighted_median",
+        "Unit test: Summit-associated PN missing from all local sources SKIPS step 4 solicit and goes to step 5 manual (Jorge and Kent never contacted)",
+        "Unit test: non-Summit PN missing from all local sources triggers step 4 solicit via SDA-004",
+        "Unit test: cascade sets provenance and confidence_flag correctly per step",
+        "Integration test tests/integration/test_cascade_live.py: full cascade with PN 273T1102-8 (present in sheet with Jorge-updated cost) returns step-2 price without invoking Gmail history",
+        "pytest passes on new tests"
+      ],
+      "tests": [
+        "test_no_price_cascade",
+        "test_cascade_live"
+      ],
+      "priority": 3,
+      "estimated_hours": 5,
+      "depends_on": [
+        "SDA-001"
+      ],
+      "files_to_create": [
+        "services/no_price_cascade.py",
+        "tests/services/test_no_price_cascade.py",
+        "tests/integration/test_cascade_live.py"
+      ],
+      "files_to_modify": [
+        "services/ils_auto_quote.py"
+      ],
+      "source_files": [],
+      "passes": false,
+      "notes": "SDA-004 is a SOFT dependency -- if SDA-004 is not yet merged, step 4 falls through to step 5 manual entry with a log warning. Cascade still functions correctly, just with a reduced automation surface for non-Summit parts."
+    },
+    {
+      "id": "SDA-004",
+      "title": "Outbound solicit tool for non-Summit vendors (Summit excluded)",
+      "description": "Build a tool that drafts an outbound price-request email to a NON-SUMMIT vendor when cascade step 4 fires. Hard excludes Jorge Fernandez and Kent Kendrick per AC directive 2026-04-09 ('no jorge in the loop dont bother him nor kent'). Any @summitmro.com recipient is blocked on the default path and requires explicit manual override.",
+      "acceptanceCriteria": [
+        "New tool tools/outbound_solicit_tool.py registered in tools/registry.py as draft_outbound_solicit",
+        "Task privacy=low (outbound to vendor), quality=S, volume=low. Routes to Claude Opus 4.6 via the existing claude_reasoning_tool.py.",
+        "Vendor selection logic: (1) most recent NON-Summit vendor from Gmail history for this PN (any sender domain except @summitmro.com); (2) else escalate to AC via Telegram for manual vendor selection via Edit Recipient flow",
+        "Hard invariant: draft recipient is never @summitmro.com under the default path. Unit test enforces. If Gmail history returns a summitmro.com candidate, skip it and use the next non-Summit candidate.",
+        "Draft body: subject 'Need pricing on <PN list>' (matches AC voice from thread 'Need 8130s' 2026-04-09), body lists each PN with description and condition, signed with AC's standard signature. Reference voice template uses AC's phrasing patterns like 'lmk what price you like here'.",
+        "Price-free guarantee: the draft body contains no $ signs, no 'cost' or 'price' tokens outside a question phrase. Regex audit rejects any draft with dollar figures or price statements.",
+        "Telegram HITL: drafted solicit is sent to @ACthecollector with buttons [Send Solicit] [Skip] [Manual Price] [Edit Recipient]. Uses existing Telegram approval callback infrastructure from gateway/platforms/telegram.py.",
+        "Send Solicit: sends via SMTP (reuse existing email-sending code from E-007), stores pending_solicit record linked to the original RFQ event, timeout 24h configurable",
+        "Edit Recipient: if AC types a summitmro.com address, prompt 'Summit excluded from auto-solicits -- send anyway?' with explicit y/n. This is the only path to a Summit recipient.",
+        "Skip: logs decision, cascade falls through to step 5 manual Telegram entry",
+        "Manual Price: inline numeric reply on Telegram proceeds directly to draft_quote using the manual value",
+        "Reply ingestion: when vendor replies to the solicit, email poller emits rfq.vendor_response event linked to pending_solicit. A new extract_vendor_cost task (Qwen3-30B local via existing local LLM wiring if present, else Claude Haiku) parses the reply body for cost numbers using SDA-001 merge rules.",
+        "Resume: once extract_vendor_cost succeeds, cascade resumes at draft_quote using extracted vendor cost with provenance=vendor_reply, source_email=<reply messageId>",
+        "Timeout: if no reply in 24h, Telegram reminder sent to AC asking whether to wait, escalate, or drop",
+        "Idempotency: pending_solicit record is idempotent per (PN, customer) -- two rapid triggers produce exactly one outbound email",
+        "Unit test tests/tools/test_outbound_solicit.py: PN with Summit association causes the tool to NOT draft (caller should route to step 5 manual). Tool returns a SKIPPED result.",
+        "Unit test: PN with no Summit association and a non-Summit Gmail vendor history produces a solicit draft addressed to the non-Summit vendor",
+        "Unit test: Gmail history returns a summitmro.com candidate -- tool skips it and uses the next non-Summit candidate or returns an escalation request",
+        "Unit test: draft containing '$500' in the body is rejected by the price-free check",
+        "Unit test: manual recipient override with a summitmro.com address triggers the confirmation prompt",
+        "Unit test: mock non-Summit vendor reply is parsed by extract_vendor_cost and resumes the pipeline",
+        "Unit test: pending_solicit idempotency -- two triggers produce exactly one email",
+        "Integration test tests/integration/test_outbound_solicit_flow.py: non-Summit PN with no price triggers the tool, produces a price-free draft, AC approves on mock Telegram, SMTP send is invoked, mock reply is ingested, cascade resumes",
+        "pytest passes on new tests"
+      ],
+      "tests": [
+        "test_outbound_solicit",
+        "test_outbound_solicit_flow"
+      ],
+      "priority": 4,
+      "estimated_hours": 5,
+      "depends_on": [
+        "SDA-003"
+      ],
+      "files_to_create": [
+        "tools/outbound_solicit_tool.py",
+        "tests/tools/test_outbound_solicit.py",
+        "tests/integration/test_outbound_solicit_flow.py"
+      ],
+      "files_to_modify": [
+        "tools/registry.py",
+        "tools/__init__.py",
+        "services/no_price_cascade.py"
+      ],
+      "source_files": [],
+      "passes": false,
+      "notes": "AC directive 2026-04-09: 'no jorge in the loop dont bother him nor kent'. The Summit exclusion is a hard invariant on the default path; manual override via Edit Recipient requires explicit y/n confirmation. The voice template should match AC's existing pattern from the Jorge 'Need 8130s' thread."
+    },
+    {
+      "id": "SDA-005",
+      "title": "Incremental quote append detection and Telegram offer flow",
+      "description": "Detect when an incoming RFQ from a repeat customer relates to an open quote from the last N days and offer to APPEND the new lines to the existing quote rather than drafting a fresh one. Three match signals in priority order: customer_quote_ref exact match, customer + overlapping PN within N days, customer + PN family within N days.",
+      "acceptanceCriteria": [
+        "New module services/quote_append_detector.py detects open quote matches before the cascade runs",
+        "Triggered after parse_rfq emits the parsed event and BEFORE cascade step 1, so append-hits avoid wasted engine/sheet/history calls",
+        "Match signal #1: if parsed.customer_quote_ref matches an existing open quote's client_order_ref in V11 (state in draft|sent), raise append-offer with confidence=high",
+        "Match signal #2: customer matches AND >=1 PN from new RFQ exists on an open quote from same customer within last 7 days (configurable HERMES_APPEND_WINDOW_DAYS), confidence=med",
+        "Match signal #3: customer matches AND PN family (NHA or similar semantic grouping) overlaps within 7 days, confidence=low",
+        "Append-offer delivered to Telegram via existing approval channel as a SPECIAL message: shows existing open quote summary (quote#, date, lines, total) alongside the new RFQ parse, with buttons [Append] [New Quote] [Reject]",
+        "Append button: new RFQ lines sent to V11 via a new endpoint or direct XML-RPC call that adds lines to the existing draft/sent SO without re-creating it. Preserves client_order_ref. Re-runs pricing pass on only the new lines.",
+        "New Quote button: pipeline proceeds normally (falls through to cascade step 1)",
+        "Reject button: RFQ marked duplicate/unnecessary, logged, dropped",
+        "Cross-customer ref collision: if customer_quote_ref matches an open quote but customer is mismatched (rare), suppress the match and log a warning",
+        "Append never crosses customer boundaries",
+        "Unit test tests/services/test_quote_append_detector.py: customer_quote_ref match emits append-offer with high confidence",
+        "Unit test: same customer + 1 overlapping PN + 3 days ago = med confidence",
+        "Unit test: different customer with same PN does NOT cross-pollinate",
+        "Unit test: customer_quote_ref collision across customers is suppressed with warning log",
+        "Integration test tests/integration/test_append_flow.py: Append button click propagates new lines to existing V11 SO, preserving client_order_ref",
+        "pytest passes on new tests"
+      ],
+      "tests": [
+        "test_quote_append_detector",
+        "test_append_flow"
+      ],
+      "priority": 6,
+      "estimated_hours": 4,
+      "depends_on": [
+        "SDA-006"
+      ],
+      "files_to_create": [
+        "services/quote_append_detector.py",
+        "tests/services/test_quote_append_detector.py",
+        "tests/integration/test_append_flow.py"
+      ],
+      "files_to_modify": [
+        "services/ils_auto_quote.py",
+        "gateway/platforms/telegram.py"
+      ],
+      "source_files": [],
+      "passes": false,
+      "notes": "Replaces hard-block duplicate detection with append-offer. Depends on SDA-006 for customer_quote_ref extraction."
+    },
+    {
+      "id": "SDA-006",
+      "title": "Customer quote reference extraction and propagation",
+      "description": "Extract fuzzy customer quote references (Ref:, Reference:, Q#, Q:, Your quote, quote #, quote number) from inbound RFQ text during parsing. Carry the extracted ref into the drafted quote subject and body, and propagate to V11 as client_order_ref.",
+      "acceptanceCriteria": [
+        "parse_rfq step (existing in services/ils_auto_quote.py and email RFQ handlers) is extended to extract customer_quote_ref from the RFQ body",
+        "Extraction patterns (case-insensitive): 'Ref:', 'Reference:', 'Q#', 'Q:', 'Your quote', 'quote #', 'quote number', followed by an adjacent alphanumeric token (letters, digits, dashes)",
+        "parsed.customer_quote_ref is null when no pattern matches, otherwise the captured token",
+        "draft_quote step (existing) includes the ref in the subject when non-null: 'Re: Your Q# <ref> -- AAC quote'",
+        "draft_quote body opening line references the ref explicitly",
+        "Propagation: when the quote is sent, the V11 SO creation payload carries customer_quote_ref as client_order_ref (existing field)",
+        "Unit test tests/services/test_customer_quote_ref.py: 8 fuzzy pattern variants correctly extract the adjacent token",
+        "Unit test: null when no pattern matches",
+        "Unit test: draft subject includes ref when present",
+        "Unit test: V11 SO creation carries client_order_ref",
+        "pytest passes"
+      ],
+      "tests": [
+        "test_customer_quote_ref"
+      ],
+      "priority": 5,
+      "estimated_hours": 2,
+      "depends_on": [],
+      "files_to_create": [
+        "tests/services/test_customer_quote_ref.py"
+      ],
+      "files_to_modify": [
+        "services/ils_auto_quote.py"
+      ],
+      "source_files": [],
+      "passes": false,
+      "notes": "Smallest story in the PRD. Pure parser extension with downstream field propagation through existing client_order_ref field. Must land before SDA-005 which uses customer_quote_ref as match signal #1."
+    },
+    {
+      "id": "SDA-007",
+      "title": "V11 engine capability verification and atlas addendum generation",
+      "description": "Probe the V11 pricing engine for two capabilities that SDA-002 Summit trace flag emission and accurate AR/SV piece-part quotes depend on: (a) condition-tier compression for SRU/piece-parts (tighter AR/SV spread than rotables/LRUs) and (b) LIFO lot selection with higher-assembly teardown cost recovery. If either capability is missing, auto-generate atlas PRD addendum stubs so the atlas execution track can close the gap.",
+      "acceptanceCriteria": [
+        "New script scripts/verify_engine_capabilities.py runs as a standalone check",
+        "Verification probe #1 (condition compression): query V11 for a known SRU piece-part in both AR and SV conditions, compute (sv_price - ar_price) / sv_price. If delta > HERMES_COMPRESSION_THRESHOLD (default 12%), the engine is NOT compressing piece parts. For the same test on a known LRU/rotable, confirm the full spread applies.",
+        "Verification probe #2 (LIFO): query V11 for a part with >=2 available lots where at least one has a recent higher-assembly teardown cost signal. Confirm the engine selects the newer teardown first (LIFO). If current selection is FIFO, flag as non-compliant.",
+        "Output: atlas-capability-report.md in the Hermes repo listing which capabilities exist, which are missing",
+        "When a capability is missing, auto-create a file tasks/prd-atlas-addendum-<slug>.json with story stubs AC can review and hand to the atlas execution track. Do NOT modify the migration PRD or any advanced-parts atlas file directly.",
+        "Missing capability #1 creates tasks/prd-atlas-addendum-srulru-compression.json with the story: 'Plumb unit_class into V11 EnrichedPart (advanced-parts src/lib/types.ts:171-207), add SRU/LRU branching to CONDITION_MULTIPLIER in src/lib/private/pricing-engine.ts such that SRU/piece-part AR/SV spread tightens to configurable tight_spread_pct (default 4%) while LRU/rotable retains existing 8% spread'",
+        "Missing capability #2 creates tasks/prd-atlas-addendum-lifo-teardown.json with the story: 'Add lifo_teardown_recovery sort mode to src/lib/lot-ranking.ts that sorts lots with pending higher-assembly teardown cost recovery first (newest teardown first), falling back to existing FIFO for lots without teardown cost. Add teardown_cost_recovery_pending boolean and teardown_cost_recency_date fields to the lot/pool model.'",
+        "SDA-002 draft_quote step adds a precondition check: if the capability report marks either capability as missing, piece-part AR drafts get a yellow confidence flag (accurate cost signal not yet possible) until the atlas addendum closes",
+        "Unit test tests/scripts/test_verify_engine_capabilities.py: probes run against a mock V11 engine and correctly detect both FIFO (non-compliant) and LIFO (compliant) behavior",
+        "Unit test: missing-capability detection correctly creates the addendum JSON files and validates they parse as valid Ralph PRDs",
+        "Integration test (manual, gated): run probes against real V11 via existing v11_client.py, produce capability report, confirm any generated addendum files parse",
+        "pytest passes"
+      ],
+      "tests": [
+        "test_verify_engine_capabilities"
+      ],
+      "priority": 7,
+      "estimated_hours": 3,
+      "depends_on": [
+        "SDA-002"
+      ],
+      "files_to_create": [
+        "scripts/verify_engine_capabilities.py",
+        "tests/scripts/test_verify_engine_capabilities.py"
+      ],
+      "files_to_modify": [],
+      "source_files": [],
+      "passes": false,
+      "notes": "Surfaces the two V11-side engine gaps (condition compression for piece parts, LIFO lot selection) as atlas PRD addendum candidates without invading the atlas PRD or advanced-parts repo. Atlas execution track owns the actual engine changes."
+    },
+    {
+      "id": "SDA-008",
+      "title": "Domain rules compliance integration test suite",
+      "description": "Comprehensive integration test suite that exercises the 5 business rules end-to-end and fails fast if any regression breaks them. The rules: (1) condition-tier pricing compression for piece parts, (2) LIFO Advanced ID selection, (3) Summit 145 trace citation, (4) incremental quote append, (5) customer quote reference propagation. Runs as a gate in CI before any deploy.",
+      "acceptanceCriteria": [
+        "New test file tests/integration/test_domain_rules.py exercises all 5 rules",
+        "Rule 1 test: piece-part AR vs SV quote delta is within tight_spread_pct (4% default) when engine supports compression; yellow confidence when it does not",
+        "Rule 2 test: LIFO selection picks newest teardown when pending recovery exists; falls back to FIFO otherwise",
+        "Rule 3 test: Summit-sourced line draft contains '145' and 'Summit Aerospace tags' tokens in the relevant line description",
+        "Rule 4 test: second RFQ from same customer with overlapping PN within 7 days triggers append-offer with med+ confidence",
+        "Rule 5 test: RFQ with 'Ref: ABC-123' in body produces draft with 'Your Q# ABC-123' in subject and V11 SO with client_order_ref='ABC-123'",
+        "Test harness uses fixture data under tests/fixtures/domain_rules/ (mock V11 responses, mock Gmail mailbox snapshots, sample RFQs)",
+        "Tests are tagged with pytest marker @pytest.mark.domain_rules for selective runs: pytest -m domain_rules",
+        "CI integration: add domain_rules marker run to the existing CI workflow (pyproject.toml or equivalent) as a required gate before deploy",
+        "All 5 tests pass against the full implemented stack (SDA-001 through SDA-007)",
+        "pytest -m domain_rules returns 0 (all pass) after SDA-001 through SDA-007 are complete"
+      ],
+      "tests": [
+        "test_domain_rules"
+      ],
+      "priority": 8,
+      "estimated_hours": 5,
+      "depends_on": [
+        "SDA-001",
+        "SDA-002",
+        "SDA-003",
+        "SDA-004",
+        "SDA-005",
+        "SDA-006",
+        "SDA-007"
+      ],
+      "files_to_create": [
+        "tests/integration/test_domain_rules.py",
+        "tests/fixtures/domain_rules/mock_v11_responses.json",
+        "tests/fixtures/domain_rules/mock_gmail_mailbox.json",
+        "tests/fixtures/domain_rules/sample_rfqs.json"
+      ],
+      "files_to_modify": [
+        "pyproject.toml"
+      ],
+      "source_files": [],
+      "passes": false,
+      "notes": "Final story of the PRD. Acts as a regression gate for the 5 business rules. Runs against the completed stack (SDA-001 through SDA-007). Adds a pytest marker so CI can selectively run this suite."
+    }
+  ]
+}
