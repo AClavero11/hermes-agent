@@ -105,7 +105,7 @@
         "~/.hermes/services/ils_auto_quote.py (loose file, <=10 lines total change)"
       ],
       "source_files": [],
-      "passes": false,
+      "passes": true,
       "notes": "This is the ONLY story that touches a loose file outside the hermes-agent repo. Ralph must use direct Edit tool calls with absolute paths, not worktree edits. The modification must be minimal and preserve all existing behavior as a fallback. If the bridge fails for any reason, the pipeline continues as if SDA-WIRE never happened."
     },
     {

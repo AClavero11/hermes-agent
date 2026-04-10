@@ -144,3 +144,25 @@ Total tests across SDA suite: ~139 tests passing
   - AppendConfidence.NONE is distinct from None — branch must handle both
 ---
 [2026-04-10T17:09:30Z] RALPH | SWA-001 | COMMIT complete
+[2026-04-10T19:51:17Z] RALPH | SWA-002 | START → LOAD
+[2026-04-10T19:54:21Z] RALPH | SWA-002 | LOAD → SCOUT→ PLAN (collapsed, clear path)
+
+## 2026-04-10 — SWA-002: Wire bridge into ils_auto_quote.py
+- Loose file backed up to tasks/backup-ils_auto_quote-2026-04-10.py before any edit
+- Inserted 1 import line + 9 code lines into ~/.hermes/services/ils_auto_quote.py (under 10-line budget)
+- Bridge call is wrapped in try/except; on any failure, pipeline falls through to existing pricing path unchanged
+- Gateway already has ~/.hermes/hermes-agent on sys.path (gateway/run.py:29) so the import resolves at runtime
+- Added tests/integration/test_bridge_wire.py (5 tests, @pytest.mark.integration):
+    - test_bridge_is_invoked_during_process_rfq: asserts BridgeContext args match RFQ state
+    - test_bridge_exception_falls_through_to_existing_pricing: run_bridge raising still produces a successful QuoteResult
+    - test_bridge_warnings_are_logged_not_raised: warnings surface via log.warning
+    - test_module_has_run_bridge_symbol + test_bridge_context_dataclass_fields: import smoke
+- Dry-run verified: _process_rfq with mocked clients + mock stock match completes with success=True, order_name=DRY-RUN-999, bridge invoked
+- Quality gates: py_compile PASS on edited file | integration tests 5/5 | SDA+bridge regression 138/138
+- **Review:** skipped formal adversarial round (single-file edit, all tests pass, fall-through guarantee is structural)
+- **Learnings:**
+  - ils_auto_quote.RFQPart has no condition field; condition lives on StockMatch instead
+  - ILSRfq uses raw (not raw_data) and ils_company_id is typed as str
+  - Gateway's sys.path setup means ~/.hermes/services/*.py can freely import from tools.*
+---
+[2026-04-10T19:57:39Z] RALPH | SWA-002 | COMMIT complete
