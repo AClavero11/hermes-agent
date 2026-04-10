@@ -218,3 +218,82 @@ class TestStalenessOverride:
         assert second["summit_guidance"] is None
         assert second["guidance_source"] is None
         assert second["provenance"] == {}
+
+
+class TestMultiPnEmailParsing:
+    """Regression tests for PN-scoped parsing of multi-PN Jorge emails."""
+
+    def setup_method(self):
+        _clear_cache()
+
+    def teardown_method(self):
+        _clear_cache()
+
+    MULTI_PN_BODY = (
+        "3605812-17   Summit Cost $ 444.00 see what you can max the sale. 70/30\n"
+        "\n"
+        "273T1102-8  try to sale over your cost 22,500.00\n"
+        "\n"
+        "273T6301-5 Summit Cost $ 520.00 try to max the sale 70/30\n"
+        "\n"
+        "273T6101-9,  Summit cost, $ 5,400.00 try to max the sale 70/30\n"
+        "\n"
+        "2206405-1 ,  Summit cost $ 0 one the other one 5K try to max the sale 70/30\n"
+    )
+
+    def _mock_email(self):
+        return [
+            {
+                "message_id": "msg-multi-pn",
+                "date": "2026-04-09",
+                "body": self.MULTI_PN_BODY,
+            }
+        ]
+
+    def test_3605812_17_gets_70_30_not_over_cost(self):
+        """Regression: 3605812-17's 70/30 guidance must not be overridden
+        by the 'over your cost' phrase that belongs to 273T1102-8 later
+        in the same email body."""
+        with patch(
+            "tools.summit_sheet_tool._fetch_jorge_emails",
+            return_value=self._mock_email(),
+        ):
+            result = summit_sheet_lookup("3605812-17")
+        assert result is not None
+        assert result["cost_basis"] == 444.0
+        assert result["summit_guidance"] == "70_30"
+        assert result["cost_source"] == "jorge_email"
+
+    def test_273T1102_8_gets_over_cost_22500(self):
+        """273T1102-8 must pick up its own 'over your cost 22,500' and NOT
+        the earlier 'Summit Cost $ 444' from 3605812-17."""
+        with patch(
+            "tools.summit_sheet_tool._fetch_jorge_emails",
+            return_value=self._mock_email(),
+        ):
+            result = summit_sheet_lookup("273T1102-8")
+        assert result is not None
+        assert result["cost_basis"] == 22500.0
+        assert result["summit_guidance"] == "over_cost"
+
+    def test_273T6301_5_gets_own_520_cost(self):
+        """273T6301-5 must pick up its own Summit Cost $520, not 3605812-17's $444."""
+        with patch(
+            "tools.summit_sheet_tool._fetch_jorge_emails",
+            return_value=self._mock_email(),
+        ):
+            result = summit_sheet_lookup("273T6301-5")
+        assert result is not None
+        assert result["cost_basis"] == 520.0
+        assert result["summit_guidance"] == "70_30"
+
+    def test_273T6101_9_gets_own_5400_cost(self):
+        """273T6101-9's cost $5,400 must be its own, not neighbors'."""
+        with patch(
+            "tools.summit_sheet_tool._fetch_jorge_emails",
+            return_value=self._mock_email(),
+        ):
+            result = summit_sheet_lookup("273T6101-9")
+        assert result is not None
+        assert result["cost_basis"] == 5400.0
+        assert result["summit_guidance"] == "70_30"

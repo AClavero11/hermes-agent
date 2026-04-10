@@ -359,29 +359,113 @@ def _expand_conditions(value: Any) -> List[str]:
 # ---------------------------------------------------------------------------
 
 
+_REPLY_HEADER_RE = re.compile(
+    r"(?im)^(?:On\s.+?\s(?:wrote|said):|From:\s.+?\n|-----\s*Original Message\s*-----)",
+)
+
+
+def _strip_quoted_section(body: str) -> str:
+    """Return the part of the email body that is NOT a reply quote.
+
+    Jorge's "Yes" reply to AC contains all the prior pricing text quoted
+    below an "On Apr 9, 2026, at 7:18 PM, Anthony Clavero wrote:" marker.
+    We want the fresh content only -- any PN extracted from the quoted
+    chain belongs to the older message and should be parsed there, not
+    in the reply envelope.
+    """
+    if not body:
+        return body
+    # Cut at the first reply header marker that we recognize.
+    match = _REPLY_HEADER_RE.search(body)
+    if match:
+        body = body[: match.start()]
+    # Also strip lines that start with ">" which are the older quote-prefix
+    # convention.
+    lines = []
+    for line in body.splitlines():
+        stripped = line.lstrip()
+        if stripped.startswith(">"):
+            continue
+        lines.append(line)
+    return "\n".join(lines)
+
+
 def _parse_jorge_cost(
     body: str, pn: str
 ) -> Optional[Tuple[float, str]]:
     """Parse a Jorge email body for a cost figure and a guidance label.
 
+    Jorge's real emails often list multiple PNs in the same message with
+    different cost and guidance statements per PN. Every extraction here
+    must be scoped to a window around the target PN; body-wide searches
+    cause cross-PN pollution (e.g. attributing "over your cost 22,500"
+    from line 2 to the PN listed on line 1).
+
+    Reply chains are also stripped: when Jorge replies "Yes" to AC, the
+    older pricing message gets re-embedded in the new message body. We
+    strip the quoted section and only parse the fresh content, so the
+    caller's newest-first iteration naturally falls through to the real
+    pricing message.
+
     Returns ``(cost, guidance)`` or ``None`` when nothing usable is found.
 
     Guidance is one of:
         - ``"70_30"`` if "70/30" appears near the PN reference
-        - ``"over_cost"`` if "over your cost" appears
+        - ``"over_cost"`` if "over your cost" appears near the PN reference
         - ``"other"`` otherwise when a cost is still extracted
     """
     if not body:
         return None
 
-    # Prefer an explicit "Summit cost $X" statement first
+    body = _strip_quoted_section(body)
+
+    pn_pos = body.find(pn)
+    if pn_pos == -1:
+        return None
+
+    # Scope the search to the paragraph that contains the PN. Jorge's
+    # real emails list one PN per paragraph, separated by blank lines
+    # (e.g. "\n\n" or ">\n>\n" after quoting). Searching the whole body
+    # cross-contaminates: e.g. "over your cost" from PN B's paragraph
+    # bleeds into PN A's guidance. Scoping to the paragraph is the
+    # single most reliable boundary for this sender's writing style.
+    para_start = body.rfind("\n\n", 0, pn_pos)
+    para_start = 0 if para_start == -1 else para_start + 2
+    para_end = body.find("\n\n", pn_pos)
+    if para_end == -1:
+        para_end = len(body)
+    window = body[para_start:para_end]
+
+    # Secondary guard: even within a "paragraph" (by blank-line split),
+    # a single-newline list may cram multiple PNs. Trim at the first
+    # line break that is followed by another digit-bearing token.
+    # Single-line trimming: after our PN, if a newline appears followed
+    # by any non-whitespace, cut there. This keeps the window to a
+    # single visual line for terse listings.
+    rel_pn_pos = pn_pos - para_start
+    after = window[rel_pn_pos + len(pn):]
+    newline_break = after.find("\n")
+    if newline_break != -1:
+        # Only cut if the next non-empty line starts with something that
+        # could be a PN (digit or uppercase letter) -- preserves
+        # continuation phrases like "see what you can max" that stay on
+        # the next wrapped line but belong to our PN.
+        rest = after[newline_break + 1:]
+        stripped_rest = rest.lstrip()
+        if stripped_rest and (stripped_rest[0].isdigit() or (
+            stripped_rest[0].isalpha() and stripped_rest[0].isupper()
+            and len(stripped_rest) > 1
+            and (stripped_rest[1].isdigit() or stripped_rest[1] == stripped_rest[1].upper())
+        )):
+            window = window[: rel_pn_pos + len(pn) + newline_break]
+
     cost: Optional[float] = None
-    match = _SUMMIT_COST_RE.search(body)
+    match = _SUMMIT_COST_RE.search(window)
     if match:
         cost = _to_float(match.group(1))
 
     if cost is None:
-        over_match = _OVER_YOUR_COST_RE.search(body)
+        over_match = _OVER_YOUR_COST_RE.search(window)
         if over_match:
             cost = _to_float(over_match.group(1))
 
@@ -389,19 +473,13 @@ def _parse_jorge_cost(
         return None
 
     guidance = "other"
-    # "over your cost" wins over 70/30 because it's a harder instruction
-    if re.search(r"over your cost", body, re.IGNORECASE):
+    # Both guidance checks now run on the PN-scoped window, not the whole
+    # body. "over your cost" still wins over 70/30 because it's a harder
+    # instruction -- but only when both appear in this PN's window.
+    if re.search(r"over your cost", window, re.IGNORECASE):
         guidance = "over_cost"
-    else:
-        # Look for a 70/30 hint within a small window of the PN mention
-        pn_pos = body.find(pn)
-        search_slice = body
-        if pn_pos != -1:
-            start = max(0, pn_pos - 400)
-            end = min(len(body), pn_pos + 400)
-            search_slice = body[start:end]
-        if "70/30" in search_slice:
-            guidance = "70_30"
+    elif "70/30" in window:
+        guidance = "70_30"
 
     return cost, guidance
 
