@@ -75,3 +75,12 @@ Branch: ralph/summit-domain-addons
 - check_manual_recipient_override prompts confirmation on @summitmro.com
 - Worker efficiency: 8 tool uses
 ---
+
+## 2026-04-10 - SDA-006: Customer quote reference extraction - COMPLETE
+- tools/customer_quote_ref.py (pure extractor)
+- tests/tools/test_customer_quote_ref.py (29 tests, 5 classes)
+- 13 fuzzy patterns recognized, case-insensitive
+- Position-first match order (not pattern-order)
+- False positive filter for TBD/TBA/N/A/NONE/UNKNOWN
+- Worker efficiency: 6 tool uses
+---

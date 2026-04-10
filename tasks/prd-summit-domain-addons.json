@@ -284,8 +284,8 @@
       ],
       "files_to_modify": [],
       "source_files": [],
-      "passes": false,
-      "notes": "Smallest story in the PRD. Pure parser extension with downstream field propagation through existing client_order_ref field. Must land before SDA-005 which uses customer_quote_ref as match signal #1. | REFRAMED 2026-04-10: pure extractor function in tools/customer_quote_ref.py. Propagation through draft_quote and V11 client_order_ref is a post-migration wiring task once the pipeline lives in a git-tracked location."
+      "passes": true,
+      "notes": "Smallest story in the PRD. Pure parser extension with downstream field propagation through existing client_order_ref field. Must land before SDA-005 which uses customer_quote_ref as match signal #1. | REFRAMED 2026-04-10: pure extractor function in tools/customer_quote_ref.py. Propagation through draft_quote and V11 client_order_ref is a post-migration wiring task once the pipeline lives in a git-tracked location. | COMPLETED 2026-04-10. 29 unit tests passing. Position-first match order chosen over pattern-order."
     },
     {
       "id": "SDA-007",
