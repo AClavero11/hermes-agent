@@ -228,7 +228,7 @@
       ],
       "files_to_modify": [],
       "source_files": [],
-      "passes": false,
+      "passes": true,
       "notes": "Documentation-only story. Safe to defer if time is tight, but valuable as an operational handoff when you're not the one on call."
     }
   ]

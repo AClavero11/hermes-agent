@@ -221,3 +221,16 @@ Total tests across SDA suite: ~139 tests passing
   - Summit "over_cost" guidance in Jorge emails legitimately produces 5-6x Kent cost overrides (sell-side advice, not cost typos) — the default 3x sanity threshold is conservative for this domain
 ---
 [2026-04-10T20:15:11Z] RALPH | SWA-005 | COMMIT complete
+[2026-04-10T20:15:24Z] RALPH | SWA-006 | START → IMPLEMENT
+
+## 2026-04-10 — SWA-006: SDA-WIRE runbook documentation
+- docs/sda-wire-runbook.md: 271-line operational reference for future maintainers
+- 8 sections: Architecture, Data Flow (ASCII diagram), Enable/Disable, Troubleshooting (grep-able error pattern table + 4 likely failure modes), Observability, Rollback, Known Limitations, Reference
+- All 8 SDA tools + loose file + gateway integration referenced by name
+- Rollback procedure: restore tasks/backup-ils_auto_quote-2026-04-10.py + restart gateway
+- Known limitations document Jorge parser fragility, integration tests gated, 3 deferred test files, Telegram wire-up dependency on gateway, placeholder _noop deps in SWA-003
+- Quality gates: all required sections present | code fences balanced | 13/13 live file references resolve | 3 deferred files correctly marked as not-written
+- **Review:** self-reviewed; no delegate needed for a documentation story
+---
+[2026-04-10T20:18:12Z] RALPH | SWA-006 | COMMIT complete
+[2026-04-10T20:18:12Z] RALPH | SDA-WIRE PRD | ALL STORIES COMPLETE
