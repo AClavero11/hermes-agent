@@ -73,7 +73,7 @@
         "tools/quote_append_detector.py (read for API)",
         "tools/outbound_solicit_tool.py (read for API)"
       ],
-      "passes": false,
+      "passes": true,
       "notes": "Foundation story. Everything else depends on this. Keep the bridge PURE — no I/O, no side effects, all external dependencies injected. The ils_auto_quote.py integration (SWA-002) is where side effects live."
     },
     {
