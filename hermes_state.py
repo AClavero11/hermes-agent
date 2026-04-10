@@ -24,7 +24,7 @@ from typing import Dict, Any, List, Optional
 
 DEFAULT_DB_PATH = Path(os.getenv("HERMES_HOME", Path.home() / ".hermes")) / "state.db"
 
-SCHEMA_VERSION = 2
+SCHEMA_VERSION = 3
 
 SCHEMA_SQL = """
 CREATE TABLE IF NOT EXISTS schema_version (
@@ -66,6 +66,24 @@ CREATE INDEX IF NOT EXISTS idx_sessions_source ON sessions(source);
 CREATE INDEX IF NOT EXISTS idx_sessions_parent ON sessions(parent_session_id);
 CREATE INDEX IF NOT EXISTS idx_sessions_started ON sessions(started_at DESC);
 CREATE INDEX IF NOT EXISTS idx_messages_session ON messages(session_id, timestamp);
+
+CREATE TABLE IF NOT EXISTS invocation_log (
+    id TEXT PRIMARY KEY,
+    tool_name TEXT NOT NULL,
+    args_json TEXT,
+    result_json TEXT,
+    source TEXT NOT NULL,
+    model_used TEXT,
+    tokens_in INTEGER DEFAULT 0,
+    tokens_out INTEGER DEFAULT 0,
+    cost_usd REAL DEFAULT 0.0,
+    latency_ms INTEGER,
+    created_at REAL NOT NULL
+);
+
+CREATE INDEX IF NOT EXISTS idx_invocation_log_tool ON invocation_log(tool_name);
+CREATE INDEX IF NOT EXISTS idx_invocation_log_source ON invocation_log(source);
+CREATE INDEX IF NOT EXISTS idx_invocation_log_created ON invocation_log(created_at DESC);
 """
 
 FTS_SQL = """
@@ -98,7 +116,7 @@ class SessionDB:
     single writer via WAL mode). Each method opens its own cursor.
     """
 
-    def __init__(self, db_path: Path = None):
+    def __init__(self, db_path: Optional[Path] = None):
         self.db_path = db_path or DEFAULT_DB_PATH
         self.db_path.parent.mkdir(parents=True, exist_ok=True)
 
@@ -133,6 +151,28 @@ class SessionDB:
                 except sqlite3.OperationalError:
                     pass  # Column already exists
                 cursor.execute("UPDATE schema_version SET version = 2")
+            if current_version < 3:
+                # v3: add invocation_log table for tool call tracking
+                try:
+                    cursor.execute("""CREATE TABLE IF NOT EXISTS invocation_log (
+                        id TEXT PRIMARY KEY,
+                        tool_name TEXT NOT NULL,
+                        args_json TEXT,
+                        result_json TEXT,
+                        source TEXT NOT NULL,
+                        model_used TEXT,
+                        tokens_in INTEGER DEFAULT 0,
+                        tokens_out INTEGER DEFAULT 0,
+                        cost_usd REAL DEFAULT 0.0,
+                        latency_ms INTEGER,
+                        created_at REAL NOT NULL
+                    )""")
+                    cursor.execute("CREATE INDEX IF NOT EXISTS idx_invocation_log_tool ON invocation_log(tool_name)")
+                    cursor.execute("CREATE INDEX IF NOT EXISTS idx_invocation_log_source ON invocation_log(source)")
+                    cursor.execute("CREATE INDEX IF NOT EXISTS idx_invocation_log_created ON invocation_log(created_at DESC)")
+                except sqlite3.OperationalError:
+                    pass  # Table/indexes already exist
+                cursor.execute("UPDATE schema_version SET version = 3")
 
 
         # FTS5 setup (separate because CREATE VIRTUAL TABLE can't be in executescript with IF NOT EXISTS reliably)
@@ -143,11 +183,9 @@ class SessionDB:
 
         self._conn.commit()
 
-    def close(self):
+    def close(self) -> None:
         """Close the database connection."""
-        if self._conn:
-            self._conn.close()
-            self._conn = None
+        self._conn.close()
 
     # =========================================================================
     # Session lifecycle
@@ -157,11 +195,11 @@ class SessionDB:
         self,
         session_id: str,
         source: str,
-        model: str = None,
-        model_config: Dict[str, Any] = None,
-        system_prompt: str = None,
-        user_id: str = None,
-        parent_session_id: str = None,
+        model: Optional[str] = None,
+        model_config: Optional[Dict[str, Any]] = None,
+        system_prompt: Optional[str] = None,
+        user_id: Optional[str] = None,
+        parent_session_id: Optional[str] = None,
     ) -> str:
         """Create a new session record. Returns the session_id."""
         self._conn.execute(
@@ -189,6 +227,19 @@ class SessionDB:
             (time.time(), end_reason, session_id),
         )
         self._conn.commit()
+
+    def close_stale_sessions(self) -> int:
+        """Close any sessions left open from a previous process (crash recovery).
+
+        Returns the number of sessions closed.
+        """
+        cursor = self._conn.execute(
+            "UPDATE sessions SET ended_at = ?, end_reason = 'process_restart' "
+            "WHERE ended_at IS NULL",
+            (time.time(),),
+        )
+        self._conn.commit()
+        return cursor.rowcount
 
     def update_system_prompt(self, session_id: str, system_prompt: str) -> None:
         """Store the full assembled system prompt snapshot."""
@@ -227,12 +278,12 @@ class SessionDB:
         self,
         session_id: str,
         role: str,
-        content: str = None,
-        tool_name: str = None,
-        tool_calls: Any = None,
-        tool_call_id: str = None,
-        token_count: int = None,
-        finish_reason: str = None,
+        content: Optional[str] = None,
+        tool_name: Optional[str] = None,
+        tool_calls: Optional[Any] = None,
+        tool_call_id: Optional[str] = None,
+        token_count: Optional[int] = None,
+        finish_reason: Optional[str] = None,
     ) -> int:
         """
         Append a message to a session. Returns the message row ID.
@@ -256,7 +307,7 @@ class SessionDB:
                 finish_reason,
             ),
         )
-        msg_id = cursor.lastrowid
+        msg_id = cursor.lastrowid or 0
 
         # Update counters
         is_tool_related = role == "tool" or tool_calls is not None
@@ -325,8 +376,8 @@ class SessionDB:
     def search_messages(
         self,
         query: str,
-        source_filter: List[str] = None,
-        role_filter: List[str] = None,
+        source_filter: Optional[List[str]] = None,
+        role_filter: Optional[List[str]] = None,
         limit: int = 20,
         offset: int = 0,
     ) -> List[Dict[str, Any]]:
@@ -411,7 +462,7 @@ class SessionDB:
 
     def search_sessions(
         self,
-        source: str = None,
+        source: Optional[str] = None,
         limit: int = 20,
         offset: int = 0,
     ) -> List[Dict[str, Any]]:
@@ -432,7 +483,7 @@ class SessionDB:
     # Utility
     # =========================================================================
 
-    def session_count(self, source: str = None) -> int:
+    def session_count(self, source: Optional[str] = None) -> int:
         """Count sessions, optionally filtered by source."""
         if source:
             cursor = self._conn.execute(
@@ -442,7 +493,7 @@ class SessionDB:
             cursor = self._conn.execute("SELECT COUNT(*) FROM sessions")
         return cursor.fetchone()[0]
 
-    def message_count(self, session_id: str = None) -> int:
+    def message_count(self, session_id: Optional[str] = None) -> int:
         """Count messages, optionally for a specific session."""
         if session_id:
             cursor = self._conn.execute(
@@ -464,7 +515,7 @@ class SessionDB:
         messages = self.get_messages(session_id)
         return {**session, "messages": messages}
 
-    def export_all(self, source: str = None) -> List[Dict[str, Any]]:
+    def export_all(self, source: Optional[str] = None) -> List[Dict[str, Any]]:
         """
         Export all sessions (with messages) as a list of dicts.
         Suitable for writing to a JSONL file for backup/analysis.
@@ -499,7 +550,7 @@ class SessionDB:
         self._conn.commit()
         return True
 
-    def prune_sessions(self, older_than_days: int = 90, source: str = None) -> int:
+    def prune_sessions(self, older_than_days: int = 90, source: Optional[str] = None) -> int:
         """
         Delete sessions older than N days. Returns count of deleted sessions.
         Only prunes ended sessions (not active ones).
@@ -526,3 +577,126 @@ class SessionDB:
 
         self._conn.commit()
         return len(session_ids)
+
+    # =========================================================================
+    # Invocation Logging
+    # =========================================================================
+
+    def log_invocation(
+        self,
+        tool_name: str,
+        args: Any,
+        result: Any,
+        source: str,
+        model_used: Optional[str] = None,
+        tokens_in: int = 0,
+        tokens_out: int = 0,
+        cost_usd: float = 0.0,
+        latency_ms: int = 0,
+    ) -> str:
+        """
+        Log a tool invocation for cost tracking and latency analysis.
+
+        Args:
+            tool_name: Name of the invoked tool
+            args: Tool arguments (will be JSON-serialized)
+            result: Tool result (will be JSON-serialized)
+            source: Source of invocation ('http', 'mcp', 'cli', 'sdk', 'telegram', 'cron')
+            model_used: Optional model name if tool invocation used a model
+            tokens_in: Input tokens consumed (if model invocation)
+            tokens_out: Output tokens consumed (if model invocation)
+            cost_usd: Cost in USD (if model invocation)
+            latency_ms: Execution time in milliseconds
+
+        Returns:
+            Invocation record ID (UUID)
+        """
+        import uuid as _uuid
+
+        record_id = str(_uuid.uuid4())
+
+        self._conn.execute(
+            """INSERT INTO invocation_log (
+                id, tool_name, args_json, result_json, source,
+                model_used, tokens_in, tokens_out, cost_usd, latency_ms, created_at
+            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
+            (
+                record_id,
+                tool_name,
+                json.dumps(args) if args else None,
+                json.dumps(result) if result else None,
+                source,
+                model_used,
+                tokens_in,
+                tokens_out,
+                cost_usd,
+                latency_ms,
+                time.time(),
+            ),
+        )
+        self._conn.commit()
+        return record_id
+
+    def get_invocation_log(
+        self,
+        tool_name: Optional[str] = None,
+        source: Optional[str] = None,
+        limit: int = 100,
+        offset: int = 0,
+    ) -> List[Dict[str, Any]]:
+        """
+        Retrieve invocation log entries, optionally filtered by tool or source.
+
+        Returns:
+            List of invocation records (newest first)
+        """
+        where_clauses = []
+        params: list = []
+
+        if tool_name:
+            where_clauses.append("tool_name = ?")
+            params.append(tool_name)
+
+        if source:
+            where_clauses.append("source = ?")
+            params.append(source)
+
+        where_sql = " AND ".join(where_clauses) if where_clauses else "1=1"
+        params.extend([limit, offset])
+
+        sql = f"""
+            SELECT * FROM invocation_log
+            WHERE {where_sql}
+            ORDER BY created_at DESC
+            LIMIT ? OFFSET ?
+        """
+
+        cursor = self._conn.execute(sql, params)
+        return [dict(row) for row in cursor.fetchall()]
+
+    def get_invocation_stats(self, tool_name: Optional[str] = None) -> Dict[str, Any]:
+        """
+        Get aggregate statistics for tool invocations.
+
+        Returns:
+            Dict with keys: count, total_latency_ms, avg_latency_ms, total_cost_usd
+        """
+        where_sql = "WHERE tool_name = ?" if tool_name else "WHERE 1=1"
+        params = [tool_name] if tool_name else []
+
+        cursor = self._conn.execute(
+            f"""
+            SELECT
+                COUNT(*) as count,
+                SUM(latency_ms) as total_latency_ms,
+                AVG(latency_ms) as avg_latency_ms,
+                SUM(cost_usd) as total_cost_usd
+            FROM invocation_log
+            {where_sql}
+            """,
+            params,
+        )
+        row = cursor.fetchone()
+        if row is None:
+            return {"count": 0, "total_latency_ms": 0, "avg_latency_ms": 0, "total_cost_usd": 0}
+        return dict(row)

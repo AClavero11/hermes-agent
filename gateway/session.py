@@ -341,13 +341,15 @@ class SessionStore:
         self._loaded = True
     
     def _save(self) -> None:
-        """Save sessions index to disk (kept for session key -> ID mapping)."""
+        """Save sessions index to disk (atomic write to prevent corruption on crash)."""
         self.sessions_dir.mkdir(parents=True, exist_ok=True)
         sessions_file = self.sessions_dir / "sessions.json"
-        
+        tmp_file = sessions_file.with_suffix(".json.tmp")
+
         data = {key: entry.to_dict() for key, entry in self._entries.items()}
-        with open(sessions_file, "w") as f:
+        with open(tmp_file, "w") as f:
             json.dump(data, f, indent=2)
+        os.replace(str(tmp_file), str(sessions_file))
     
     def _generate_session_key(self, source: SessionSource) -> str:
         """Generate a session key from a source."""
@@ -624,30 +626,50 @@ class SessionStore:
                 f.write(json.dumps(msg, ensure_ascii=False) + "\n")
 
     def load_transcript(self, session_id: str) -> List[Dict[str, Any]]:
-        """Load all messages from a session's transcript."""
+        """Load all messages from a session's transcript.
+
+        Repairs any orphaned tool_use/tool_result blocks that may have been
+        persisted due to crashes, cron interleaving, or network failures.
+        """
         # Try SQLite first
         if self._db:
             try:
                 messages = self._db.get_messages_as_conversation(session_id)
                 if messages:
-                    return messages
+                    return self._repair_loaded_transcript(messages)
             except Exception as e:
                 logger.debug("Could not load messages from DB: %s", e)
-        
+
         # Fall back to legacy JSONL
         transcript_path = self.get_transcript_path(session_id)
-        
+
         if not transcript_path.exists():
             return []
-        
+
         messages = []
         with open(transcript_path, "r") as f:
             for line in f:
                 line = line.strip()
                 if line:
                     messages.append(json.loads(line))
-        
-        return messages
+
+        return self._repair_loaded_transcript(messages)
+
+    @staticmethod
+    def _repair_loaded_transcript(messages: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
+        """Repair tool_use/tool_result pairing in a loaded transcript."""
+        try:
+            from agent.context_compressor import ContextCompressor
+            repaired = ContextCompressor._repair_tool_pairs(messages)
+            if len(repaired) < len(messages):
+                logger.warning(
+                    "Repaired transcript: %d → %d messages (dropped orphaned tool blocks)",
+                    len(messages), len(repaired),
+                )
+            return repaired
+        except Exception as e:
+            logger.debug("Transcript repair skipped: %s", e)
+            return messages
 
 
 def build_session_context(

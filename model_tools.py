@@ -95,6 +95,9 @@ def _discover_tools():
         "tools.send_message_tool",
         "tools.honcho_tools",
         "tools.homeassistant_tool",
+        "tools.claude_reasoning_tool",
+        "tools.pipeline_tool",
+        "tools.x_scraper_tool",
     ]
     import importlib
     for mod_name in _modules:
@@ -107,11 +110,31 @@ def _discover_tools():
 _discover_tools()
 
 # MCP tool discovery (external MCP servers from config)
+_mcp_discovery_ok = False
 try:
     from tools.mcp_tool import discover_mcp_tools
-    discover_mcp_tools()
+    _mcp_tools = discover_mcp_tools()
+    _mcp_discovery_ok = bool(_mcp_tools)
+    if _mcp_tools:
+        logger.info("MCP discovery: %d tool(s) registered", len(_mcp_tools))
+    else:
+        logger.warning("MCP discovery returned 0 tools — will retry on first agent call")
 except Exception as e:
-    logger.debug("MCP tool discovery failed: %s", e)
+    logger.warning("MCP tool discovery failed (will retry on first agent call): %s", e)
+
+
+def ensure_mcp_tools():
+    """Retry MCP discovery if startup failed. Safe to call multiple times."""
+    global _mcp_discovery_ok
+    if _mcp_discovery_ok:
+        return
+    try:
+        tools = discover_mcp_tools()
+        if tools:
+            _mcp_discovery_ok = True
+            logger.info("MCP retry succeeded: %d tool(s) registered", len(tools))
+    except Exception as e:
+        logger.warning("MCP retry failed: %s", e)
 
 
 # =============================================================================
@@ -179,6 +202,9 @@ def get_tool_definitions(
     Returns:
         Filtered list of OpenAI-format tool definitions.
     """
+    # Retry MCP if startup discovery failed
+    ensure_mcp_tools()
+
     # Determine which tool names the caller wants
     tools_to_include: set = set()
 

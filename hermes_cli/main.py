@@ -180,6 +180,29 @@ def cmd_gateway(args):
     gateway_command(args)
 
 
+def cmd_invoke(args):
+    """Invoke hermes tools directly from the CLI."""
+    from hermes_cli.invoke import main as invoke_main
+    # Extract remaining args to pass through
+    remaining_args = []
+    if hasattr(args, "tool") and args.tool:
+        remaining_args.append(args.tool)
+    if hasattr(args, "tool_args") and args.tool_args:
+        for arg in args.tool_args:
+            remaining_args.append("--arg")
+            remaining_args.append(arg)
+    if hasattr(args, "list") and args.list:
+        remaining_args.append("--list")
+    if hasattr(args, "pipeline") and args.pipeline:
+        remaining_args.append("--pipeline")
+        remaining_args.append(args.pipeline)
+    if hasattr(args, "pipeline_vars") and args.pipeline_vars:
+        for var in args.pipeline_vars:
+            remaining_args.append("--var")
+            remaining_args.append(var)
+    invoke_main(remaining_args)
+
+
 def cmd_whatsapp(args):
     """Set up WhatsApp: choose mode, configure, install bridge, pair via QR."""
     import os
@@ -881,6 +904,12 @@ def cmd_doctor(args):
     run_doctor(args)
 
 
+def cmd_stats(args):
+    """Display metrics and usage statistics."""
+    from hermes_cli.stats import cmd_stats as stats_command
+    stats_command(args)
+
+
 def cmd_config(args):
     """Configuration management."""
     from hermes_cli.config import config_command
@@ -1293,6 +1322,44 @@ For more help on a command:
     chat_parser.set_defaults(func=cmd_chat)
 
     # =========================================================================
+    # invoke command
+    # =========================================================================
+    invoke_parser = subparsers.add_parser(
+        "invoke",
+        help="Invoke hermes tools directly",
+        description="Invoke hermes tools from the command line without the agent loop"
+    )
+    invoke_parser.add_argument(
+        "tool",
+        nargs="?",
+        help="Tool name to invoke (e.g., 'web_search', 'terminal')"
+    )
+    invoke_parser.add_argument(
+        "--arg",
+        action="append",
+        default=[],
+        dest="tool_args",
+        help="Tool argument in key=value format (can be repeated)"
+    )
+    invoke_parser.add_argument(
+        "--list",
+        action="store_true",
+        help="List all available tools"
+    )
+    invoke_parser.add_argument(
+        "--pipeline",
+        help="Run a YAML pipeline by name (Phase 2)"
+    )
+    invoke_parser.add_argument(
+        "--var",
+        action="append",
+        default=[],
+        dest="pipeline_vars",
+        help="Pipeline variable in key=value format (can be repeated)"
+    )
+    invoke_parser.set_defaults(func=cmd_invoke)
+
+    # =========================================================================
     # model command
     # =========================================================================
     model_parser = subparsers.add_parser(
@@ -1505,7 +1572,42 @@ For more help on a command:
         help="Attempt to fix issues automatically"
     )
     doctor_parser.set_defaults(func=cmd_doctor)
-    
+
+    # =========================================================================
+    # stats command
+    # =========================================================================
+    stats_parser = subparsers.add_parser(
+        "stats",
+        help="Show Hermes metrics and usage statistics",
+        description="Display metrics, costs, token usage, and system health"
+    )
+    stats_subparsers = stats_parser.add_subparsers(dest="metric_type")
+
+    # stats overview (default)
+    stats_overview = stats_subparsers.add_parser("overview", help="High-level metrics dashboard")
+    stats_overview.add_argument("--hours", type=int, default=24, help="Time window in hours (default: 24)")
+
+    # stats tools
+    stats_tools = stats_subparsers.add_parser("tools", help="Per-tool invocation metrics")
+    stats_tools.add_argument("--hours", type=int, default=24, help="Time window in hours (default: 24)")
+
+    # stats costs
+    stats_costs = stats_subparsers.add_parser("costs", help="Cost breakdown by model and source")
+    stats_costs.add_argument("--hours", type=int, default=24, help="Time window in hours (default: 24)")
+
+    # stats tokens
+    stats_tokens = stats_subparsers.add_parser("tokens", help="Token consumption by model tier")
+    stats_tokens.add_argument("--hours", type=int, default=24, help="Time window in hours (default: 24)")
+
+    # stats health
+    stats_health = stats_subparsers.add_parser("health", help="System health status")
+
+    # stats all
+    stats_all = stats_subparsers.add_parser("all", help="Display all metrics")
+    stats_all.add_argument("--hours", type=int, default=24, help="Time window in hours (default: 24)")
+
+    stats_parser.set_defaults(func=cmd_stats, metric_type="overview", hours=24)
+
     # =========================================================================
     # config command
     # =========================================================================

@@ -3202,6 +3202,50 @@ class HermesCLI:
 
 
 # ============================================================================
+# Pipeline Commands (Fire-routable)
+# ============================================================================
+
+class pipeline:
+    """Pipeline execution commands.
+
+    Usage:
+        hermes pipeline run smart-pricing.yaml --part_number="1709121"
+        hermes pipeline list
+        hermes pipeline validate smart-pricing.yaml
+    """
+
+    def run(self, pipeline_path: str, **kwargs):
+        """Execute a YAML pipeline with inputs.
+
+        Args:
+            pipeline_path: Path to YAML pipeline file
+            **kwargs: Input arguments for the pipeline
+
+        Example:
+            hermes pipeline run smart-pricing.yaml --part_number="1709121" --quantity=5
+        """
+        from hermes_cli.pipelines import run as pipeline_run
+        return pipeline_run(pipeline_path, **kwargs)
+
+    def list(self):
+        """List all available pipelines."""
+        from hermes_cli.pipelines import list as pipeline_list
+        return pipeline_list()
+
+    def validate(self, pipeline_path: str):
+        """Validate a pipeline without executing it.
+
+        Args:
+            pipeline_path: Path to YAML pipeline file
+
+        Example:
+            hermes pipeline validate smart-pricing.yaml
+        """
+        from hermes_cli.pipelines import validate as pipeline_validate
+        return pipeline_validate(pipeline_path)
+
+
+# ============================================================================
 # Main Entry Point
 # ============================================================================
 

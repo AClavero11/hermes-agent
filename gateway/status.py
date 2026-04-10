@@ -12,6 +12,7 @@ concurrently under distinct configurations).
 """
 
 import os
+import subprocess
 from pathlib import Path
 from typing import Optional
 
@@ -40,8 +41,8 @@ def remove_pid_file() -> None:
 def get_running_pid() -> Optional[int]:
     """Return the PID of a running gateway instance, or ``None``.
 
-    Checks the PID file and verifies the process is actually alive.
-    Cleans up stale PID files automatically.
+    Checks the PID file and verifies the process is actually alive and is a gateway.
+    Cleans up stale PID files automatically (handles PID reuse).
     """
     pid_path = _get_pid_path()
     if not pid_path.exists():
@@ -49,7 +50,28 @@ def get_running_pid() -> Optional[int]:
     try:
         pid = int(pid_path.read_text().strip())
         os.kill(pid, 0)  # signal 0 = existence check, no actual signal sent
-        return pid
+
+        # Verify it's actually a gateway process (not a reused PID from another process)
+        # Check if the process command contains gateway indicators
+        try:
+            result = subprocess.run(
+                ["ps", "-p", str(pid), "-o", "command="],
+                capture_output=True, text=True, timeout=2
+            )
+            if result.returncode == 0:
+                cmd = result.stdout.strip()
+                # Verify the command looks like a gateway process
+                # Matches: hermes_cli.main gateway, gateway/run.py, -m gateway.run
+                if "hermes_cli.main gateway" in cmd or "gateway/run.py" in cmd or "gateway.run" in cmd:
+                    return pid
+        except Exception:
+            # If we can't verify the command, trust the PID existence check
+            # This is safe because the PID file is gateway-specific
+            return pid
+
+        # Process exists but is not a gateway — clean up stale PID file
+        remove_pid_file()
+        return None
     except (ValueError, ProcessLookupError, PermissionError):
         # Stale PID file — process is gone
         remove_pid_file()

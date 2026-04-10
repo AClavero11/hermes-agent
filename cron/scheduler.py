@@ -12,6 +12,7 @@ import asyncio
 import logging
 import os
 import sys
+import threading
 import traceback
 
 # fcntl is Unix-only; on Windows use msvcrt for file locking
@@ -42,6 +43,9 @@ _hermes_home = Path(os.getenv("HERMES_HOME", Path.home() / ".hermes"))
 # File-based lock prevents concurrent ticks from gateway + daemon + systemd timer
 _LOCK_DIR = _hermes_home / "cron"
 _LOCK_FILE = _LOCK_DIR / ".tick.lock"
+
+# Thread lock for env var injection (prevents race with gateway's _flush_memories)
+_cron_env_lock = threading.Lock()
 
 
 def _resolve_origin(job: dict) -> Optional[dict]:
@@ -115,6 +119,12 @@ def _deliver_result(job: dict, content: str) -> None:
         logger.warning("Job '%s': platform '%s' not configured/enabled", job["id"], platform_name)
         return
 
+    # Use automated bot token for cron delivery if available (avoids polling conflicts)
+    if pconfig.automated_token:
+        from copy import copy
+        pconfig = copy(pconfig)
+        pconfig.token = pconfig.automated_token
+
     # Run the async send in a fresh event loop (safe from any thread)
     try:
         result = asyncio.run(_send_to_platform(platform, pconfig, chat_id, content))
@@ -158,8 +168,10 @@ def run_job(job: dict) -> tuple[bool, str, str, Optional[str]]:
     logger.info("Running job '%s' (ID: %s)", job_name, job_id)
     logger.info("Prompt: %s", prompt[:100])
 
-    # Inject origin context so the agent's send_message tool knows the chat
+    # Inject origin context so the agent's send_message tool knows the chat.
+    # Use a lock to prevent races if the gateway runs _flush_memories concurrently.
     if origin:
+        _cron_env_lock.acquire()
         os.environ["HERMES_SESSION_PLATFORM"] = origin["platform"]
         os.environ["HERMES_SESSION_CHAT_ID"] = str(origin["chat_id"])
         if origin.get("chat_name"):
@@ -264,6 +276,8 @@ def run_job(job: dict) -> tuple[bool, str, str, Optional[str]]:
         # Clean up injected env vars so they don't leak to other jobs
         for key in ("HERMES_SESSION_PLATFORM", "HERMES_SESSION_CHAT_ID", "HERMES_SESSION_CHAT_NAME"):
             os.environ.pop(key, None)
+        if origin:
+            _cron_env_lock.release()
 
 
 def tick(verbose: bool = True) -> int:

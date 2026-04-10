@@ -199,6 +199,10 @@ class GatewayRunner:
         try:
             from hermes_state import SessionDB
             self._session_db = SessionDB()
+            # Close any sessions left open from a previous crash/restart
+            stale = self._session_db.close_stale_sessions()
+            if stale:
+                logger.info("Closed %d stale sessions from previous run", stale)
         except Exception as e:
             logger.debug("SQLite session store not available: %s", e)
         
@@ -470,23 +474,40 @@ class GatewayRunner:
         return True
     
     async def stop(self) -> None:
-        """Stop the gateway and disconnect all adapters."""
+        """Stop the gateway and disconnect all adapters gracefully.
+
+        Waits for in-flight messages to complete before closing connections.
+        """
         logger.info("Stopping gateway...")
         self._running = False
-        
+
+        # Stop accepting new messages from all adapters
+        for adapter in self.adapters.values():
+            adapter._running = False
+
+        # Disconnect all adapters (each waits for in-flight messages up to 5s)
+        disconnect_tasks = []
         for platform, adapter in self.adapters.items():
             try:
-                await adapter.disconnect()
-                logger.info("✓ %s disconnected", platform.value)
+                task = asyncio.create_task(adapter.disconnect())
+                disconnect_tasks.append((platform, task))
             except Exception as e:
                 logger.error("✗ %s disconnect error: %s", platform.value, e)
-        
+
+        # Wait for all disconnects to complete
+        for platform, task in disconnect_tasks:
+            try:
+                await task
+                logger.info("✓ %s disconnected", platform.value)
+            except Exception as e:
+                logger.error("✗ %s disconnect timeout/error: %s", platform.value, e)
+
         self.adapters.clear()
         self._shutdown_event.set()
-        
+
         from gateway.status import remove_pid_file
         remove_pid_file()
-        
+
         logger.info("Gateway stopped")
     
     async def wait_for_shutdown(self) -> None:
@@ -665,7 +686,8 @@ class GatewayRunner:
         # Emit command:* hook for any recognized slash command
         _known_commands = {"new", "reset", "help", "status", "stop", "model",
                           "personality", "retry", "undo", "sethome", "set-home",
-                          "compress", "usage", "insights", "reload-mcp", "update"}
+                          "compress", "usage", "insights", "reload-mcp", "update",
+                          "cc", "cc-status"}
         if command and command in _known_commands:
             await self.hooks.emit(f"command:{command}", {
                 "platform": source.platform.value if source.platform else "",
@@ -715,7 +737,10 @@ class GatewayRunner:
 
         if command == "update":
             return await self._handle_update_command(event)
-        
+
+        if command in ["cc", "cc-status"]:
+            return await self._handle_cc_command(event)
+
         # Skill slash commands: /skill-name loads the skill and sends to agent
         if command:
             try:
@@ -891,6 +916,15 @@ class GatewayRunner:
                         f"Ask the user what they'd like you to do with it.]"
                     )
                 message_text = f"{context_note}\n\n{message_text}"
+
+        # -----------------------------------------------------------------
+        # Auto-enrich URLs in the message (Twitter, articles, etc.)
+        # -----------------------------------------------------------------
+        try:
+            from gateway.url_enrichment import enrich_message_with_urls
+            message_text = await enrich_message_with_urls(message_text)
+        except Exception as e:
+            logger.debug("URL enrichment failed: %s", e)
 
         try:
             # Emit agent:start hook
@@ -1116,6 +1150,8 @@ class GatewayRunner:
             "`/insights [days]` — Show usage insights and analytics",
             "`/reload-mcp` — Reload MCP servers from config",
             "`/update` — Update Hermes Agent to the latest version",
+            "`/cc \"task\"` — Dispatch a Claude Code task",
+            "`/cc-status` — Show active CC Remote sessions",
             "`/help` — Show this message",
         ]
         try:
@@ -1584,7 +1620,88 @@ class GatewayRunner:
             pending_path.unlink(missing_ok=True)
             return f"✗ Failed to start update: {e}"
 
-        return "⚕ Starting Hermes update… I'll notify you when it's done."
+        return "⚕ Starting Hermes update... I'll notify you when it's done."
+
+    async def _handle_cc_command(self, event: MessageEvent) -> Optional[str]:
+        """Handle /cc and /cc-status commands for Claude Code remote control."""
+        from tools.cc_remote import (
+            handle_cc_command,
+            parse_cc_command,
+            get_active_sessions,
+        )
+
+        source = event.source
+        command = event.get_command()
+        adapter = self.adapters.get(source.platform)
+
+        if not adapter:
+            return "CC Remote requires a platform adapter."
+
+        # /cc-status: show active sessions
+        if command == "cc-status":
+            sessions = get_active_sessions()
+            if not sessions:
+                return "No active CC sessions."
+            lines = ["<b>CC Remote Sessions</b>\n"]
+            for s in sessions:
+                elapsed = int(time.time() - s.get("started_at", 0))
+                lines.append(
+                    f"<code>{s['session_id']}</code> | "
+                    f"{s['status']} | {elapsed}s | "
+                    f"{s['task'][:40]}"
+                )
+            await adapter.send(source.chat_id, "\n".join(lines))
+            return None
+
+        # /cc "task" [--repo /path]
+        args_text = event.get_command_args().strip()
+        if not args_text:
+            return "Usage: /cc \"task description\" [--repo /path/to/repo]"
+
+        task, repo_path = parse_cc_command(f"/cc {args_text}")
+        if not task:
+            return "No task provided. Usage: /cc \"task description\""
+
+        # Build send callbacks that bridge to the adapter
+        async def send_message(chat_id, text, **kwargs):
+            await adapter.send(str(chat_id), text)
+
+        async def send_inline_keyboard(chat_id, text, buttons, **kwargs):
+            # Use the Telegram bot directly for inline keyboards
+            bot = getattr(adapter, '_bot', None)
+            if bot:
+                try:
+                    from telegram import InlineKeyboardMarkup, InlineKeyboardButton
+                    keyboard = InlineKeyboardMarkup([
+                        [InlineKeyboardButton(
+                            text=btn["text"],
+                            callback_data=btn["callback_data"],
+                        ) for btn in row]
+                        for row in buttons
+                    ])
+                    await bot.send_message(
+                        chat_id=int(chat_id),
+                        text=text,
+                        parse_mode="HTML",
+                        reply_markup=keyboard,
+                    )
+                except Exception as e:
+                    logger.error("CC Remote: failed to send keyboard: %s", e)
+                    await adapter.send(str(chat_id), text)
+            else:
+                await adapter.send(str(chat_id), text)
+
+        result = await handle_cc_command(
+            task=task,
+            chat_id=source.chat_id,
+            send_message=send_message,
+            send_inline_keyboard=send_inline_keyboard,
+            repo_path=repo_path,
+        )
+
+        # The handle_cc_command already sends its own messages, return None
+        # so the gateway doesn't try to send the JSON result as a message.
+        return None
 
     async def _send_update_notification(self) -> None:
         """If the gateway is starting after a ``/update``, notify the user."""
@@ -2235,7 +2352,30 @@ class GatewayRunner:
             # Return final response, or a message if something went wrong
             final_response = result.get("final_response")
             if not final_response:
-                error_msg = f"⚠️ {result['error']}" if result.get("error") else "(No response generated)"
+                raw_error = result.get("error", "")
+                # Sanitize: don't send raw API traces/JSON to the user
+                if raw_error and len(raw_error) > 200:
+                    raw_lower = raw_error.lower()
+                    # Extract just the meaningful part
+                    if "tool_use" in raw_error and "tool_result" in raw_error:
+                        error_msg = "⚠️ Message history got corrupted (tool pairing error). Resetting session — try again."
+                    elif "credit balance" in raw_lower or "purchase credits" in raw_lower:
+                        error_msg = "⚠️ Anthropic API credits depleted. Top up at console.anthropic.com."
+                    elif "context length" in raw_lower or "413" in raw_error:
+                        error_msg = "⚠️ Conversation too long — context compressed. Try again."
+                    elif "api key" in raw_lower or "unauthorized" in raw_lower:
+                        error_msg = "⚠️ API authentication issue. Check credentials."
+                    elif "rate limit" in raw_lower or "429" in raw_error:
+                        error_msg = "⚠️ Rate limited. Try again in a minute."
+                    elif "cannot connect" in raw_lower or "nodename nor servname" in raw_lower:
+                        error_msg = "⚠️ Network/DNS error — can't reach API. Check internet."
+                    else:
+                        error_msg = f"⚠️ API error — retries exhausted. Try again in a minute."
+                    logger.error("Sanitized error for user. Raw: %s", raw_error[:500])
+                elif raw_error:
+                    error_msg = f"⚠️ {raw_error}"
+                else:
+                    error_msg = "(No response generated)"
                 return {
                     "final_response": error_msg,
                     "messages": result.get("messages", []),
@@ -2436,6 +2576,23 @@ def _run_ils_poll() -> None:
         logger.error("ILS poll error: %s", e, exc_info=True)
 
 
+def _run_shipment_poll():
+    """
+    Scheduled heartbeat task: Check V11 for completed deliveries.
+
+    Called every 5 minutes by the cron ticker.
+    """
+    try:
+        from services.shipment_watcher import poll_shipments
+        sent = poll_shipments()
+        if sent:
+            logger.info("Shipment poll: sent %d notification(s)", sent)
+        else:
+            logger.debug("Shipment poll: no new shipments")
+    except Exception as e:
+        logger.error("Shipment poll error: %s", e, exc_info=True)
+
+
 def _start_cron_ticker(stop_event: threading.Event, adapters=None, interval: int = 60):
     """
     Background thread that ticks the cron scheduler at a regular interval.
@@ -2452,6 +2609,7 @@ def _start_cron_ticker(stop_event: threading.Event, adapters=None, interval: int
     IMAGE_CACHE_EVERY = 60   # ticks — once per hour at default 60s interval
     CHANNEL_DIR_EVERY = 5    # ticks — every 5 minutes
     ILS_POLL_EVERY = 5       # ticks — every 5 minutes (from config.yaml heartbeat.ils_poll)
+    SHIPMENT_POLL_EVERY = 5  # ticks — every 5 minutes
 
     logger.info("Cron ticker started (interval=%ds)", interval)
     tick_count = 0
@@ -2475,6 +2633,12 @@ def _start_cron_ticker(stop_event: threading.Event, adapters=None, interval: int
                 _run_ils_poll()
             except Exception as e:
                 logger.error("ILS poll task error: %s", e, exc_info=True)
+
+        if tick_count % SHIPMENT_POLL_EVERY == 0:
+            try:
+                _run_shipment_poll()
+            except Exception as e:
+                logger.error("Shipment poll task error: %s", e, exc_info=True)
 
         if tick_count % IMAGE_CACHE_EVERY == 0:
             try:
@@ -2507,21 +2671,38 @@ async def start_gateway(config: Optional[GatewayConfig] = None) -> bool:
     # The PID file is scoped to HERMES_HOME, so future multi-profile
     # setups (each profile using a distinct HERMES_HOME) will naturally
     # allow concurrent instances without tripping this guard.
-    from gateway.status import get_running_pid
+    from gateway.status import get_running_pid, remove_pid_file
     existing_pid = get_running_pid()
     if existing_pid is not None and existing_pid != os.getpid():
-        hermes_home = os.getenv("HERMES_HOME", "~/.hermes")
-        logger.error(
-            "Another gateway instance is already running (PID %d, HERMES_HOME=%s). "
-            "Use 'hermes gateway restart' to replace it, or 'hermes gateway stop' first.",
-            existing_pid, hermes_home,
+        # When launched by launchd (KeepAlive), the old process may still be
+        # shutting down.  Give it a moment, then send SIGTERM to take over
+        # gracefully instead of refusing to start (which causes a restart loop).
+        import time
+        logger.warning(
+            "Existing gateway PID %d detected — sending SIGTERM and waiting for clean handoff.",
+            existing_pid,
         )
-        print(
-            f"\n❌ Gateway already running (PID {existing_pid}).\n"
-            f"   Use 'hermes gateway restart' to replace it,\n"
-            f"   or 'hermes gateway stop' to kill it first.\n"
-        )
-        return False
+        try:
+            os.kill(existing_pid, signal.SIGTERM)
+        except ProcessLookupError:
+            pass  # Already dead
+        # Wait up to 10s for old process to exit
+        for _ in range(20):
+            try:
+                os.kill(existing_pid, 0)
+                time.sleep(0.5)
+            except ProcessLookupError:
+                break
+        else:
+            # Still alive after 10s — force kill
+            logger.warning("Old gateway PID %d did not exit — sending SIGKILL.", existing_pid)
+            try:
+                os.kill(existing_pid, signal.SIGKILL)
+                time.sleep(0.5)
+            except ProcessLookupError:
+                pass
+        remove_pid_file()
+        logger.info("Old gateway cleared — proceeding with startup.")
 
     # Sync bundled skills on gateway start (fast -- skips unchanged)
     try:

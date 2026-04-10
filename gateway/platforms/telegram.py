@@ -11,6 +11,7 @@ import asyncio
 import logging
 import os
 import re
+import time
 from typing import Dict, List, Optional, Any
 
 logger = logging.getLogger(__name__)
@@ -94,21 +95,28 @@ def _strip_mdv2(text: str) -> str:
 class TelegramAdapter(BasePlatformAdapter):
     """
     Telegram bot adapter.
-    
+
     Handles:
     - Receiving messages from users and groups
     - Sending responses with Telegram markdown
     - Forum topics (thread_id support)
     - Media messages
     """
-    
+
     # Telegram message limits
     MAX_MESSAGE_LENGTH = 4096
-    
+
+    # Send timeout and retry settings
+    SEND_TIMEOUT_SECONDS = 10
+    SEND_MAX_RETRIES = 3
+    SEND_RETRY_BACKOFF_SECONDS = [1, 2, 4]  # exponential: 1s, 2s, 4s
+
     def __init__(self, config: PlatformConfig):
         super().__init__(config, Platform.TELEGRAM)
         self._app: Optional[Application] = None
         self._bot: Optional[Bot] = None
+        self._in_flight_messages = 0  # Track pending sends
+        self._in_flight_lock = asyncio.Lock()
     
     async def connect(self) -> bool:
         """Connect to Telegram and start polling for updates."""
@@ -145,6 +153,12 @@ class TelegramAdapter(BasePlatformAdapter):
                 pattern=r"^ilsq_"
             ))
 
+            # Register CC Remote (Claude Code) approval/rejection/diff callbacks
+            self._app.add_handler(CallbackQueryHandler(
+                self._handle_cc_remote_callback,
+                pattern=r"^cc_"
+            ))
+
             # Start polling in background
             await self._app.initialize()
             await self._app.start()
@@ -164,6 +178,7 @@ class TelegramAdapter(BasePlatformAdapter):
                     BotCommand("stop", "Stop the running agent"),
                     BotCommand("sethome", "Set this chat as the home channel"),
                     BotCommand("help", "Show available commands"),
+                    BotCommand("cc", "Dispatch a Claude Code task"),
                 ])
             except Exception as e:
                 print(f"[{self.name}] Could not register command menu: {e}")
@@ -177,7 +192,21 @@ class TelegramAdapter(BasePlatformAdapter):
             return False
     
     async def disconnect(self) -> None:
-        """Stop polling and disconnect."""
+        """Stop polling and disconnect, waiting for in-flight messages."""
+        self._running = False
+
+        # Wait for in-flight sends to complete (up to 5 seconds)
+        wait_start = time.time()
+        timeout_seconds = 5
+        while self._in_flight_messages > 0 and (time.time() - wait_start) < timeout_seconds:
+            await asyncio.sleep(0.1)
+
+        if self._in_flight_messages > 0:
+            logger.warning(
+                "[%s] Shutdown timeout: %d in-flight messages still pending",
+                self.name, self._in_flight_messages
+            )
+
         if self._app:
             try:
                 await self._app.updater.stop()
@@ -185,12 +214,87 @@ class TelegramAdapter(BasePlatformAdapter):
                 await self._app.shutdown()
             except Exception as e:
                 print(f"[{self.name}] Error during disconnect: {e}")
-        
-        self._running = False
+
         self._app = None
         self._bot = None
         print(f"[{self.name}] Disconnected")
+
+    async def is_healthy(self) -> bool:
+        """Check if the Telegram connection is healthy by calling getMe."""
+        if not self._bot:
+            return False
+
+        try:
+            await asyncio.wait_for(self._bot.get_me(), timeout=self.SEND_TIMEOUT_SECONDS)
+            return True
+        except asyncio.TimeoutError:
+            logger.warning("[%s] Health check timeout", self.name)
+            return False
+        except Exception as e:
+            logger.debug("[%s] Health check failed: %s", self.name, e)
+            return False
     
+    async def _send_message_with_retry(
+        self,
+        send_coro,
+        description: str,
+    ) -> Optional[Message]:
+        """
+        Execute a Telegram API call with exponential backoff retry.
+
+        Args:
+            send_coro: An awaitable that performs the send operation
+            description: Human-readable description for logging
+
+        Returns:
+            The Message object on success, or None on final failure
+        """
+        for attempt in range(self.SEND_MAX_RETRIES):
+            try:
+                msg = await asyncio.wait_for(
+                    send_coro(),
+                    timeout=self.SEND_TIMEOUT_SECONDS
+                )
+                return msg
+            except asyncio.TimeoutError:
+                if attempt < self.SEND_MAX_RETRIES - 1:
+                    delay = self.SEND_RETRY_BACKOFF_SECONDS[attempt]
+                    logger.warning(
+                        "[%s] Send timeout on %s, retrying in %ds (attempt %d/%d)",
+                        self.name, description, delay, attempt + 1, self.SEND_MAX_RETRIES
+                    )
+                    await asyncio.sleep(delay)
+                else:
+                    logger.error(
+                        "[%s] Send timeout on %s after %d retries",
+                        self.name, description, self.SEND_MAX_RETRIES
+                    )
+                    return None
+            except Exception as e:
+                error_str = str(e)
+                # Don't retry on client errors (400, 403, 404, etc)
+                if any(code in error_str for code in ["400", "403", "404", "401"]):
+                    logger.error(
+                        "[%s] Client error sending %s: %s (no retry)",
+                        self.name, description, error_str
+                    )
+                    return None
+
+                if attempt < self.SEND_MAX_RETRIES - 1:
+                    delay = self.SEND_RETRY_BACKOFF_SECONDS[attempt]
+                    logger.warning(
+                        "[%s] Transient error sending %s: %s, retrying in %ds (attempt %d/%d)",
+                        self.name, description, error_str, delay, attempt + 1, self.SEND_MAX_RETRIES
+                    )
+                    await asyncio.sleep(delay)
+                else:
+                    logger.error(
+                        "[%s] Failed to send %s after %d retries: %s",
+                        self.name, description, self.SEND_MAX_RETRIES, error_str
+                    )
+                    return None
+        return None
+
     async def send(
         self,
         chat_id: str,
@@ -198,54 +302,71 @@ class TelegramAdapter(BasePlatformAdapter):
         reply_to: Optional[str] = None,
         metadata: Optional[Dict[str, Any]] = None
     ) -> SendResult:
-        """Send a message to a Telegram chat."""
+        """Send a message to a Telegram chat with retry and timeout."""
         if not self._bot:
             return SendResult(success=False, error="Not connected")
-        
+
+        async with self._in_flight_lock:
+            self._in_flight_messages += 1
+
         try:
             # Format and split message if needed
             formatted = self.format_message(content)
             chunks = self.truncate_message(formatted, self.MAX_MESSAGE_LENGTH)
-            
+
             message_ids = []
             thread_id = metadata.get("thread_id") if metadata else None
-            
+
             for i, chunk in enumerate(chunks):
-                # Try Markdown first, fall back to plain text if it fails
-                try:
-                    msg = await self._bot.send_message(
+                # Try Markdown first with retry, fall back to plain text if it fails
+                msg = await self._send_message_with_retry(
+                    lambda: self._bot.send_message(
                         chat_id=int(chat_id),
                         text=chunk,
                         parse_mode=ParseMode.MARKDOWN_V2,
                         reply_to_message_id=int(reply_to) if reply_to and i == 0 else None,
                         message_thread_id=int(thread_id) if thread_id else None,
-                    )
-                except Exception as md_error:
-                    # Markdown parsing failed, try plain text
-                    if "parse" in str(md_error).lower() or "markdown" in str(md_error).lower():
-                        logger.warning("[%s] MarkdownV2 parse failed, falling back to plain text: %s", self.name, md_error)
-                        # Strip MDV2 escape backslashes so the user doesn't
-                        # see raw backslashes littered through the message.
+                    ),
+                    f"MarkdownV2 message chunk {i+1}"
+                )
+
+                # If markdown failed, try plain text fallback (no retry on fallback)
+                if msg is None:
+                    try:
                         plain_chunk = _strip_mdv2(chunk)
-                        msg = await self._bot.send_message(
-                            chat_id=int(chat_id),
-                            text=plain_chunk,
-                            parse_mode=None,  # Plain text
-                            reply_to_message_id=int(reply_to) if reply_to and i == 0 else None,
-                            message_thread_id=int(thread_id) if thread_id else None,
+                        msg = await asyncio.wait_for(
+                            self._bot.send_message(
+                                chat_id=int(chat_id),
+                                text=plain_chunk,
+                                parse_mode=None,  # Plain text
+                                # Don't use reply_to in fallback — the original message
+                                # may no longer exist after a gateway restart
+                                message_thread_id=int(thread_id) if thread_id else None,
+                            ),
+                            timeout=self.SEND_TIMEOUT_SECONDS
                         )
-                    else:
-                        raise  # Re-raise if not a parse error
-                message_ids.append(str(msg.message_id))
-            
+                        logger.info("[%s] Sent message chunk %d as plain text fallback", self.name, i + 1)
+                    except Exception as e:
+                        logger.error("[%s] Plain text fallback failed: %s", self.name, e)
+                        return SendResult(success=False, error=f"Failed to send chunk {i+1}: {str(e)}")
+
+                if msg:
+                    message_ids.append(str(msg.message_id))
+                else:
+                    return SendResult(success=False, error=f"Failed to send chunk {i+1} after retries")
+
             return SendResult(
                 success=True,
                 message_id=message_ids[0] if message_ids else None,
                 raw_response={"message_ids": message_ids}
             )
-            
+
         except Exception as e:
             return SendResult(success=False, error=str(e))
+
+        finally:
+            async with self._in_flight_lock:
+                self._in_flight_messages -= 1
 
     async def edit_message(
         self,
@@ -253,28 +374,51 @@ class TelegramAdapter(BasePlatformAdapter):
         message_id: str,
         content: str,
     ) -> SendResult:
-        """Edit a previously sent Telegram message."""
+        """Edit a previously sent Telegram message with retry."""
         if not self._bot:
             return SendResult(success=False, error="Not connected")
+
+        async with self._in_flight_lock:
+            self._in_flight_messages += 1
+
         try:
             formatted = self.format_message(content)
-            try:
-                await self._bot.edit_message_text(
+
+            # Try markdown first with retry
+            result = await self._send_message_with_retry(
+                lambda: self._bot.edit_message_text(
                     chat_id=int(chat_id),
                     message_id=int(message_id),
                     text=formatted,
                     parse_mode=ParseMode.MARKDOWN_V2,
-                )
-            except Exception:
-                # Fallback: retry without markdown formatting
-                await self._bot.edit_message_text(
-                    chat_id=int(chat_id),
-                    message_id=int(message_id),
-                    text=content,
-                )
+                ),
+                f"edit_message {message_id}"
+            )
+
+            # If markdown failed, try plain text fallback (no retry on fallback)
+            if result is None:
+                try:
+                    await asyncio.wait_for(
+                        self._bot.edit_message_text(
+                            chat_id=int(chat_id),
+                            message_id=int(message_id),
+                            text=content,
+                        ),
+                        timeout=self.SEND_TIMEOUT_SECONDS
+                    )
+                    logger.info("[%s] Edited message %s as plain text fallback", self.name, message_id)
+                except Exception as e:
+                    logger.error("[%s] Edit message fallback failed: %s", self.name, e)
+                    return SendResult(success=False, error=str(e))
+
             return SendResult(success=True, message_id=message_id)
+
         except Exception as e:
             return SendResult(success=False, error=str(e))
+
+        finally:
+            async with self._in_flight_lock:
+                self._in_flight_messages -= 1
 
     async def send_voice(
         self,
@@ -283,36 +427,55 @@ class TelegramAdapter(BasePlatformAdapter):
         caption: Optional[str] = None,
         reply_to: Optional[str] = None,
     ) -> SendResult:
-        """Send audio as a native Telegram voice message or audio file."""
+        """Send audio as a native Telegram voice message or audio file with retry."""
         if not self._bot:
             return SendResult(success=False, error="Not connected")
-        
+
+        async with self._in_flight_lock:
+            self._in_flight_messages += 1
+
         try:
             import os
             if not os.path.exists(audio_path):
                 return SendResult(success=False, error=f"Audio file not found: {audio_path}")
-            
+
             with open(audio_path, "rb") as audio_file:
                 # .ogg files -> send as voice (round playable bubble)
                 if audio_path.endswith(".ogg") or audio_path.endswith(".opus"):
-                    msg = await self._bot.send_voice(
-                        chat_id=int(chat_id),
-                        voice=audio_file,
-                        caption=caption[:1024] if caption else None,
-                        reply_to_message_id=int(reply_to) if reply_to else None,
+                    msg = await self._send_message_with_retry(
+                        lambda: self._bot.send_voice(
+                            chat_id=int(chat_id),
+                            voice=audio_file,
+                            caption=caption[:1024] if caption else None,
+                            reply_to_message_id=int(reply_to) if reply_to else None,
+                        ),
+                        "send_voice"
                     )
                 else:
                     # .mp3 and others -> send as audio file
-                    msg = await self._bot.send_audio(
-                        chat_id=int(chat_id),
-                        audio=audio_file,
-                        caption=caption[:1024] if caption else None,
-                        reply_to_message_id=int(reply_to) if reply_to else None,
+                    msg = await self._send_message_with_retry(
+                        lambda: self._bot.send_audio(
+                            chat_id=int(chat_id),
+                            audio=audio_file,
+                            caption=caption[:1024] if caption else None,
+                            reply_to_message_id=int(reply_to) if reply_to else None,
+                        ),
+                        "send_audio"
                     )
-            return SendResult(success=True, message_id=str(msg.message_id))
+
+            if msg:
+                return SendResult(success=True, message_id=str(msg.message_id))
+            else:
+                logger.error("[%s] Failed to send voice/audio after retries", self.name)
+                return await super().send_voice(chat_id, audio_path, caption, reply_to)
+
         except Exception as e:
             print(f"[{self.name}] Failed to send voice/audio: {e}")
             return await super().send_voice(chat_id, audio_path, caption, reply_to)
+
+        finally:
+            async with self._in_flight_lock:
+                self._in_flight_messages -= 1
     
     async def send_image(
         self,
@@ -321,23 +484,40 @@ class TelegramAdapter(BasePlatformAdapter):
         caption: Optional[str] = None,
         reply_to: Optional[str] = None,
     ) -> SendResult:
-        """Send an image natively as a Telegram photo."""
+        """Send an image natively as a Telegram photo with retry."""
         if not self._bot:
             return SendResult(success=False, error="Not connected")
-        
+
+        async with self._in_flight_lock:
+            self._in_flight_messages += 1
+
         try:
             # Telegram can send photos directly from URLs
-            msg = await self._bot.send_photo(
-                chat_id=int(chat_id),
-                photo=image_url,
-                caption=caption[:1024] if caption else None,  # Telegram caption limit
-                reply_to_message_id=int(reply_to) if reply_to else None,
+            msg = await self._send_message_with_retry(
+                lambda: self._bot.send_photo(
+                    chat_id=int(chat_id),
+                    photo=image_url,
+                    caption=caption[:1024] if caption else None,  # Telegram caption limit
+                    reply_to_message_id=int(reply_to) if reply_to else None,
+                ),
+                "send_photo"
             )
-            return SendResult(success=True, message_id=str(msg.message_id))
+
+            if msg:
+                return SendResult(success=True, message_id=str(msg.message_id))
+            else:
+                logger.error("[%s] Failed to send photo after retries, falling back to URL", self.name)
+                # Fallback: send as text link
+                return await super().send_image(chat_id, image_url, caption, reply_to)
+
         except Exception as e:
             print(f"[{self.name}] Failed to send photo, falling back to URL: {e}")
             # Fallback: send as text link
             return await super().send_image(chat_id, image_url, caption, reply_to)
+
+        finally:
+            async with self._in_flight_lock:
+                self._in_flight_messages -= 1
     
     async def send_animation(
         self,
@@ -346,42 +526,67 @@ class TelegramAdapter(BasePlatformAdapter):
         caption: Optional[str] = None,
         reply_to: Optional[str] = None,
     ) -> SendResult:
-        """Send an animated GIF natively as a Telegram animation (auto-plays inline)."""
+        """Send an animated GIF natively as a Telegram animation (auto-plays inline) with retry."""
         if not self._bot:
             return SendResult(success=False, error="Not connected")
-        
+
+        async with self._in_flight_lock:
+            self._in_flight_messages += 1
+
         try:
-            msg = await self._bot.send_animation(
-                chat_id=int(chat_id),
-                animation=animation_url,
-                caption=caption[:1024] if caption else None,
-                reply_to_message_id=int(reply_to) if reply_to else None,
+            msg = await self._send_message_with_retry(
+                lambda: self._bot.send_animation(
+                    chat_id=int(chat_id),
+                    animation=animation_url,
+                    caption=caption[:1024] if caption else None,
+                    reply_to_message_id=int(reply_to) if reply_to else None,
+                ),
+                "send_animation"
             )
-            return SendResult(success=True, message_id=str(msg.message_id))
+
+            if msg:
+                return SendResult(success=True, message_id=str(msg.message_id))
+            else:
+                logger.error("[%s] Failed to send animation after retries, falling back to photo", self.name)
+                # Fallback: try as a regular photo
+                return await self.send_image(chat_id, animation_url, caption, reply_to)
+
         except Exception as e:
             print(f"[{self.name}] Failed to send animation, falling back to photo: {e}")
             # Fallback: try as a regular photo
             return await self.send_image(chat_id, animation_url, caption, reply_to)
 
+        finally:
+            async with self._in_flight_lock:
+                self._in_flight_messages -= 1
+
     async def send_typing(self, chat_id: str) -> None:
-        """Send typing indicator."""
+        """Send typing indicator with timeout."""
         if self._bot:
             try:
-                await self._bot.send_chat_action(
-                    chat_id=int(chat_id),
-                    action="typing"
+                await asyncio.wait_for(
+                    self._bot.send_chat_action(
+                        chat_id=int(chat_id),
+                        action="typing"
+                    ),
+                    timeout=self.SEND_TIMEOUT_SECONDS
                 )
+            except asyncio.TimeoutError:
+                logger.debug("[%s] Typing indicator timeout", self.name)
             except Exception:
                 pass  # Ignore typing indicator failures
     
     async def get_chat_info(self, chat_id: str) -> Dict[str, Any]:
-        """Get information about a Telegram chat."""
+        """Get information about a Telegram chat with timeout."""
         if not self._bot:
             return {"name": "Unknown", "type": "dm"}
-        
+
         try:
-            chat = await self._bot.get_chat(int(chat_id))
-            
+            chat = await asyncio.wait_for(
+                self._bot.get_chat(int(chat_id)),
+                timeout=self.SEND_TIMEOUT_SECONDS
+            )
+
             chat_type = "dm"
             if chat.type == ChatType.GROUP:
                 chat_type = "group"
@@ -391,13 +596,16 @@ class TelegramAdapter(BasePlatformAdapter):
                     chat_type = "forum"
             elif chat.type == ChatType.CHANNEL:
                 chat_type = "channel"
-            
+
             return {
                 "name": chat.title or chat.full_name or str(chat_id),
                 "type": chat_type,
                 "username": chat.username,
                 "is_forum": getattr(chat, "is_forum", False),
             }
+        except asyncio.TimeoutError:
+            logger.warning("[%s] get_chat_info timeout for chat %s", self.name, chat_id)
+            return {"name": str(chat_id), "type": "dm", "error": "Timeout"}
         except Exception as e:
             return {"name": str(chat_id), "type": "dm", "error": str(e)}
     
@@ -729,6 +937,42 @@ class TelegramAdapter(BasePlatformAdapter):
             if query:
                 try:
                     await query.answer("Error processing callback", show_alert=True)
+                except Exception:
+                    pass
+
+    async def _handle_cc_remote_callback(self, update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+        """Handle CC Remote (Claude Code) approve/reject/diff button callbacks."""
+        query = update.callback_query
+        if not query or not query.data:
+            return
+
+        try:
+            await query.answer()
+
+            # Parse callback_data: "cc_approve:session_id", "cc_reject:session_id", "cc_diff:session_id"
+            parts = query.data.split(":", 1)
+            if len(parts) != 2:
+                return
+
+            action = parts[0].replace("cc_", "")  # approve, reject, diff
+            session_id = parts[1]
+
+            from tools.cc_remote import handle_approval
+
+            async def _send_msg(chat_id, text, **kwargs):
+                await self._bot.send_message(
+                    chat_id=int(chat_id),
+                    text=text,
+                    parse_mode="HTML",
+                )
+
+            await handle_approval(session_id, action, _send_msg)
+
+        except Exception as e:
+            logger.error("CC Remote callback error: %s", e, exc_info=True)
+            if query:
+                try:
+                    await query.answer("Error processing CC callback", show_alert=True)
                 except Exception:
                     pass
 

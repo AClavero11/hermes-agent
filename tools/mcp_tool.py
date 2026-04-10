@@ -428,9 +428,33 @@ def _make_tool_handler(server_name: str, tool_name: str, tool_timeout: float):
 
     The handler conforms to the registry's dispatch interface:
     ``handler(args_dict, **kwargs) -> str``
+
+    Integrates with mcp_tool_approval to gate DESTRUCTIVE operations and
+    log WRITE operations before execution.
     """
 
     def _handler(args: dict, **kwargs) -> str:
+        # --- Tool approval gate ---
+        try:
+            from tools.mcp_tool_approval import classify_tool, ToolLevel
+            approval = classify_tool(server_name, tool_name, args)
+            if approval.level == ToolLevel.DESTRUCTIVE:
+                logger.warning(
+                    "BLOCKED destructive MCP tool %s/%s: %s",
+                    server_name, tool_name, approval.reason,
+                )
+                return json.dumps({
+                    "error": f"BLOCKED: {tool_name} is classified as DESTRUCTIVE "
+                             f"({approval.reason}). Cannot execute without explicit override."
+                })
+            if approval.level == ToolLevel.WRITE:
+                logger.info(
+                    "WRITE MCP tool %s/%s approved: %s",
+                    server_name, tool_name, approval.reason,
+                )
+        except ImportError:
+            pass  # mcp_tool_approval not available — skip gating
+
         with _lock:
             server = _servers.get(server_name)
         if not server or not server.session:

@@ -268,7 +268,16 @@ class AIAgent:
         _error_file_handler.setFormatter(RedactingFormatter(
             '%(asctime)s %(levelname)s %(name)s: %(message)s',
         ))
-        logging.getLogger().addHandler(_error_file_handler)
+        # Only add the error handler once (prevents 4-8x duplicate log entries
+        # when multiple AIAgent instances are created, e.g. by cron jobs)
+        _root = logging.getLogger()
+        _already_has_error_handler = any(
+            isinstance(h, RotatingFileHandler)
+            and 'errors.log' in str(getattr(h, 'baseFilename', ''))
+            for h in _root.handlers
+        )
+        if not _already_has_error_handler:
+            _root.addHandler(_error_file_handler)
 
         if self.verbose_logging:
             logging.basicConfig(
@@ -3463,10 +3472,27 @@ class AIAgent:
                                 "partial": True
                             }
 
+                    # Check for tool_use/tool_result pairing errors — these are
+                    # repairable by fixing the message history, not a true client error.
+                    is_tool_pair_error = 'tool_use' in error_msg and 'tool_result' in error_msg
+
+                    if is_tool_pair_error:
+                        print(f"{self.log_prefix}⚠️  Tool use/result pairing error — repairing message history...")
+                        logging.warning(f"{self.log_prefix}Tool pair error detected, attempting repair: {str(api_error)[:200]}")
+                        from agent.context_compressor import ContextCompressor
+                        original_len = len(messages)
+                        messages = ContextCompressor._repair_tool_pairs(messages)
+                        api_messages = messages  # Refresh api_messages
+                        if len(messages) < original_len:
+                            print(f"{self.log_prefix}   🔧 Repaired: {original_len} → {len(messages)} messages (dropped orphaned tool blocks)")
+                            continue  # Retry with repaired messages
+                        else:
+                            print(f"{self.log_prefix}   ⚠️  No orphaned tool blocks found — cannot auto-repair.")
+
                     # Check for non-retryable client errors (4xx HTTP status codes).
                     # These indicate a problem with the request itself (bad model ID,
                     # invalid API key, forbidden, etc.) and will never succeed on retry.
-                    # Note: 413 and context-length errors are excluded — handled above.
+                    # Note: 413, context-length, and tool-pair errors are excluded — handled above.
                     is_client_status_error = isinstance(status_code, int) and 400 <= status_code < 500 and status_code != 413
                     is_client_error = (is_client_status_error or any(phrase in error_msg for phrase in [
                         'error code: 401', 'error code: 403',
@@ -3474,7 +3500,7 @@ class AIAgent:
                         'is not a valid model', 'invalid model', 'model not found',
                         'invalid api key', 'invalid_api_key', 'authentication',
                         'unauthorized', 'forbidden', 'not found',
-                    ])) and not is_context_length_error
+                    ])) and not is_context_length_error and not is_tool_pair_error
 
                     if is_client_error:
                         self._dump_api_request_debug(

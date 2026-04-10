@@ -196,6 +196,93 @@ Write only the summary, starting with "[CONTEXT SUMMARY]:" prefix."""
             logger.debug("Could not build fallback auxiliary client: %s", exc)
             return None, None
 
+    @staticmethod
+    def _repair_tool_pairs(messages: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
+        """Remove orphaned tool_use and tool_result messages after compression.
+
+        The Anthropic API requires every assistant message with tool_calls to be
+        immediately followed by tool-role messages with matching tool_call_ids.
+        Compression can break this invariant by slicing at pair boundaries.
+
+        Strategy: scan for two kinds of orphans and drop them.
+        1. Assistant messages with tool_calls not followed by any matching tool results.
+        2. Tool-role messages whose tool_call_id doesn't match the preceding assistant.
+        """
+        if not messages:
+            return messages
+
+        repaired = []
+        i = 0
+        n = len(messages)
+
+        while i < n:
+            msg = messages[i]
+
+            # Case 1: assistant with tool_calls — verify results follow
+            if msg.get("role") == "assistant" and msg.get("tool_calls"):
+                expected_ids = set()
+                for tc in msg["tool_calls"]:
+                    tc_id = tc.get("id") if isinstance(tc, dict) else getattr(tc, "id", None)
+                    if tc_id:
+                        expected_ids.add(tc_id)
+
+                # Collect subsequent tool messages
+                j = i + 1
+                found_ids = set()
+                while j < n and messages[j].get("role") == "tool":
+                    tcid = messages[j].get("tool_call_id")
+                    if tcid:
+                        found_ids.add(tcid)
+                    j += 1
+
+                if expected_ids and not expected_ids.issubset(found_ids):
+                    # Missing tool results for some/all tool calls — drop this assistant message
+                    logger.warning(
+                        "Dropping orphaned tool_use assistant message (IDs: %s)",
+                        expected_ids,
+                    )
+                    i += 1
+                    continue
+
+                # Keep it
+                repaired.append(msg)
+                i += 1
+                continue
+
+            # Case 2: tool message — verify preceding assistant has matching tool_call
+            if msg.get("role") == "tool":
+                tcid = msg.get("tool_call_id")
+                if tcid and repaired:
+                    prev = repaired[-1]
+                    # The preceding message should be assistant with tool_calls, or another tool msg
+                    # Walk back to find the assistant
+                    found_match = False
+                    for k in range(len(repaired) - 1, -1, -1):
+                        if repaired[k].get("role") == "assistant" and repaired[k].get("tool_calls"):
+                            prev_ids = set()
+                            for tc in repaired[k]["tool_calls"]:
+                                pid = tc.get("id") if isinstance(tc, dict) else getattr(tc, "id", None)
+                                if pid:
+                                    prev_ids.add(pid)
+                            if tcid in prev_ids:
+                                found_match = True
+                            break
+                        elif repaired[k].get("role") != "tool":
+                            break
+
+                    if not found_match:
+                        logger.warning(
+                            "Dropping orphaned tool_result message (tool_call_id: %s)",
+                            tcid,
+                        )
+                        i += 1
+                        continue
+
+            repaired.append(msg)
+            i += 1
+
+        return repaired
+
     def compress(self, messages: List[Dict[str, Any]], current_tokens: int = None) -> List[Dict[str, Any]]:
         """Compress conversation messages by summarizing middle turns.
 
@@ -233,6 +320,7 @@ Write only the summary, starting with "[CONTEXT SUMMARY]:" prefix."""
             tail = messages[-self.protect_last_n:]
             kept.extend(m.copy() for m in tail)
             self.compression_count += 1
+            kept = self._repair_tool_pairs(kept)
             if not self.quiet_mode:
                 print(f"   ✂️  Truncated: {len(messages)} → {len(kept)} messages (dropped middle turns)")
             return kept
@@ -254,6 +342,7 @@ Write only the summary, starting with "[CONTEXT SUMMARY]:" prefix."""
         for i in range(compress_end, n_messages):
             compressed.append(messages[i].copy())
 
+        compressed = self._repair_tool_pairs(compressed)
         self.compression_count += 1
 
         if not self.quiet_mode:

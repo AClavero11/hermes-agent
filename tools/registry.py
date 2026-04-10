@@ -16,6 +16,7 @@ Import chain (circular-import safe):
 
 import json
 import logging
+import time
 from typing import Any, Callable, Dict, List, Optional, Set
 
 logger = logging.getLogger(__name__)
@@ -58,8 +59,8 @@ class ToolRegistry:
         toolset: str,
         schema: dict,
         handler: Callable,
-        check_fn: Callable = None,
-        requires_env: list = None,
+        check_fn: Optional[Callable] = None,
+        requires_env: Optional[list] = None,
         is_async: bool = False,
         description: str = "",
     ):
@@ -115,18 +116,73 @@ class ToolRegistry:
         * Async handlers are bridged automatically via ``_run_async()``.
         * All exceptions are caught and returned as ``{"error": "..."}``
           for consistent error format.
+        * Tool invocations are logged to SessionDB for observability.
         """
+        start_time = time.time()
         entry = self._tools.get(name)
         if not entry:
-            return json.dumps({"error": f"Unknown tool: {name}"})
+            error_result = json.dumps({"error": f"Unknown tool: {name}"})
+            self._log_invocation(name, args, error_result, start_time, source="registry")
+            return error_result
         try:
             if entry.is_async:
                 from model_tools import _run_async
-                return _run_async(entry.handler(args, **kwargs))
-            return entry.handler(args, **kwargs)
+                result = _run_async(entry.handler(args, **kwargs))
+            else:
+                result = entry.handler(args, **kwargs)
+            self._log_invocation(name, args, result, start_time, source="registry")
+            return result
         except Exception as e:
             logger.exception("Tool %s dispatch error: %s", name, e)
-            return json.dumps({"error": f"Tool execution failed: {type(e).__name__}: {e}"})
+            error_result = json.dumps({"error": f"Tool execution failed: {type(e).__name__}: {e}"})
+            self._log_invocation(name, args, error_result, start_time, source="registry", error=True)
+            return error_result
+
+    def _log_invocation(
+        self,
+        tool_name: str,
+        args: dict,
+        result: str,
+        start_time: float,
+        source: str = "registry",
+        error: bool = False,
+    ) -> None:
+        """
+        Log a tool invocation to SessionDB. Best-effort, never blocks dispatch.
+
+        Args:
+            tool_name: Name of the invoked tool
+            args: Tool arguments
+            result: Tool result (already JSON string)
+            start_time: Unix timestamp of invocation start
+            source: Source of invocation ('registry', 'http', 'mcp', 'cli', etc.)
+            error: Whether this invocation resulted in an error
+        """
+        try:
+            from hermes_state import SessionDB
+            from pathlib import Path
+            import os
+
+            # Calculate latency
+            latency_ms = int((time.time() - start_time) * 1000)
+
+            # Truncate result to 500 chars to avoid bloating DB
+            result_for_log = result if isinstance(result, dict) else {"result": result[:500] if result else ""}
+
+            # Open DB and log
+            db_path = Path(os.getenv("HERMES_HOME", Path.home() / ".hermes")) / "state.db"
+            db = SessionDB(db_path)
+            db.log_invocation(
+                tool_name=tool_name,
+                args=args,
+                result=result_for_log,
+                source=source,
+                latency_ms=latency_ms,
+            )
+            db.close()
+        except Exception as log_err:
+            # Best-effort: never let logging failures impact dispatch
+            logger.debug("Failed to log invocation for %s: %s", tool_name, log_err)
 
     # ------------------------------------------------------------------
     # Query helpers  (replace redundant dicts in model_tools.py)

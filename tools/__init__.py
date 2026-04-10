@@ -155,6 +155,16 @@ from .delegate_tool import (
     DELEGATE_TASK_SCHEMA,
 )
 
+# Claude Code remote control (Telegram /cc dispatch)
+from .cc_remote import (
+    handle_cc_command,
+    handle_approval,
+    parse_cc_command,
+    get_active_sessions,
+    check_cc_remote_requirements,
+    CC_REMOTE_SCHEMA,
+)
+
 # File tools have no external requirements - they use the terminal backend
 def check_file_requirements():
     """File tools only require terminal backend to be available."""
@@ -260,5 +270,12 @@ __all__ = [
     'delegate_task',
     'check_delegate_requirements',
     'DELEGATE_TASK_SCHEMA',
+    # Claude Code remote control
+    'handle_cc_command',
+    'handle_approval',
+    'parse_cc_command',
+    'get_active_sessions',
+    'check_cc_remote_requirements',
+    'CC_REMOTE_SCHEMA',
 ]
 

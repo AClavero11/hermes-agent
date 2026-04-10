@@ -92,10 +92,11 @@ class SessionResetPolicy:
 class PlatformConfig:
     """Configuration for a single messaging platform."""
     enabled: bool = False
-    token: Optional[str] = None  # Bot token (Telegram, Discord)
+    token: Optional[str] = None  # Bot token (Telegram, Discord) — used for interactive polling
+    automated_token: Optional[str] = None  # Separate bot token for cron/automated sends (e.g. @CzarAero_bot)
     api_key: Optional[str] = None  # API key if different from token
     home_channel: Optional[HomeChannel] = None
-    
+
     # Platform-specific settings
     extra: Dict[str, Any] = field(default_factory=dict)
     
@@ -106,6 +107,8 @@ class PlatformConfig:
         }
         if self.token:
             result["token"] = self.token
+        if self.automated_token:
+            result["automated_token"] = self.automated_token
         if self.api_key:
             result["api_key"] = self.api_key
         if self.home_channel:
@@ -121,6 +124,7 @@ class PlatformConfig:
         return cls(
             enabled=data.get("enabled", False),
             token=data.get("token"),
+            automated_token=data.get("automated_token"),
             api_key=data.get("api_key"),
             home_channel=home_channel,
             extra=data.get("extra", {}),
@@ -331,6 +335,12 @@ def _apply_env_overrides(config: GatewayConfig) -> None:
             config.platforms[Platform.TELEGRAM] = PlatformConfig()
         config.platforms[Platform.TELEGRAM].enabled = True
         config.platforms[Platform.TELEGRAM].token = telegram_token
+
+    # Automated sends go through a separate bot (@CzarAero_bot) to avoid
+    # polling conflicts between cron output and interactive messages.
+    telegram_automated = os.getenv("TELEGRAM_BOT_TOKEN_CZAR")
+    if telegram_automated and Platform.TELEGRAM in config.platforms:
+        config.platforms[Platform.TELEGRAM].automated_token = telegram_automated
     
     telegram_home = os.getenv("TELEGRAM_HOME_CHANNEL")
     if telegram_home and Platform.TELEGRAM in config.platforms:

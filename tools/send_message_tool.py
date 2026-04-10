@@ -117,6 +117,14 @@ def _handle_send(args):
     if not pconfig or not pconfig.enabled:
         return json.dumps({"error": f"Platform '{platform_name}' is not configured. Set up credentials in ~/.hermes/gateway.json or environment variables."})
 
+    # Use automated bot token for tool-initiated sends if available.
+    # This routes outbound messages through @CzarAero_bot, keeping the
+    # interactive bot (@accode) free of polling conflicts.
+    if pconfig.automated_token:
+        from copy import copy
+        pconfig = copy(pconfig)
+        pconfig.token = pconfig.automated_token
+
     used_home_channel = False
     if not chat_id:
         home = config.get_home_channel(platform)
