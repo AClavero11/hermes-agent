@@ -1,0 +1,25 @@
+# Ralph Progress Log
+Started: 2026-04-10T02:15:00Z
+Project: summit-domain-addons (layered on czar-to-hermes-migration)
+Branch: ralph/summit-domain-addons
+
+## Codebase Patterns
+(populated by Ralph as it discovers patterns)
+
+## Context
+- Hermes repo at /Users/ac/.hermes/hermes-agent/
+- Python project, pytest via pyproject.toml, openpyxl 3.1.5 available
+- tools/ directory with ~40 tools, tools/registry.py for registration
+- services/ directory with ils_auto_quote.py (40KB), ils_notifications.py, market_scanner.py
+- tests/ with tests/tools/, tests/integration/, tests/services/, tests/fakes/, conftest.py
+- Privacy wall: tasks tagged privacy=high must route local; PrivacyWallViolation to be defined if not already present
+
+## Hard Invariants
+- Summit 8140 sheet content never leaves Mac Studio
+- V11 engine is immutable ground truth; LLMs never generate numeric prices
+- Jorge Fernandez and Kent Kendrick at @summitmro.com excluded from default outbound solicit (per AC directive 2026-04-09)
+- IDG Summit piece parts produce yellow warning, not hard approval lock
+- AR condition lines never carry '8130 on request' language; SV/OH/NE/NS/New use '8130-3 on request'
+- Summit-sourced lines always cite '145 trace, Summit Aerospace tags'
+
+---

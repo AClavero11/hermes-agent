@@ -68,14 +68,14 @@
         "tests/integration/test_summit_sheet_integration.py"
       ],
       "files_to_modify": [
-        "tools/registry.py",
-        "tools/__init__.py"
+        "tools/__init__.py",
+        "toolsets.py"
       ],
       "source_files": [
         "/Users/ac/data/summit-8140-pricing.xlsx"
       ],
       "passes": false,
-      "notes": "Foundation for SDA-002 (consignment detection) and SDA-003 (no-price cascade). The sheet file already exists on disk as of 2026-04-09 with Jorge email context added as cell comments (non-destructive enrichment)."
+      "notes": "Foundation for SDA-002 (consignment detection) and SDA-003 (no-price cascade). The sheet file already exists on disk as of 2026-04-09 with Jorge email context added as cell comments (non-destructive enrichment). | VERIFIED 2026-04-10: tools/summit_sheet_tool.py registers via tools/registry.py self-registration pattern, exports from tools/__init__.py, and is added to _HERMES_CORE_TOOLS in toolsets.py."
     },
     {
       "id": "SDA-002",
@@ -108,16 +108,16 @@
         "SDA-001"
       ],
       "files_to_create": [
+        "tools/summit_trace_flags.py",
         "tests/tools/test_trace_flags.py",
         "tests/integration/test_summit_trace_flow.py"
       ],
       "files_to_modify": [
-        "services/ils_auto_quote.py",
         "gateway/platforms/telegram.py"
       ],
       "source_files": [],
       "passes": false,
-      "notes": "AC directive 2026-04-09: Jorge standing green light removes hard approval lock. IDG piece parts remain a softer exception (yellow warning, not a block). Reference: project_summit_green_light memory file."
+      "notes": "AC directive 2026-04-09: Jorge standing green light removes hard approval lock. IDG piece parts remain a softer exception (yellow warning, not a block). Reference: project_summit_green_light memory file. | REFRAMED 2026-04-10: core logic now lives in tools/summit_trace_flags.py (pure module, not a registered tool). The gateway/platforms/telegram.py change is only to render the yellow-banner UX for idg_piece_part_warning and per_line_check_required. Integration with ~/.hermes/services/ils_auto_quote.py is deferred to a post-migration wiring task."
     },
     {
       "id": "SDA-003",
@@ -150,16 +150,14 @@
         "SDA-001"
       ],
       "files_to_create": [
-        "services/no_price_cascade.py",
-        "tests/services/test_no_price_cascade.py",
+        "tools/no_price_cascade.py",
+        "tests/tools/test_no_price_cascade.py",
         "tests/integration/test_cascade_live.py"
       ],
-      "files_to_modify": [
-        "services/ils_auto_quote.py"
-      ],
+      "files_to_modify": [],
       "source_files": [],
       "passes": false,
-      "notes": "SDA-004 is a SOFT dependency -- if SDA-004 is not yet merged, step 4 falls through to step 5 manual entry with a log warning. Cascade still functions correctly, just with a reduced automation surface for non-Summit parts."
+      "notes": "SDA-004 is a SOFT dependency -- if SDA-004 is not yet merged, step 4 falls through to step 5 manual entry with a log warning. Cascade still functions correctly, just with a reduced automation surface for non-Summit parts. | REFRAMED 2026-04-10: Standalone module in hermes-agent/tools/. Integration with the auto-quote pipeline at ~/.hermes/services/ils_auto_quote.py is deferred to a post-migration wiring task once that code lives in a git-tracked location. This PRD delivers tested, importable logic; wiring is out of scope."
     },
     {
       "id": "SDA-004",
@@ -206,13 +204,12 @@
         "tests/integration/test_outbound_solicit_flow.py"
       ],
       "files_to_modify": [
-        "tools/registry.py",
         "tools/__init__.py",
-        "services/no_price_cascade.py"
+        "toolsets.py"
       ],
       "source_files": [],
       "passes": false,
-      "notes": "AC directive 2026-04-09: 'no jorge in the loop dont bother him nor kent'. The Summit exclusion is a hard invariant on the default path; manual override via Edit Recipient requires explicit y/n confirmation. The voice template should match AC's existing pattern from the Jorge 'Need 8130s' thread."
+      "notes": "AC directive 2026-04-09: 'no jorge in the loop dont bother him nor kent'. The Summit exclusion is a hard invariant on the default path; manual override via Edit Recipient requires explicit y/n confirmation. The voice template should match AC's existing pattern from the Jorge 'Need 8130s' thread. | REFRAMED 2026-04-10: registered as an LLM-callable tool via tools/__init__.py and toolsets.py _HERMES_CORE_TOOLS list. No changes to services/no_price_cascade.py (which is a tools/ module now per SDA-003 reframe)."
     },
     {
       "id": "SDA-005",
@@ -247,17 +244,16 @@
         "SDA-006"
       ],
       "files_to_create": [
-        "services/quote_append_detector.py",
-        "tests/services/test_quote_append_detector.py",
+        "tools/quote_append_detector.py",
+        "tests/tools/test_quote_append_detector.py",
         "tests/integration/test_append_flow.py"
       ],
       "files_to_modify": [
-        "services/ils_auto_quote.py",
         "gateway/platforms/telegram.py"
       ],
       "source_files": [],
       "passes": false,
-      "notes": "Replaces hard-block duplicate detection with append-offer. Depends on SDA-006 for customer_quote_ref extraction."
+      "notes": "Replaces hard-block duplicate detection with append-offer. Depends on SDA-006 for customer_quote_ref extraction. | REFRAMED 2026-04-10: detector lives in tools/; telegram.py adds append-offer UI with three buttons. The actual V11 append API call is deferred to post-migration wiring (can't modify ~/.hermes/services/ils_auto_quote.py from inside hermes-agent worktree)."
     },
     {
       "id": "SDA-006",
@@ -283,14 +279,13 @@
       "estimated_hours": 2,
       "depends_on": [],
       "files_to_create": [
-        "tests/services/test_customer_quote_ref.py"
+        "tools/customer_quote_ref.py",
+        "tests/tools/test_customer_quote_ref.py"
       ],
-      "files_to_modify": [
-        "services/ils_auto_quote.py"
-      ],
+      "files_to_modify": [],
       "source_files": [],
       "passes": false,
-      "notes": "Smallest story in the PRD. Pure parser extension with downstream field propagation through existing client_order_ref field. Must land before SDA-005 which uses customer_quote_ref as match signal #1."
+      "notes": "Smallest story in the PRD. Pure parser extension with downstream field propagation through existing client_order_ref field. Must land before SDA-005 which uses customer_quote_ref as match signal #1. | REFRAMED 2026-04-10: pure extractor function in tools/customer_quote_ref.py. Propagation through draft_quote and V11 client_order_ref is a post-migration wiring task once the pipeline lives in a git-tracked location."
     },
     {
       "id": "SDA-007",
@@ -325,7 +320,7 @@
       "files_to_modify": [],
       "source_files": [],
       "passes": false,
-      "notes": "Surfaces the two V11-side engine gaps (condition compression for piece parts, LIFO lot selection) as atlas PRD addendum candidates without invading the atlas PRD or advanced-parts repo. Atlas execution track owns the actual engine changes."
+      "notes": "Surfaces the two V11-side engine gaps (condition compression for piece parts, LIFO lot selection) as atlas PRD addendum candidates without invading the atlas PRD or advanced-parts repo. Atlas execution track owns the actual engine changes. | VERIFIED 2026-04-10: hermes-agent/scripts/ directory exists; verify_engine_capabilities.py as a standalone CLI script is the correct target."
     },
     {
       "id": "SDA-008",
@@ -369,7 +364,7 @@
       ],
       "source_files": [],
       "passes": false,
-      "notes": "Final story of the PRD. Acts as a regression gate for the 5 business rules. Runs against the completed stack (SDA-001 through SDA-007). Adds a pytest marker so CI can selectively run this suite."
+      "notes": "Final story of the PRD. Acts as a regression gate for the 5 business rules. Runs against the completed stack (SDA-001 through SDA-007). Adds a pytest marker so CI can selectively run this suite. | VERIFIED 2026-04-10: tests/integration/test_domain_rules.py + fixtures under tests/fixtures/domain_rules/. All paths inside hermes-agent."
     }
   ]
 }
