@@ -66,3 +66,12 @@ Branch: ralph/summit-domain-addons
 - Quality gates: import ok, 12/12 tests pass
 - Worker efficiency: 7 tool uses, no review round needed
 ---
+
+## 2026-04-10 - SDA-004: Outbound solicit tool (non-Summit only) - COMPLETE
+- tools/outbound_solicit_tool.py (~185 lines)
+- tests/tools/test_outbound_solicit.py (26 tests, 4 classes)
+- Hard Summit exclusion at vendor selection AND draft builder (two layers)
+- verify_price_free enforces no $ / no cost-price outside question form
+- check_manual_recipient_override prompts confirmation on @summitmro.com
+- Worker efficiency: 8 tool uses
+---

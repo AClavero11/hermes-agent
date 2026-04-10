@@ -208,8 +208,8 @@
         "toolsets.py"
       ],
       "source_files": [],
-      "passes": false,
-      "notes": "AC directive 2026-04-09: 'no jorge in the loop dont bother him nor kent'. The Summit exclusion is a hard invariant on the default path; manual override via Edit Recipient requires explicit y/n confirmation. The voice template should match AC's existing pattern from the Jorge 'Need 8130s' thread. | REFRAMED 2026-04-10: registered as an LLM-callable tool via tools/__init__.py and toolsets.py _HERMES_CORE_TOOLS list. No changes to services/no_price_cascade.py (which is a tools/ module now per SDA-003 reframe)."
+      "passes": true,
+      "notes": "AC directive 2026-04-09: 'no jorge in the loop dont bother him nor kent'. The Summit exclusion is a hard invariant on the default path; manual override via Edit Recipient requires explicit y/n confirmation. The voice template should match AC's existing pattern from the Jorge 'Need 8130s' thread. | REFRAMED 2026-04-10: registered as an LLM-callable tool via tools/__init__.py and toolsets.py _HERMES_CORE_TOOLS list. No changes to services/no_price_cascade.py (which is a tools/ module now per SDA-003 reframe). | COMPLETED 2026-04-10. 26 unit tests passing. Hard Summit exclusion at two layers."
     },
     {
       "id": "SDA-005",
