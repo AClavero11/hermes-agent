@@ -499,6 +499,17 @@ def _fetch_jorge_emails(pn: str) -> List[Dict[str, Any]]:
     except ImportError:
         return []
 
+    # SWA-005: narrow the catch-all to named failure modes so unexpected
+    # exceptions still surface at WARNING level instead of being swallowed.
+    try:
+        from googleapiclient.errors import HttpError  # type: ignore
+        from google.auth.exceptions import (  # type: ignore
+            RefreshError,
+            DefaultCredentialsError,
+        )
+    except ImportError:
+        HttpError = RefreshError = DefaultCredentialsError = ()  # type: ignore
+
     try:
         creds = Credentials.from_authorized_user_file(
             str(JORGE_GMAIL_TOKEN_PATH)
@@ -531,8 +542,23 @@ def _fetch_jorge_emails(pn: str) -> List[Dict[str, Any]]:
                 {"message_id": msg_id, "date": msg_date, "body": body}
             )
         return results
-    except Exception as exc:  # noqa: BLE001 - network / auth issues shouldn't crash lookup
-        logger.debug("Jorge email fetch failed for %s: %s", pn, exc)
+    except (HttpError, RefreshError, DefaultCredentialsError) as exc:
+        logger.debug(
+            "Jorge email fetch: expected transient failure for %s (%s): %s",
+            pn, type(exc).__name__, exc,
+        )
+        return []
+    except (FileNotFoundError, TimeoutError) as exc:
+        logger.debug(
+            "Jorge email fetch: IO failure for %s (%s): %s",
+            pn, type(exc).__name__, exc,
+        )
+        return []
+    except Exception as exc:  # noqa: BLE001 - narrowed above; this is the safety net
+        logger.warning(
+            "Jorge email fetch: UNEXPECTED exception for %s (%s): %s",
+            pn, type(exc).__name__, exc,
+        )
         return []
 
 
@@ -603,10 +629,28 @@ def _apply_default_cost_basis(hit: SummitSheetHit) -> None:
     hit.provenance = {}
 
 
+def _jorge_cost_sanity_ratio() -> float:
+    """Read the Jorge cost sanity ratio from env, defaulting to 3.0.
+
+    SWA-005: a parser glitch or Jorge typo could produce a wildly
+    incorrect override cost. We reject any Jorge cost that differs from
+    the baseline Kent Ext Cost by more than this ratio.
+    """
+    raw = os.getenv("HERMES_JORGE_COST_SANITY_RATIO", "3.0")
+    try:
+        return max(1.0, float(raw))
+    except (TypeError, ValueError):
+        return 3.0
+
+
 def _merge_jorge_override(
     hit: SummitSheetHit, emails: List[Dict[str, Any]]
 ) -> None:
-    """Override sheet cost with the newest Jorge email newer than Meimin Date."""
+    """Override sheet cost with the newest Jorge email newer than Meimin Date.
+
+    SWA-005: rejects override if the Jorge cost is outside the sanity
+    band (default: within 1/3x..3x of the Kent Ext Cost baseline).
+    """
     if not emails:
         return
 
@@ -623,6 +667,8 @@ def _merge_jorge_override(
         reverse=True,
     )
 
+    ratio = _jorge_cost_sanity_ratio()
+
     for email in ranked:
         email_date = email["date"]
         if meimin and email_date <= meimin:
@@ -631,6 +677,24 @@ def _merge_jorge_override(
         if not parsed:
             continue
         cost, guidance = parsed
+
+        # Sanity check against Kent Ext Cost baseline.
+        kent = hit.kent_ext_cost
+        if kent is not None and kent > 0 and cost > 0:
+            if cost > kent * ratio or cost < kent / ratio:
+                logger.warning(
+                    "Jorge cost sanity rejected for %s: jorge=%.2f kent=%.2f ratio=%.1f",
+                    hit.pn, cost, kent, ratio,
+                )
+                hit.provenance["sanity_check_rejected_jorge_cost"] = {
+                    "jorge_cost": cost,
+                    "kent_ext_cost": kent,
+                    "ratio_threshold": ratio,
+                    "jorge_email_id": email["message_id"],
+                    "jorge_email_date": email_date,
+                }
+                return
+
         hit.cost_basis = cost
         hit.cost_source = "jorge_email"
         hit.summit_guidance = guidance

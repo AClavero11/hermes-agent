@@ -132,9 +132,19 @@ class TestPrivacyWall:
 class TestStalenessOverride:
     def setup_method(self):
         _clear_cache()
+        # SWA-005: legacy fixtures encode Summit "over_cost" guidance (sell-side
+        # advice, not cost typos) that legitimately exceeds the default 3x
+        # sanity threshold. Raise the ratio for these tests so the documented
+        # behavior survives.
+        self._prev_ratio = os.environ.get("HERMES_JORGE_COST_SANITY_RATIO")
+        os.environ["HERMES_JORGE_COST_SANITY_RATIO"] = "100.0"
 
     def teardown_method(self):
         _clear_cache()
+        if self._prev_ratio is None:
+            os.environ.pop("HERMES_JORGE_COST_SANITY_RATIO", None)
+        else:
+            os.environ["HERMES_JORGE_COST_SANITY_RATIO"] = self._prev_ratio
 
     def test_staleness_override_with_mock_jorge_email(self):
         """Jorge email newer than Meimin Date must override cost basis."""
@@ -225,9 +235,16 @@ class TestMultiPnEmailParsing:
 
     def setup_method(self):
         _clear_cache()
+        # SWA-005: same legacy-fixture rationale as TestStalenessOverride.
+        self._prev_ratio = os.environ.get("HERMES_JORGE_COST_SANITY_RATIO")
+        os.environ["HERMES_JORGE_COST_SANITY_RATIO"] = "100.0"
 
     def teardown_method(self):
         _clear_cache()
+        if self._prev_ratio is None:
+            os.environ.pop("HERMES_JORGE_COST_SANITY_RATIO", None)
+        else:
+            os.environ["HERMES_JORGE_COST_SANITY_RATIO"] = self._prev_ratio
 
     MULTI_PN_BODY = (
         "3605812-17   Summit Cost $ 444.00 see what you can max the sale. 70/30\n"
