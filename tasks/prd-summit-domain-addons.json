@@ -363,8 +363,8 @@
         "pyproject.toml"
       ],
       "source_files": [],
-      "passes": false,
-      "notes": "Final story of the PRD. Acts as a regression gate for the 5 business rules. Runs against the completed stack (SDA-001 through SDA-007). Adds a pytest marker so CI can selectively run this suite. | VERIFIED 2026-04-10: tests/integration/test_domain_rules.py + fixtures under tests/fixtures/domain_rules/. All paths inside hermes-agent."
+      "passes": true,
+      "notes": "Final story of the PRD. Acts as a regression gate for the 5 business rules. Runs against the completed stack (SDA-001 through SDA-007). Adds a pytest marker so CI can selectively run this suite. | VERIFIED 2026-04-10: tests/integration/test_domain_rules.py + fixtures under tests/fixtures/domain_rules/. All paths inside hermes-agent. | COMPLETED 2026-04-10. 17 domain rules tests passing."
     }
   ]
 }

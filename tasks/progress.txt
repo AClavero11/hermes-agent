@@ -102,3 +102,22 @@ Branch: ralph/summit-domain-addons
 - Idempotent: existing stub files are preserved
 - Worker efficiency: 13 tool uses
 ---
+
+## 2026-04-10 - SDA-008: Domain rules compliance test suite - COMPLETE
+- tests/integration/test_domain_rules.py (17 tests, 6 classes)
+- tests/fixtures/domain_rules/{mock_gmail_mailbox,sample_rfqs,mock_v11_responses}.json
+- pyproject.toml: added 'domain_rules' marker
+- Covers 5 business rules + Summit exclusion safety invariant
+- Worker efficiency: 21 tool uses (highest of the run; integration work is inherently wider)
+
+## ALL 8 SDA STORIES COMPLETE
+Total tests across SDA suite: ~139 tests passing
+- SDA-001: 18 unit + 2 integration
+- SDA-002: 12 unit + 3 integration
+- SDA-003: 12 unit
+- SDA-004: 26 unit
+- SDA-005: 23 unit
+- SDA-006: 29 unit
+- SDA-007: 19 unit
+- SDA-008: 17 integration (domain_rules marker)
+---
