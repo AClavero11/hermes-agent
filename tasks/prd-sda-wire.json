@@ -1,0 +1,235 @@
+{
+  "project": "sda-wire — integrate SDA stack into the live auto-quote pipeline",
+  "branchName": "ralph/sda-wire",
+  "description": "Wire the 8 SDA tools (summit_sheet_lookup, summit_trace_flags, no_price_cascade, outbound_solicit_tool, quote_append_detector, customer_quote_ref, verify_engine_capabilities, plus the domain_rules test gate) into the live auto-quote pipeline via a bridge module pattern. The bridge lives entirely inside hermes-agent for full git coverage and test CI; the loose ~/.hermes/services/ils_auto_quote.py file gets minimal one-line modifications to call into the bridge. This PRD is runnable by Ralph in a fresh session with zero prior context.",
+  "metadata": {
+    "created": "2026-04-10",
+    "author": "Claude Opus 4.6 + AC session 2026-04-10",
+    "source": "Gemini 2.5 Pro cross-model brief recommended 'wire no_price_cascade into main application pipeline' as the single highest-value next action. This PRD executes that recommendation plus the remaining deferrals from the SDA run.",
+    "dependsOnPrd": "tasks/prd-summit-domain-addons.json — all 8 SDA stories must be passes=true before this PRD runs (verified as of 2026-04-10 commit 1897349)",
+    "readBeforeStarting": [
+      "tasks/overnight-run-2026-04-10.md — full context on what was built overnight and why this wire-up is needed",
+      "tasks/prd-summit-domain-addons.json — the PRD that built the 8 SDA tools this wire-up consumes",
+      "tasks/progress.txt — Ralph's progress log with learnings from each SDA story"
+    ],
+    "estimatedTotalHours": 14,
+    "hardInvariants": [
+      "Privacy wall preserved: summit_sheet_lookup and Gmail history content never leaves Mac Studio (inherited from SDA-001)",
+      "V11 engine output remains immutable ground truth; LLM never generates a numeric price",
+      "Summit contacts (@summitmro.com) stay excluded from default outbound solicit path (inherited from SDA-004)",
+      "IDG Summit piece parts produce a yellow warning banner but NEVER a hard approval lock (inherited from SDA-002)",
+      "AR condition lines never carry '8130 on request' language (inherited from SDA-002)",
+      "Summit-sourced lines always cite '145 trace, Summit Aerospace tags' in customer drafts (inherited from SDA-002)",
+      "Bridge module must fall back gracefully: any failure inside the bridge returns a structured error that ils_auto_quote.py can detect and revert to its existing pricing path (no broken live pipeline under any failure mode)",
+      "Loose-file modification to ~/.hermes/services/ils_auto_quote.py must be minimal (1-3 lines total) and MUST preserve the existing behavior as a fallback if the bridge raises or returns None"
+    ],
+    "boundaryNote": "hermes-agent is the git-tracked repo (~/.hermes/hermes-agent/). ~/.hermes/services/ils_auto_quote.py is a LOOSE file outside any git repo. Ralph cannot create worktrees for the loose file. When a story needs to modify the loose file, it does a direct edit (not a worktree edit), verifies the edit is minimal (<= 3 lines changed), and stores a backup of the original at tasks/backup-ils_auto_quote-YYYY-MM-DD.py before the first modification.",
+    "testEnvironment": {
+      "python": "python3 (repo venv if present at ~/.hermes/hermes-agent/.venv/bin/python3; otherwise system python3 with openpyxl + pytest + googleapiclient installed)",
+      "pytestCommand": "cd ~/.hermes/hermes-agent && PYTHONPATH=. python3 -m pytest",
+      "integrationMarker": "@pytest.mark.integration (excluded from default runs via addopts = '-m not integration')",
+      "domainRulesMarker": "@pytest.mark.domain_rules (the SDA-008 gate; included in default runs)"
+    }
+  },
+  "userStories": [
+    {
+      "id": "SWA-001",
+      "title": "Build auto-quote bridge module (pure logic, no side effects)",
+      "description": "Create a single-function bridge at tools/auto_quote_bridge.py that orchestrates all 8 SDA tools into one callable. Given an incoming RFQ context (customer, PN list, body text), the bridge returns a structured result containing: per-PN cascade outcome (engine/sheet/history/solicit/manual), per-PN trace flags, extracted customer_quote_ref, and quote append suggestion if applicable. Pure function with injected dependencies — no network calls, no SMTP, no Telegram, no V11 writes. Every external source (V11 engine, Gmail history, manual entry) is passed in as a callable so the bridge is fully testable in isolation.",
+      "acceptanceCriteria": [
+        "File tools/auto_quote_bridge.py exists in hermes-agent repo",
+        "Exports a dataclass BridgeContext with: customer_id, customer_name, rfq_body, pn_list, aircraft (optional), condition_per_pn (dict)",
+        "Exports a dataclass BridgeResult with: cascade_results (list of CascadeResult, one per PN), trace_flags (list of TraceFlags, one per PN), customer_quote_ref (Optional[str]), append_suggestion (Optional[AppendSuggestion]), warnings (list of str)",
+        "Exports a function run_bridge(ctx: BridgeContext, engine_probe: Callable, history_probe: Callable, solicit_probe: Callable, manual_probe: Callable, open_quotes: Optional[List[OpenQuote]] = None) -> BridgeResult",
+        "Logic: (1) extract customer_quote_ref from ctx.rfq_body via tools.customer_quote_ref.extract_customer_quote_ref; (2) if open_quotes provided, call tools.quote_append_detector.detect_append_suggestion first — if HIGH or MED confidence, populate append_suggestion and return early with empty cascade/flags lists; (3) for each PN, call tools.no_price_cascade.run_cascade passing in a sheet_source that wraps tools.summit_sheet_tool.summit_sheet_lookup; (4) for each priced line, call tools.summit_trace_flags.emit_trace_flags using the condition from ctx.condition_per_pn",
+        "Failure mode: any exception inside run_bridge is caught at the top level, logged, and returned as a BridgeResult with warnings populated and cascade_results/trace_flags empty — the caller can detect the failure and fall back to existing behavior. Never propagates exceptions up.",
+        "Tests in tests/tools/test_auto_quote_bridge.py (at least 10 tests)",
+        "test_bridge_happy_path — mock all sources to return canned data, assert all 4 output fields populated correctly",
+        "test_bridge_with_append_short_circuits — provide open_quotes that would trigger HIGH confidence match, assert append_suggestion populated and cascade_results empty",
+        "test_bridge_extracts_customer_ref_from_body — RFQ body contains 'Ref: ABC-123', assert customer_quote_ref == 'ABC-123'",
+        "test_bridge_each_pn_gets_own_cascade_result — 3 PNs, all engine hits, assert 3 cascade_results with correct confidence",
+        "test_bridge_each_pn_gets_own_trace_flags — mix of Summit and non-Summit lines, assert trace_flags match expected values",
+        "test_bridge_failure_in_cascade_returns_warning_not_raise — engine_probe raises RuntimeError, assert run_bridge returns BridgeResult with warning, does not re-raise",
+        "test_bridge_failure_in_trace_flags_isolated — one PN's trace_flag raises, others still populate correctly",
+        "test_bridge_no_pns_returns_empty_but_valid_result — ctx.pn_list == [], assert empty lists and no errors",
+        "test_bridge_no_customer_ref_is_none — rfq_body without any ref pattern, customer_quote_ref is None",
+        "test_bridge_append_suggestion_low_confidence_does_not_short_circuit — LOW confidence should still let cascade run",
+        "Quality gates: module imports cleanly, all tests pass via pytest, no warnings"
+      ],
+      "tests": ["test_auto_quote_bridge"],
+      "priority": 1,
+      "estimated_hours": 3,
+      "depends_on": [],
+      "files_to_create": [
+        "tools/auto_quote_bridge.py",
+        "tests/tools/test_auto_quote_bridge.py"
+      ],
+      "files_to_modify": [],
+      "source_files": [
+        "tools/summit_sheet_tool.py (read for API)",
+        "tools/summit_trace_flags.py (read for API)",
+        "tools/no_price_cascade.py (read for API)",
+        "tools/customer_quote_ref.py (read for API)",
+        "tools/quote_append_detector.py (read for API)",
+        "tools/outbound_solicit_tool.py (read for API)"
+      ],
+      "passes": false,
+      "notes": "Foundation story. Everything else depends on this. Keep the bridge PURE — no I/O, no side effects, all external dependencies injected. The ils_auto_quote.py integration (SWA-002) is where side effects live."
+    },
+    {
+      "id": "SWA-002",
+      "title": "Wire bridge into ~/.hermes/services/ils_auto_quote.py with minimal loose-file touching",
+      "description": "Modify the loose file ~/.hermes/services/ils_auto_quote.py to call the SWA-001 bridge from its pricing step. The edit must be minimal: 1-3 lines total. The existing pricing path is preserved as a fallback: if the bridge raises OR returns a BridgeResult with empty cascade_results, the code continues with its existing logic as if the bridge was never there.",
+      "acceptanceCriteria": [
+        "Before any modification, backup the original file: cp ~/.hermes/services/ils_auto_quote.py ~/.hermes/hermes-agent/tasks/backup-ils_auto_quote-2026-04-10.py",
+        "Read ~/.hermes/services/ils_auto_quote.py in full and identify the pricing step (the function that computes a price for an RFQ line)",
+        "Insert import: from tools.auto_quote_bridge import run_bridge, BridgeContext (add to the existing imports section)",
+        "Insert call at the pricing step: build a BridgeContext from the current RFQ state, call run_bridge with the existing engine/history/solicit/manual sources wrapped as probe callables, inspect the result",
+        "If bridge result has cascade_results and they contain valid cost_basis values, use those prices and trace flags downstream in the pipeline",
+        "If bridge raises OR returns empty cascade_results OR contains only warnings: log the failure, fall through to the existing pricing logic unchanged",
+        "Total lines changed in ils_auto_quote.py must be <= 10 (not counting the new import line). This story should NOT rewrite the pricing step — only insert a bridge call with a fallback.",
+        "Integration test: tests/integration/test_bridge_wire.py that imports ils_auto_quote.py as a module, constructs a mock RFQ, and verifies the bridge is invoked. Marked @pytest.mark.integration.",
+        "Regression test: the existing ils_auto_quote.py test suite (if any) still passes after the modification",
+        "Dry-run verification: invoke ils_auto_quote.py's poll function (or equivalent) against a mock RFQ in DRY_RUN mode and confirm it completes without error",
+        "Quality gates: Python syntax check on the modified loose file, bridge import succeeds, integration test passes"
+      ],
+      "tests": ["test_bridge_wire"],
+      "priority": 2,
+      "estimated_hours": 2,
+      "depends_on": ["SWA-001"],
+      "files_to_create": [
+        "tests/integration/test_bridge_wire.py",
+        "tasks/backup-ils_auto_quote-2026-04-10.py (before modification)"
+      ],
+      "files_to_modify": [
+        "~/.hermes/services/ils_auto_quote.py (loose file, <=10 lines total change)"
+      ],
+      "source_files": [],
+      "passes": false,
+      "notes": "This is the ONLY story that touches a loose file outside the hermes-agent repo. Ralph must use direct Edit tool calls with absolute paths, not worktree edits. The modification must be minimal and preserve all existing behavior as a fallback. If the bridge fails for any reason, the pipeline continues as if SDA-WIRE never happened."
+    },
+    {
+      "id": "SWA-003",
+      "title": "Telegram callback handlers for the 4 new SDA flows",
+      "description": "Add Telegram inline keyboard callback handlers for the four new user-facing flows from the SDA stack: (1) no-price manual entry prompt (AC replies with a numeric value); (2) outbound solicit approval [Send Solicit] [Skip] [Manual Price] [Edit Recipient]; (3) quote append offer [Append] [New Quote] [Reject]; (4) IDG Summit piece part yellow warning banner (informational, no buttons). Callback patterns are registered in gateway/platforms/telegram.py following the existing ^ilsq_ and ^cc_ pattern precedent.",
+      "acceptanceCriteria": [
+        "New file tools/telegram_sda_flows.py exports four async callback handlers: handle_noprice_manual_reply, handle_solicit_callback, handle_append_callback, handle_idg_warning_dismissed",
+        "Each handler is decorated or structured to match the existing gateway/platforms/telegram.py callback registration pattern",
+        "Callback patterns: ^sda_noprice_, ^sda_solicit_, ^sda_append_, ^sda_idg_",
+        "Handlers consume the callback_data payload, extract the action (approve/skip/edit_recipient/append/new_quote/reject/dismissed), and dispatch to the appropriate downstream side effect (send via SMTP, enqueue for manual drafting, call atlas append endpoint, etc.)",
+        "Downstream side effects are themselves injected callables so the handlers are testable without real SMTP, real Telegram, real V11",
+        "gateway/platforms/telegram.py is extended with: `self._app.add_handler(CallbackQueryHandler(self._handle_sda_callback, pattern=r'^sda_'))` routing all ^sda_ patterns to a single dispatcher that delegates to the four handlers",
+        "Unit tests in tests/tools/test_telegram_sda_flows.py cover each handler's callback_data parsing, action dispatch, and error handling with mocked downstream callables",
+        "At least 12 unit tests: 3 per flow covering happy path + error path + edge case",
+        "Integration test in tests/integration/test_telegram_sda_integration.py uses a mock Telegram bot to simulate a full callback round-trip for each of the 4 flows. Marked @pytest.mark.integration",
+        "No real Telegram API calls in any test",
+        "Summit recipient guard: handle_solicit_callback's Edit Recipient branch, when it receives a summitmro.com address, MUST call tools.outbound_solicit_tool.check_manual_recipient_override and require an additional confirmation callback before accepting",
+        "Quality gates: module imports, unit tests pass, integration test passes with mock Telegram"
+      ],
+      "tests": ["test_telegram_sda_flows", "test_telegram_sda_integration"],
+      "priority": 3,
+      "estimated_hours": 3,
+      "depends_on": ["SWA-001"],
+      "files_to_create": [
+        "tools/telegram_sda_flows.py",
+        "tests/tools/test_telegram_sda_flows.py",
+        "tests/integration/test_telegram_sda_integration.py"
+      ],
+      "files_to_modify": [
+        "gateway/platforms/telegram.py"
+      ],
+      "source_files": [
+        "tools/outbound_solicit_tool.py (for Summit recipient override check)",
+        "tools/no_price_cascade.py (for cascade result shape)",
+        "tools/quote_append_detector.py (for append suggestion shape)"
+      ],
+      "passes": false,
+      "notes": "This story does NOT modify the pricing or drafting logic — it only adds the user-facing approval UI. The actual send-on-approval side effects are injected so the handlers remain unit-testable."
+    },
+    {
+      "id": "SWA-004",
+      "title": "End-to-end integration test with mocked externals",
+      "description": "Build a single comprehensive integration test that exercises the full wire-up: RFQ arrives, parse extracts customer_quote_ref, bridge runs cascade with mixed Summit/non-Summit PNs, trace flags emit, draft step generates text with correct 145 citations for Summit lines and no '8130' for AR lines, Telegram callback handlers fire for each approval surface. All external services (Gmail, V11, SMTP, Telegram) are mocked. The test acts as a pre-deploy confidence gate.",
+      "acceptanceCriteria": [
+        "New file tests/integration/test_sda_e2e.py",
+        "Marked @pytest.mark.integration and also @pytest.mark.domain_rules (runs in both the default pre-deploy gate AND on-demand integration runs)",
+        "Fixture: a realistic RFQ body with 4 lines (2 Summit, 1 non-Summit SV, 1 non-Summit AR), a customer_quote_ref in the body, and a customer known to have one open quote within the 7-day append window",
+        "Mock V11 engine returns prices for 3 of 4 PNs (one miss to exercise the cascade fallback)",
+        "Mock Gmail returns one Jorge email newer than the sheet's Meimin Date for one of the Summit PNs (to exercise the staleness override)",
+        "Mock Telegram records every message sent and callback handler invoked so the test can assert the right UI surfaces were triggered",
+        "Assertions on the bridge output: 4 cascade_results with correct sources (3 engine + 1 sheet), 4 trace_flags (2 with trace_type='145', 1 with '8130', 1 with None for AR), customer_quote_ref correctly extracted, append_suggestion populated with HIGH or MED confidence",
+        "Assertions on the Telegram mock: yellow IDG warning banner triggered if any Summit line is IDG piece part, append offer triggered due to open quote match, no solicit triggered (all PNs either priced by engine or found in sheet)",
+        "Assertions on the draft output (if SWA-003 or later story wires drafting): Summit lines contain '145' and 'Summit Aerospace tags', AR line does NOT contain '8130 on request'",
+        "Safety assertion: no call to the real Gmail API, no call to the real V11 MCP, no outbound Telegram message, no SMTP send — all externals confirmed mocked via strict spec mocks",
+        "Quality gates: integration test passes, domain_rules suite still passes, no regressions"
+      ],
+      "tests": ["test_sda_e2e"],
+      "priority": 4,
+      "estimated_hours": 3,
+      "depends_on": ["SWA-001", "SWA-002", "SWA-003"],
+      "files_to_create": [
+        "tests/integration/test_sda_e2e.py"
+      ],
+      "files_to_modify": [],
+      "source_files": [],
+      "passes": false,
+      "notes": "This is the acceptance test for the whole SDA-WIRE PRD. If this passes, the feature is genuinely integrated end-to-end and ready for production traffic behind DRY_RUN."
+    },
+    {
+      "id": "SWA-005",
+      "title": "Polish: narrow exception handling and Jorge cost sanity fallback",
+      "description": "Two quality improvements surfaced by Gemini 2.5 Pro's cross-model audit of the SDA-001 module: (1) the broad except Exception clause in _fetch_jorge_emails masks specific failure modes that would be useful to distinguish; (2) the Jorge email cost override has no sanity check against the Kent Ext Cost baseline — a parser glitch or Jorge typo could produce a wildly incorrect cost that flows straight through. This story narrows the exceptions and adds a sanity fallback.",
+      "acceptanceCriteria": [
+        "tools/summit_sheet_tool.py: _fetch_jorge_emails's broad `except Exception` is narrowed to specific exception types: googleapiclient.errors.HttpError, google.auth.exceptions.RefreshError, google.auth.exceptions.DefaultCredentialsError, FileNotFoundError, TimeoutError. A final catch-all remains but logs at WARNING level with the exception class name.",
+        "tools/summit_sheet_tool.py: _merge_jorge_override adds a sanity check. If the Jorge-parsed cost is more than 3x or less than 1/3 of the row's Kent Ext Cost (when Kent cost is non-None), log a warning and DO NOT override. The fallback behavior uses Kent Ext Cost and records 'sanity_check_rejected_jorge_cost' in the provenance dict.",
+        "Sanity check threshold is configurable via env var HERMES_JORGE_COST_SANITY_RATIO, default 3.0",
+        "Unit test: mock Jorge email returns cost 10x the Kent cost, assert the override is rejected and cost_basis remains the Kent value with sanity flag in provenance",
+        "Unit test: mock Jorge email returns cost within threshold, assert the override is accepted normally",
+        "Unit test: env var HERMES_JORGE_COST_SANITY_RATIO=10.0 allows a 5x deviation that the default would have rejected",
+        "Unit test: narrowed exception types — mocking googleapiclient to raise HttpError returns [] silently; a random RuntimeError propagates (caught by outermost handler with WARNING log)",
+        "Regression test: all 18 existing test_summit_sheet_tool.py tests still pass",
+        "All 156 existing SDA tests still pass",
+        "Quality gates: module imports, tests pass, no regressions"
+      ],
+      "tests": ["test_summit_sheet_tool_sanity"],
+      "priority": 5,
+      "estimated_hours": 2,
+      "depends_on": [],
+      "files_to_create": [],
+      "files_to_modify": [
+        "tools/summit_sheet_tool.py",
+        "tests/tools/test_summit_sheet_tool.py"
+      ],
+      "source_files": [],
+      "passes": false,
+      "notes": "Sourced from Gemini 2.5 Pro's cross-model audit 2026-04-10. Independent story that can run in parallel with SWA-001..SWA-004 but scheduled last to avoid churn on the summit_sheet_tool.py file while the bridge is being built."
+    },
+    {
+      "id": "SWA-006",
+      "title": "Documentation and runbook for the SDA-WIRE integration",
+      "description": "Write a single markdown doc that documents the full wire-up for operational handoff: how data flows from RFQ arrival through parse, bridge, cascade, trace flags, draft, Telegram approval, and send. Include a troubleshooting section, a rollback procedure, and the observability touch points. This doc is the runbook AC (or a future maintainer) reads when something misbehaves in production.",
+      "acceptanceCriteria": [
+        "New file docs/sda-wire-runbook.md",
+        "Sections: Architecture overview, Data flow diagram (ASCII or mermaid), File map, How to enable/disable the bridge, Troubleshooting the 4 most likely failure modes (bridge raises, Gmail auth expired, Summit sheet missing, Telegram callback lost), Rollback procedure, Observability touch points (log locations, metrics, Telegram alerts), Known limitations",
+        "Architecture overview references by name: tools/auto_quote_bridge.py, tools/summit_sheet_tool.py, tools/summit_trace_flags.py, tools/no_price_cascade.py, tools/outbound_solicit_tool.py, tools/quote_append_detector.py, tools/customer_quote_ref.py, tools/telegram_sda_flows.py",
+        "Data flow diagram shows: RFQ ingress -> parse -> customer_quote_ref extraction -> quote_append_detector -> bridge -> cascade -> trace_flags -> draft -> telegram HITL -> send",
+        "Rollback procedure: 'To disable SDA-WIRE and revert to pre-bridge behavior, restore the backup at tasks/backup-ils_auto_quote-2026-04-10.py and restart the Hermes gateway. The bridge module in tools/ can remain in place; it is only invoked by the loose file wire-up.'",
+        "Troubleshooting section has a grep-able error pattern table: error string → cause → fix",
+        "Known limitations section documents: (1) Jorge email parser is format-sensitive per Gemini audit; (2) real-sheet integration tests are gated off default CI; (3) three deferred integration test files still not written; (4) Telegram wire-up requires the gateway to be running",
+        "Doc is readable by a future maintainer who has never seen this PRD — no implicit context assumptions",
+        "Quality gates: markdown parses cleanly, all referenced files exist"
+      ],
+      "tests": [],
+      "priority": 6,
+      "estimated_hours": 1,
+      "depends_on": ["SWA-001", "SWA-002", "SWA-003", "SWA-004"],
+      "files_to_create": [
+        "docs/sda-wire-runbook.md"
+      ],
+      "files_to_modify": [],
+      "source_files": [],
+      "passes": false,
+      "notes": "Documentation-only story. Safe to defer if time is tight, but valuable as an operational handoff when you're not the one on call."
+    }
+  ]
+}
