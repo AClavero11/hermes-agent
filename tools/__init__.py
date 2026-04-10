@@ -165,6 +165,13 @@ from .cc_remote import (
     CC_REMOTE_SCHEMA,
 )
 
+# Summit 8140 pricing sheet lookup (local-only, privacy=high)
+from .summit_sheet_tool import (
+    summit_sheet_lookup,
+    check_summit_requirements,
+    PrivacyWallViolation,
+)
+
 # File tools have no external requirements - they use the terminal backend
 def check_file_requirements():
     """File tools only require terminal backend to be available."""
@@ -277,5 +284,9 @@ __all__ = [
     'get_active_sessions',
     'check_cc_remote_requirements',
     'CC_REMOTE_SCHEMA',
+    # Summit 8140 pricing sheet lookup
+    'summit_sheet_lookup',
+    'check_summit_requirements',
+    'PrivacyWallViolation',
 ]
 
