@@ -1,3 +1,155 @@
+# Advanced Aerospace Operating Doctrine
+
+## Mission
+
+Convert repeatable aviation operations into deterministic software.
+
+LLMs are allowed to accelerate analysis, code generation, and unstructured-input normalization. They are not allowed to own final business logic when the task can be formalized in code.
+
+Every system we build must reduce token burn, reduce latency, increase auditability, and create reusable code assets.
+
+## Strategic Thesis
+
+We are building an aviation advantage stack composed of:
+- deterministic engines
+- durable automations
+- clean adapters to internal and external systems
+- LLM supplementation only where input data is messy, ambiguous, or novel
+
+The default answer to repeated work is code, not more prompting.
+
+## First Program
+
+Build a deterministic pricing and quoting engine as the single source of truth for:
+- advanced.parts customer-facing quote generation
+- Atlas internal quote workflows
+- Hermes automated quote issuance for inbound marketplace RFQs such as ILS or AeroExchange
+
+Do not allow separate quote logic per channel.
+Channel-specific behavior belongs only in adapters, permissions, and presentation.
+
+## Language Policy
+
+- Default to Python for domain logic, rules, APIs, tests, orchestration, and data tooling.
+- Use Rust only when profiling or operational constraints prove Python is insufficient.
+- Do not introduce C++ without a written justification showing why Python or Rust is not economically sufficient.
+
+Optimize for total operating leverage, maintainability, and auditability first.
+
+## What Must Become Deterministic
+
+The following must be code, not prompt behavior:
+- price calculation
+- margin floors and ceilings
+- customer/account pricing rules
+- quote validity windows
+- approval thresholds
+- override policies
+- routing and escalation rules
+- inventory and availability decisions once structured inputs exist
+- marketplace response rules once structured inputs exist
+
+## Allowed LLM Uses
+
+LLMs may be used to:
+- normalize messy RFQs, emails, and marketplace text into strict schemas
+- extract part number, quantity, condition, cert, trace, urgency, and free-text notes
+- classify exceptions and summarize edge cases for humans
+- draft code, tests, migrations, and documentation
+- propose rule changes for human review
+
+## Forbidden LLM Uses As Final Authority
+
+LLMs may not be the final authority for:
+- final quote price
+- margin logic
+- final cost basis selection once structured inputs exist
+- quote approval
+- compliance-critical decisions
+- hidden business logic embedded only in prompts
+
+## Delivery Standard
+
+For every production feature, deliver:
+1. architecture note
+2. typed domain model
+3. deterministic core logic
+4. adapters/interfaces
+5. test suite
+6. realistic fixtures
+7. observability and audit trail
+8. migration plan from current behavior
+9. rollback path
+
+No mock architecture. Ship code.
+
+## Pricing Engine Requirements
+
+The pricing engine must accept, at minimum:
+- part number and normalization metadata
+- quantity
+- condition
+- cert and trace requirements
+- customer/account tier
+- source cost basis and provenance
+- market signals and comparable references
+- lead time
+- inventory position
+- risk flags
+- issuer context: advanced.parts, Atlas, or Hermes
+
+The pricing engine must output, at minimum:
+- normalized request object
+- eligibility decision
+- minimum sell
+- target sell
+- recommended quote
+- validity window
+- auto-quote eligibility
+- confidence score or deterministic confidence band
+- full calculation breakdown
+- machine-readable reason codes
+- ruleset version
+- input snapshot hash
+
+## System Design Constraints
+
+- one canonical quote engine, many adapters
+- pure functions at the core
+- versioned rules and immutable quote snapshots
+- idempotent APIs and workers
+- no duplicate pricing logic across frontend, backend, or gateway
+- no magic constants outside versioned configuration
+- no silent fallbacks
+- fail closed on missing required inputs
+- always provide a human escalation path when thresholds are not met
+
+## Repository Behavior
+
+Always begin by reading the existing repository and tracing where quote logic currently lives.
+
+Prefer extending or extracting current working logic over inventing a parallel system.
+
+Make the smallest irreversible change first.
+
+When unknowns exist, isolate them behind explicit configuration or TODO-marked policy files. Never fabricate business coefficients.
+
+Do not stop at analysis. Implement working code, tests, fixtures, and docs.
+
+## Success Metrics
+
+Optimize for:
+- lower token spend
+- lower quote latency
+- higher safe auto-quote rate
+- lower human override rate
+- improved margin protection
+- improved quote consistency
+- faster time-to-quote
+- easier auditability and postmortems
+
+---
+
 # Hermes Agent - Development Guide
 
 Instructions for AI coding assistants (GitHub Copilot, Cursor, etc.) and human developers.
