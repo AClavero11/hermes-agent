@@ -89,3 +89,23 @@ Refreshing for US-003 /autoresearch, US-004 Autoreason in Ralph REVIEW, US-005 r
   - Multi-round skill instructions must define the loop entry point, not hardcode round numbers into step headers
   - Domain validation with ls fallback is the correct pattern (route via ROUTING.md, validate via ls, fallback to unrouted)
 ---
+[2026-04-14T15:24:05Z] RALPH | US-004 | LOAD → SCOUT
+[2026-04-14T15:29:28Z] RALPH | US-004 | SCOUT → PLAN
+[2026-04-14T15:31:12Z] RALPH | US-004 | PLAN → IMPLEMENT
+[2026-04-14T15:35:00Z] RALPH | US-004 | IMPLEMENT → VERIFY
+[2026-04-14T15:35:39Z] RALPH | US-004 | VERIFY → REVIEW (gates: all PASS)
+[2026-04-14T15:40:25Z] RALPH | US-004 | REVIEW → COMMIT (round 1 fixes applied, all gates re-pass)
+
+## 2026-04-14 - US-004: Autoreason in Ralph REVIEW phase
+- Updated ~/.claude/skills/ralph/SKILL.md Phase 6 with A/B/AB blind Borda protocol
+- 7 edit points: frontmatter, state JSON example, Phase 6 full replacement (6a/6b/6c/6d), state reset, recovery table, total agents, Rule 8
+- Files changed: ~/.claude/skills/ralph/SKILL.md (modified, ~1020 lines total)
+- Quality gates: phase-6:PASS three-variants:PASS blind-judging:PASS borda-scoring:PASS convergence:PASS fallback:PASS logging:PASS state-fields:PASS (8/8)
+- **Review:** 1 round, 4 must-fix resolved (resume counter clobber, REVIEW_START unset on resume, AB synthesizer label leak, winner commit before re-capture), 4 should-fix resolved (single-judge log, max-rounds exit, dual counter docs, fallback VERIFY note)
+- **Learnings:**
+  - Shell variables (REVIEW_START) are not persisted — always set fresh on resume, document the per-session budget
+  - Synthesizer prompts must use neutral labels (Implementation 1/2, not Variant A/B) to prevent bias leaking
+  - When applying winner files to worktree, must git commit before re-capturing diffs — Write alone doesn't update git state
+  - Resume logic must load stored counters before initialization — unconditional zeroing breaks the resume contract
+  - Multi-model protocols (A/B/AB + judges) create dual counter systems — document which counter serves which path
+---
