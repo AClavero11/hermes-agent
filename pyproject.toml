@@ -83,3 +83,29 @@ markers = [
     "domain_rules: marks the 5-rule domain compliance suite",
 ]
 addopts = "-m 'not integration'"
+
+[tool.ruff]
+target-version = "py311"
+
+[tool.ruff.lint]
+# E402: module-level imports not at top — intentional across the codebase
+#       (env vars and sys.path must be set before importing modules that read them)
+# F541: f-strings without placeholders — cosmetic, pervasive across the codebase
+ignore = ["E402", "F541"]
+
+[tool.ruff.lint.per-file-ignores]
+# Vulture whitelist uses bare names that ruff flags as F821
+".vulture-whitelist.py" = ["F821"]
+# cli.py: F401 (unused imports kept for side effects), F811 (intentional redefinitions
+# after conditional imports / ASCII art blocks), F841 (argparse subparser vars)
+"cli.py" = ["F401", "F811", "F841"]
+# hermes_cli/main.py: F401 (lazy imports inside command handlers), F841 (argparse subparser vars)
+"hermes_cli/main.py" = ["F401", "F841"]
+# run_agent.py: F401 (imports used dynamically), F841 (variables used in conditional paths)
+"run_agent.py" = ["F401", "F841"]
+# gateway/run.py: F401 (lazy platform imports), F841 (exception vars)
+"gateway/run.py" = ["F401", "F841"]
+# batch_runner.py: F841 (checkpoint vars)
+"batch_runner.py" = ["F841"]
+# agent/context_compressor.py: F841 (intentional look-behind var)
+"agent/context_compressor.py" = ["F841"]

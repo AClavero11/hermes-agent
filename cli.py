@@ -3264,10 +3264,12 @@ def main(
     list_toolsets: bool = False,
     gateway: bool = False,
     resume: str = None,
+    profile: str = None,
+    p: str = None,
 ):
     """
     Hermes Agent CLI - Interactive AI Assistant
-    
+
     Args:
         query: Single query to execute (then exit). Alias: -q
         q: Shorthand for --query
@@ -3282,13 +3284,16 @@ def main(
         list_tools: List available tools and exit
         list_toolsets: List available toolsets and exit
         resume: Resume a previous session by its ID (e.g., 20260225_143052_a1b2c3)
-    
+        profile: Use a named profile for isolated SOUL.md and memory. Alias: -p
+        p: Shorthand for --profile
+
     Examples:
         python cli.py                            # Start interactive mode
         python cli.py --toolsets web,terminal    # Use specific toolsets
         python cli.py -q "What is Python?"       # Single query mode
         python cli.py --list-tools               # List tools and exit
         python cli.py --resume 20260225_143052_a1b2c3  # Resume session
+        python cli.py -p research                # Use the 'research' profile
     """
     # Signal to terminal_tool that we're in interactive mode
     # This enables interactive sudo password prompts with timeout
@@ -3302,6 +3307,18 @@ def main(
         asyncio.run(start_gateway())
         return
     
+    # Handle profile shorthand and activate profile environment
+    profile = profile or p
+    if profile:
+        from hermes_cli.profile import profile_exists, get_profile_dir
+        if not profile_exists(profile):
+            print(f"Profile '{profile}' not found. Create it with: hermes profile create {profile}")
+            return
+        profile_dir = get_profile_dir(profile)
+        os.environ["HERMES_SOUL_PATH"] = str(profile_dir / "SOUL.md")
+        os.environ["HERMES_MEMORY_DIR"] = str(profile_dir / "memories")
+        os.environ["HERMES_PROFILE"] = profile
+
     # Handle query shorthand
     query = query or q
     

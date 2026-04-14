@@ -70,3 +70,13 @@ start_gateway = None  # unused variable
 # model_config is read by Pydantic machinery, not called explicitly.
 # ---------------------------------------------------------------------------
 model_config = None  # unused variable
+
+# ---------------------------------------------------------------------------
+# cli.py: imports used for side-effects, dynamic dispatch, or threading
+# ---------------------------------------------------------------------------
+_callbacks  # unused import (registered via side-effect at import time)
+resolve_toolset  # unused import (used dynamically via toolsets module)
+TOOLSET_REQUIREMENTS  # unused import (used in conditional branches)
+get_skill_commands  # unused import (used in completer setup)
+complete_event  # unused variable (threading Event, waited on by other thread)
+_load_mcp_config  # unused import (called conditionally)

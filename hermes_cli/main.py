@@ -167,10 +167,11 @@ def cmd_chat(args):
         "verbose": args.verbose,
         "query": args.query,
         "resume": getattr(args, "resume", None),
+        "profile": getattr(args, "profile", None),
     }
     # Filter out None values
     kwargs = {k: v for k, v in kwargs.items() if v is not None}
-    
+
     cli_main(**kwargs)
 
 
@@ -1261,6 +1262,12 @@ For more help on a command:
         help="Show version and exit"
     )
     parser.add_argument(
+        "--profile", "-p",
+        metavar="PROFILE",
+        default=None,
+        help="Use a named profile for isolated SOUL.md and memory (shortcut for: hermes chat -p NAME)"
+    )
+    parser.add_argument(
         "--resume", "-r",
         metavar="SESSION_ID",
         default=None,
@@ -1318,6 +1325,12 @@ For more help on a command:
         action="store_true",
         default=False,
         help="Resume the most recent CLI session"
+    )
+    chat_parser.add_argument(
+        "--profile", "-p",
+        metavar="PROFILE",
+        default=None,
+        help="Use a named profile for isolated SOUL.md and memory"
     )
     chat_parser.set_defaults(func=cmd_chat)
 
@@ -1738,6 +1751,35 @@ For more help on a command:
     skills_parser.set_defaults(func=cmd_skills)
 
     # =========================================================================
+    # profile command
+    # =========================================================================
+    profile_parser = subparsers.add_parser(
+        "profile",
+        help="Manage agent profiles (isolated SOUL.md + memory)",
+        description="Create, list, show, and delete agent profiles for context isolation"
+    )
+    profile_subparsers = profile_parser.add_subparsers(dest="profile_action")
+
+    profile_list = profile_subparsers.add_parser("list", help="List all profiles")
+
+    profile_create = profile_subparsers.add_parser("create", help="Create a new profile")
+    profile_create.add_argument("profile_name", help="Profile name (alphanumeric, hyphens, underscores)")
+    profile_create.add_argument("--clone", action="store_true", help="Clone SOUL.md and memories from global config")
+
+    profile_show = profile_subparsers.add_parser("show", help="Show profile details")
+    profile_show.add_argument("profile_name", help="Profile name")
+
+    profile_delete = profile_subparsers.add_parser("delete", help="Delete a profile")
+    profile_delete.add_argument("profile_name", help="Profile name")
+    profile_delete.add_argument("--yes", "-y", action="store_true", help="Skip confirmation")
+
+    def cmd_profile(args):
+        from hermes_cli.profile import profile_command
+        profile_command(args)
+
+    profile_parser.set_defaults(func=cmd_profile)
+
+    # =========================================================================
     # tools command
     # =========================================================================
     tools_parser = subparsers.add_parser(
@@ -1942,6 +1984,19 @@ For more help on a command:
         cmd_version(args)
         return
     
+    # Handle top-level --profile as shortcut to chat
+    if getattr(args, "profile", None) and args.command is None:
+        args.command = "chat"
+        args.query = None
+        args.model = None
+        args.provider = None
+        args.toolsets = None
+        args.verbose = False
+        args.resume = None
+        args.continue_last = False
+        cmd_chat(args)
+        return
+
     # Handle top-level --resume / --continue as shortcut to chat
     if (args.resume or args.continue_last) and args.command is None:
         args.command = "chat"
@@ -1952,7 +2007,7 @@ For more help on a command:
         args.verbose = False
         cmd_chat(args)
         return
-    
+
     # Default to chat if no command specified
     if args.command is None:
         args.query = None

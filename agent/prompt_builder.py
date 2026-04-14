@@ -325,13 +325,19 @@ def build_context_files_prompt(cwd: Optional[str] = None) -> str:
         cursorrules_content = _truncate_content(cursorrules_content, ".cursorrules")
         sections.append(cursorrules_content)
 
-    # SOUL.md (cwd first, then ~/.hermes/ fallback)
+    # SOUL.md (HERMES_SOUL_PATH override > cwd > ~/.hermes/ fallback)
     soul_path = None
-    for name in ["SOUL.md", "soul.md"]:
-        candidate = cwd_path / name
+    env_soul = os.getenv("HERMES_SOUL_PATH")
+    if env_soul:
+        candidate = Path(env_soul)
         if candidate.exists():
             soul_path = candidate
-            break
+    if not soul_path:
+        for name in ["SOUL.md", "soul.md"]:
+            candidate = cwd_path / name
+            if candidate.exists():
+                soul_path = candidate
+                break
     if not soul_path:
         global_soul = Path.home() / ".hermes" / "SOUL.md"
         if global_soul.exists():

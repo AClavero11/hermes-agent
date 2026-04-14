@@ -33,8 +33,11 @@ from typing import Dict, Any, List, Optional
 
 logger = logging.getLogger(__name__)
 
-# Where memory files live
-MEMORY_DIR = Path(os.getenv("HERMES_HOME", Path.home() / ".hermes")) / "memories"
+# Where memory files live. HERMES_MEMORY_DIR overrides for profile isolation.
+MEMORY_DIR = Path(
+    os.getenv("HERMES_MEMORY_DIR")
+    or str(Path(os.getenv("HERMES_HOME", Path.home() / ".hermes")) / "memories")
+)
 
 ENTRY_DELIMITER = "\n§\n"
 
