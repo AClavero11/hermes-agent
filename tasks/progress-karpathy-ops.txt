@@ -1,0 +1,91 @@
+# Ralph Progress Log
+Started: 2026-04-14
+Project: karpathy-ops
+Branch: ralph/karpathy-ops
+
+## Codebase Patterns
+(populated by Ralph as it discovers patterns)
+
+## Key Context
+- Alexandria lives at ~/alexandria/ with _system/ for infrastructure
+- Existing ingestion at ~/alexandria/_system/ingestion/ handles structured data (Plaid/Odoo/crypto)
+- Skills live at ~/.claude/skills/{name}/SKILL.md
+- Ralph REVIEW phase currently uses single Sonnet adversarial reviewer (SKILL.md lines 492-570)
+- ROUTING.md at ~/alexandria/_system/ROUTING.md maps task domains to file paths
+- GROUND_TRUTH.md at ~/alexandria/_system/GROUND_TRUTH.md has verified facts
+- CORRECTIONS.md / ACTIVE_CORRECTIONS.md for error tracking
+- hermes-agent is Python (pytest, no pre-commit framework currently)
+- Existing skills pattern: frontmatter YAML + markdown body with allowed-tools
+
+## Signal Sources
+- Karpathy LLM Wiki gist: https://gist.github.com/karpathy/442a6bf555914893e9891c11519de94f
+- NousResearch/autoreason: https://github.com/NousResearch/autoreason
+- vulture: https://github.com/jendrikseipp/vulture
+- ruff dead code rules: F401, F841, F811
+
+---
+[2026-04-14T12:58:26Z] RALPH | US-001 | LOAD → SCOUT
+[2026-04-14T13:00:42Z] RALPH | US-001 | SCOUT → PLAN
+[2026-04-14T13:01:26Z] RALPH | US-001 | PLAN → IMPLEMENT
+[2026-04-14T13:54:42Z] RALPH | US-001 | IMPLEMENT → VERIFY
+[2026-04-14T13:55:07Z] RALPH | US-001 | VERIFY → REVIEW
+[2026-04-14T14:04:03Z] RALPH | US-001 | REVIEW → COMMIT (round 2 fixes applied, proceeding)
+
+## 2026-04-14 - US-001: /ingest skill — source-to-wiki pipeline
+- Created ~/.claude/skills/ingest/SKILL.md (v1.0.1, ~265 lines)
+- 9-step pipeline: parse → read → route → idempotency → generate → CONTEXT.md → cross-ref → log → skill-usage
+- Files changed: ~/.claude/skills/ingest/SKILL.md (created)
+- Quality gates: file-exists:PASS frontmatter:PASS sections:PASS AC-coverage:PASS
+- **Review:** 2 rounds, 8 must-fix resolved (dry-run safety, CONTEXT.md anchor, slug collision, cross-ref safety, URL injection, batch isolation, frontmatter verification, Bash write exclusion from dry-run), 5 should-fix resolved
+- **Learnings:**
+  - Skills are pure markdown — no traditional test infra, only structural verification
+  - Edit tool requires explicit old_string anchor — use Bash echo >> for append-only logs
+  - Dry-run must exclude ALL write operations including Bash echo/mkdir
+  - URL validation critical for Jina proxy — include SSRF blocklist with 169.254.x
+  - Batch ingestion needs per-domain pre-existing page snapshots to prevent cross-ref pollution
+---
+[2026-04-14T14:06:01Z] RALPH | US-002 | LOAD → SCOUT
+[2026-04-14T14:13:35Z] RALPH | US-002 | SCOUT → PLAN
+[2026-04-14T14:14:06Z] RALPH | US-002 | PLAN → IMPLEMENT
+[2026-04-14T14:45:19Z] RALPH | US-002 | IMPLEMENT → VERIFY → REVIEW (gates: all PASS)
+
+## 2026-04-14 - US-002: /lint skill — Alexandria health checker
+- Created ~/.claude/skills/alexandria-lint/SKILL.md (v1.0.1, ~195 lines)
+- 9-step pipeline: parse → inventory → broken links → orphans → stale → GROUND_TRUTH → report → ACTIVE_CORRECTIONS → skill-usage
+- Files changed: ~/.claude/skills/alexandria-lint/SKILL.md (created)
+- Quality gates: file-exists:PASS frontmatter:PASS sections:PASS AC-coverage:PASS (8/8)
+- **Review:** 1 round, 5 must-fix resolved (empty hallucination grep, echo \n, dynamic domain list, orphan definition, printf for append)
+- **Learnings:**
+  - Dynamic domain list from `ls ~/alexandria/` — never hardcode domain names
+  - GROUND_TRUTH rows with empty cells must be explicitly skipped
+  - `echo` without `-e` writes literal `\n` — use `printf` for format strings
+  - `printf '%s\n'` is safer than `echo` for untrusted content in shell append
+  - Orphan detection = CONTEXT.md reachability, not "referenced anywhere" — document the definition
+  - Early-exit on caps prevents performance blowup (20 GROUND_TRUTH rows x 16K files)
+---
+[2026-04-14T14:48:28Z] RALPH | US-002 | REVIEW → COMMIT (complete)
+
+## Session Checkpoint — 2026-04-14
+US-001 (/ingest) and US-002 (/lint) COMPLETE. US-003-005 remain.
+Context window heavy from 2 full Ralph cycles with adversarial review.
+Refreshing for US-003 /autoresearch, US-004 Autoreason in Ralph REVIEW, US-005 ruff+vulture pre-commit.
+[2026-04-14T15:07:06Z] RALPH | US-003 | LOAD → SCOUT
+[2026-04-14T15:09:13Z] RALPH | US-003 | SCOUT → PLAN
+[2026-04-14T15:10:51Z] RALPH | US-003 | PLAN → IMPLEMENT
+[2026-04-14T15:14:12Z] RALPH | US-003 | IMPLEMENT → VERIFY
+[2026-04-14T15:15:10Z] RALPH | US-003 | VERIFY → REVIEW (gates: all PASS)
+[2026-04-14T15:22:11Z] RALPH | US-003 | REVIEW → COMMIT (round 1 fixes applied, all gates re-pass)
+
+## 2026-04-14 - US-003: /autoresearch skill — autonomous research-to-wiki loop
+- Created ~/.claude/skills/autoresearch/SKILL.md (v1.0.1, ~320 lines)
+- 9-step pipeline: parse → decompose → search → gap-analysis → synthesize → /ingest filing → state save → research-log → skill-usage
+- Files changed: ~/.claude/skills/autoresearch/SKILL.md (created)
+- Quality gates: file-exists:PASS frontmatter:PASS sections:PASS AC-coverage:PASS(10/10) composition:PASS loop:PASS citation:PASS log:PASS
+- **Review:** 1 round, 5 must-fix resolved (rounds_completed tracking, --continue completion guard, extension round execution path, /ingest source argument via temp file, dry-run routing probe), 5 should-fix resolved (WARN format, dry-run page estimate, step dry-run guards, domain validation, printf note accuracy)
+- **Learnings:**
+  - Skills that compose other skills need temp file intermediary — Skill tool args are flat strings, can't pass content inline
+  - --continue/resume patterns need: completion guard, extension execution path definition, and state variable handoff
+  - Dry-run must compute domain routing (read-only probe) before halting to show accurate preview
+  - Multi-round skill instructions must define the loop entry point, not hardcode round numbers into step headers
+  - Domain validation with ls fallback is the correct pattern (route via ROUTING.md, validate via ls, fallback to unrouted)
+---

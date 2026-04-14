@@ -1,5 +1,5 @@
 {
-  "prdFile": "tasks/prd-sda-wire.json",
+  "prdFile": "tasks/prd-karpathy-ops.json",
   "currentStory": null,
   "phase": "COMPLETE",
   "phaseRetries": {
@@ -9,13 +9,13 @@
   "gateResults": {},
   "hardenCycles": 0,
   "worktreePath": null,
-  "startedAt": "2026-04-10T16:50:14Z",
-  "storiesCompleted": 6,
+  "startedAt": "2026-04-14T15:06:21Z",
+  "storiesCompleted": 3,
   "storiesFailed": 0,
   "tokensEstimate": 0,
-  "lastPhaseTimestamp": "2026-04-10T20:18:12Z",
+  "lastPhaseTimestamp": "2026-04-14T15:25:00Z",
   "repoPath": "/Users/ac/.hermes/hermes-agent",
-  "branch": "ralph/sda-wire",
-  "parentBranch": "ralph/summit-domain-addons",
-  "notes": "SDA-WIRE PRD: wire 8 SDA tools into live auto-quote pipeline via bridge module pattern."
+  "branch": "ralph/karpathy-ops",
+  "parentBranch": "ralph/sda-wire",
+  "notes": "Karpathy Ops: Alexandria /ingest + /lint + /autoresearch skills, Autoreason in Ralph REVIEW, ruff+vulture pre-commit gate."
 }
