@@ -109,3 +109,30 @@ Refreshing for US-003 /autoresearch, US-004 Autoreason in Ralph REVIEW, US-005 r
   - Resume logic must load stored counters before initialization — unconditional zeroing breaks the resume contract
   - Multi-model protocols (A/B/AB + judges) create dual counter systems — document which counter serves which path
 ---
+[2026-04-14T15:41:53Z] RALPH | US-005 | LOAD → SCOUT
+[2026-04-14T15:43:49Z] RALPH | US-005 | SCOUT → PLAN
+[2026-04-14T15:44:53Z] RALPH | US-005 | PLAN → IMPLEMENT
+[2026-04-14T15:49:15Z] RALPH | US-005 | IMPLEMENT → VERIFY
+[2026-04-14T15:49:48Z] RALPH | US-005 | VERIFY → REVIEW (gates: all PASS)
+[2026-04-14T16:16:40Z] RALPH | US-005 | REVIEW → COMMIT (round 1 fixes applied, all gates re-pass)
+
+## 2026-04-14 - US-005: ruff + vulture pre-commit dead code gate
+- Created .git/hooks/pre-commit (executable, 55 lines) — ruff check + vulture on staged .py files
+- Created .vulture-whitelist.py (72 lines) — framework false-positive suppression for pytest, Pydantic, Telegram, tool registry
+- Created requirements-dev.txt — ruff==0.11.6, vulture==2.14, mypy>=1.0
+- Modified pyproject.toml — added vulture to dev optional-dependencies
+- Files changed: .git/hooks/pre-commit (created), .vulture-whitelist.py (created), requirements-dev.txt (created), pyproject.toml (modified)
+- Quality gates: hook-exists:PASS hook-syntax:PASS whitelist-exists:PASS whitelist-syntax:PASS requirements:PASS pyproject:PASS staged-only:PASS confidence:PASS blocks:PASS (9/9)
+- **Review:** 1 round, 2 must-fix resolved (xargs -0 null-delimited for space-safe filenames, bash array for whitelist args), 4 should-fix resolved (whitelist over-suppression of generic names, ruff comment accuracy, mypy in requirements, tool-not-installed guard)
+- **Learnings:**
+  - xargs on macOS requires `tr '\n' '\0' | xargs -0` for space-safe filename handling (no -d flag on BSD)
+  - Vulture whitelists suppress names GLOBALLY — avoid generic names like main/start/search that appear in non-framework code
+  - Use bash arrays for conditional args (`ARGS=(); if ...; ARGS+=(...); fi; "${ARGS[@]}"`) instead of unquoted strings
+  - Pre-commit hooks should guard for missing tools with `command -v` and helpful install messages
+  - Hook already ran successfully on US-005's own commit — self-validating
+
+## Codebase Patterns (update)
+- Pre-commit hook: `tr '\n' '\0' | xargs -0` for space-safe filename handling
+- Vulture whitelist: scope entries to specific patterns, avoid generic function names
+- Tool guard pattern: `command -v "$tool" >/dev/null 2>&1 || { echo "..."; exit 1; }`
+---

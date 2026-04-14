@@ -94,8 +94,8 @@
         "Hook can be bypassed with --no-verify for emergencies (standard git behavior, no custom flag)"
       ],
       "priority": 5,
-      "passes": false,
-      "notes": "Inspired by @gabriberton tweet (680K views). Fits our Mandatory Feedback Gates pattern. ruff handles F401 (unused imports), F841 (unused vars). vulture catches unused functions/classes that ruff misses."
+      "passes": true,
+      "notes": "Inspired by @gabriberton tweet (680K views). Fits our Mandatory Feedback Gates pattern. ruff handles F401 (unused imports), F841 (unused vars). vulture catches unused functions/classes that ruff misses. COMPLETED: hook + whitelist + requirements-dev, 1 review round, 2 must-fix + 4 should-fix resolved."
     }
   ]
 }
