@@ -97,7 +97,13 @@ def _emit_one(line: QuoteLine) -> TraceFlags:
     summit_consignment = lookup_result is not None
 
     if summit_consignment:
-        tag_source: Optional[str] = "Summit Aerospace"
+        # Customer-facing "Summit Aerospace" tag only applies to SV
+        # condition. Other conditions (AR, OH, etc.) still get the 145
+        # trace and internal consignment flag, but no Summit branding
+        # on the quote form.
+        tag_source: Optional[str] = (
+            "Summit Aerospace" if line.condition == "SV" else None
+        )
         summit_cost_recent = lookup_result.get("cost_basis")
         summit_guidance = lookup_result.get("summit_guidance")
     else:

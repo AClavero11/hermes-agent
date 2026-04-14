@@ -140,6 +140,7 @@ class TestRule3SummitTrace:
     def test_summit_line_produces_145_trace(self) -> None:
         from tools.summit_trace_flags import QuoteLine, emit_trace_flags
 
+        # OH condition: gets 145 trace but NOT the Summit tag (SV-only)
         lines = [QuoteLine(pn="SUMMIT-PN", condition="OH")]
 
         def mock_lookup(pn: str):
@@ -155,9 +156,29 @@ class TestRule3SummitTrace:
 
         assert len(flags) == 1
         assert flags[0].trace_type == "145"
-        assert flags[0].tag_source == "Summit Aerospace"
+        assert flags[0].tag_source is None  # only SV gets Summit tag
         assert flags[0].summit_consignment is True
         assert flags[0].summit_cost_recent == 500.0
+
+    def test_summit_sv_line_gets_tag_source(self) -> None:
+        from tools.summit_trace_flags import QuoteLine, emit_trace_flags
+
+        lines = [QuoteLine(pn="SUMMIT-PN", condition="SV")]
+
+        def mock_lookup(pn: str):
+            if pn == "SUMMIT-PN":
+                return {"cost_basis": 500.0, "summit_guidance": "70_30"}
+            return None
+
+        with patch(
+            "tools.summit_trace_flags.summit_sheet_lookup",
+            side_effect=mock_lookup,
+        ):
+            flags = emit_trace_flags(lines)
+
+        assert flags[0].trace_type == "145"
+        assert flags[0].tag_source == "Summit Aerospace"
+        assert flags[0].summit_consignment is True
 
     def test_non_summit_sv_line_gets_8130(self) -> None:
         from tools.summit_trace_flags import QuoteLine, emit_trace_flags
@@ -209,7 +230,7 @@ class TestRule3SummitTrace:
             flags = emit_trace_flags(lines)
 
         assert [f.trace_type for f in flags] == ["145", "8130", None]
-        assert flags[0].tag_source == "Summit Aerospace"
+        assert flags[0].tag_source is None  # OH ≠ SV, no Summit tag
         assert flags[1].tag_source is None
         assert flags[2].tag_source is None
 

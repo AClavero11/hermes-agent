@@ -22,8 +22,23 @@ def _summit_hit(**overrides):
 
 
 class TestSummitMembership:
-    def test_summit_non_idg_line(self):
+    def test_summit_non_idg_line_ar(self):
+        """AR condition: Summit consigned but NO tag_source (SV-only rule)."""
         line = QuoteLine(pn="3605812-17", condition="AR", is_idg_piece_part=False)
+        with patch(
+            "tools.summit_trace_flags.summit_sheet_lookup",
+            return_value=_summit_hit(),
+        ):
+            flags = emit_trace_flags([line])
+        assert len(flags) == 1
+        assert flags[0].summit_consignment is True
+        assert flags[0].trace_type == "145"
+        assert flags[0].tag_source is None  # only SV gets Summit tag
+        assert flags[0].idg_piece_part_warning is False
+
+    def test_summit_non_idg_line_sv(self):
+        """SV condition: Summit consigned AND tagged."""
+        line = QuoteLine(pn="3605812-17", condition="SV", is_idg_piece_part=False)
         with patch(
             "tools.summit_trace_flags.summit_sheet_lookup",
             return_value=_summit_hit(),
