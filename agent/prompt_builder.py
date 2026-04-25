@@ -188,7 +188,11 @@ TOOL_USE_ENFORCEMENT_GUIDANCE = (
     "the task, use them instead of telling the user what you would do.\n"
     "Every response should either (a) contain tool calls that make progress, or "
     "(b) deliver a final result to the user. Responses that only describe intentions "
-    "without acting are not acceptable."
+    "without acting are not acceptable.\n"
+    "If the API does not emit structured tool calls for you, emit inline tool calls "
+    "as valid JSON inside XML tags and nothing else, for example: "
+    "<tool_call>{\"name\":\"terminal\",\"arguments\":{\"command\":\"pwd\"}}</tool_call>. "
+    "Arguments must include every required field from the tool schema."
 )
 
 # Model name substrings that trigger tool-use enforcement guidance.

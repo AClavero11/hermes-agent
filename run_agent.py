@@ -21,6 +21,7 @@ Usage:
 """
 
 import asyncio
+import ast
 import base64
 import concurrent.futures
 import copy
@@ -2521,6 +2522,373 @@ class AIAgent:
 
         # Check if there's any non-whitespace content remaining
         return bool(cleaned.strip())
+
+    @staticmethod
+    def _strip_markdown_code_fence(text: str) -> str:
+        stripped = text.strip()
+        if not stripped.startswith("```"):
+            return stripped
+        stripped = re.sub(r"^```(?:json|python)?\s*", "", stripped, flags=re.IGNORECASE)
+        stripped = re.sub(r"\s*```$", "", stripped)
+        return stripped.strip()
+
+    @staticmethod
+    def _parse_inline_tool_payload(payload: str) -> list[dict]:
+        payload = AIAgent._strip_markdown_code_fence(payload)
+        try:
+            parsed = json.loads(payload)
+        except Exception:
+            try:
+                parsed = ast.literal_eval(payload)
+            except Exception:
+                return []
+
+        if isinstance(parsed, dict):
+            parsed_items = [parsed]
+        elif isinstance(parsed, list):
+            parsed_items = parsed
+        else:
+            return []
+
+        calls = []
+        for item in parsed_items:
+            if not isinstance(item, dict):
+                continue
+            function = item.get("function") if isinstance(item.get("function"), dict) else None
+            if function:
+                name = function.get("name")
+                arguments = function.get("arguments", {})
+            else:
+                name = item.get("name") or item.get("tool") or item.get("tool_name")
+                arguments = item.get("arguments", item.get("args", {}))
+
+            if not isinstance(name, str) or not name.strip():
+                continue
+            if arguments is None:
+                arguments = {}
+            if isinstance(arguments, str):
+                arguments_text = _repair_tool_call_arguments(arguments, name)
+            elif isinstance(arguments, dict):
+                arguments_text = json.dumps(arguments, ensure_ascii=False)
+            else:
+                arguments_text = json.dumps({"value": arguments}, ensure_ascii=False)
+            calls.append({"name": name.strip(), "arguments": arguments_text})
+        return calls
+
+    def _extract_inline_tool_calls(self, content: str) -> list:
+        """Convert XML/JSON tool calls embedded in text into OpenAI-style calls."""
+        if not isinstance(content, str) or "<" not in content:
+            return []
+
+        calls = []
+        for match in re.finditer(
+            r"<terminal\b[^>]*>(.*?)</terminal>",
+            content,
+            flags=re.DOTALL | re.IGNORECASE,
+        ):
+            command = self._strip_markdown_code_fence(match.group(1)).strip()
+            if command:
+                calls.append(
+                    {
+                        "name": "terminal",
+                        "arguments": json.dumps(
+                            {"command": command}, ensure_ascii=False
+                        ),
+                    }
+                )
+
+        for match in re.finditer(
+            r"<(tool_call|function_call)\b[^>]*>(.*?)</\1>",
+            content,
+            flags=re.DOTALL | re.IGNORECASE,
+        ):
+            calls.extend(self._parse_inline_tool_payload(match.group(2)))
+
+        if not calls:
+            for match in re.finditer(
+                r"<(tool_calls|function_calls)\b[^>]*>(.*?)</\1>",
+                content,
+                flags=re.DOTALL | re.IGNORECASE,
+            ):
+                calls.extend(self._parse_inline_tool_payload(match.group(2)))
+
+        tool_calls = []
+        for index, call in enumerate(calls):
+            call_id = self._deterministic_call_id(
+                call["name"], call["arguments"], index
+            )
+            tool_calls.append(
+                SimpleNamespace(
+                    id=call_id,
+                    call_id=call_id,
+                    response_item_id=None,
+                    type="function",
+                    function=SimpleNamespace(
+                        name=call["name"],
+                        arguments=call["arguments"],
+                    ),
+                )
+            )
+        return tool_calls
+
+    @staticmethod
+    def _last_user_content_for_tool_router(messages: list) -> str:
+        for msg in reversed(messages or []):
+            if not isinstance(msg, dict) or msg.get("role") != "user":
+                continue
+            content = msg.get("content") or ""
+            if not isinstance(content, str):
+                continue
+            stripped = content.strip()
+            if stripped.startswith("[System:"):
+                continue
+            return stripped
+        return ""
+
+    @staticmethod
+    def _has_tool_result_after_last_user(messages: list) -> bool:
+        last_user_idx = -1
+        for idx, msg in enumerate(messages or []):
+            if not isinstance(msg, dict) or msg.get("role") != "user":
+                continue
+            content = msg.get("content") or ""
+            if isinstance(content, str) and content.strip().startswith("[System:"):
+                continue
+            last_user_idx = idx
+        if last_user_idx < 0:
+            return False
+        return any(
+            isinstance(msg, dict) and msg.get("role") == "tool"
+            for msg in (messages or [])[last_user_idx + 1 :]
+        )
+
+    def _should_attempt_tool_router_recovery(
+        self, messages: list, assistant_content: str
+    ) -> bool:
+        if self.api_mode != "chat_completions":
+            return False
+        if not self.valid_tool_names or not self.tools:
+            return False
+        if self._has_tool_result_after_last_user(messages):
+            return False
+        if getattr(self, "_tool_router_recovery_attempts", 0) >= 2:
+            return False
+
+        user_content = self._last_user_content_for_tool_router(messages)
+        if not user_content:
+            return False
+        return True
+
+    def _compact_tool_specs_for_router(self) -> str:
+        specs = []
+        for tool in self.tools or []:
+            if not isinstance(tool, dict):
+                continue
+            func = tool.get("function") if isinstance(tool.get("function"), dict) else {}
+            name = func.get("name")
+            if not name:
+                continue
+            specs.append(
+                {
+                    "name": name,
+                    "description": func.get("description", ""),
+                    "parameters": func.get("parameters", {}),
+                }
+            )
+        return json.dumps(specs, ensure_ascii=False)
+
+    def _direct_tool_call_from_user_request(self, user_content: str) -> list:
+        if "terminal" not in self.valid_tool_names:
+            return []
+        if not isinstance(user_content, str) or not user_content.strip():
+            return []
+
+        lower = user_content.lower()
+        if not any(term in lower for term in ("terminal", "shell", "command", "run")):
+            return []
+
+        command = ""
+        backtick_match = re.search(r"`([^`]+)`", user_content)
+        if backtick_match:
+            command = backtick_match.group(1).strip()
+        if not command:
+            patterns = (
+                r"(?:terminal tool|terminal|shell|command).*?\brun:?\s+(.+?)(?:\.\s|$)",
+                r"\brun:?\s+(.+?)(?:\.\s|$)",
+                r"\bexecute:?\s+(.+?)(?:\.\s|$)",
+            )
+            for pattern in patterns:
+                match = re.search(pattern, user_content, flags=re.IGNORECASE | re.DOTALL)
+                if match:
+                    command = match.group(1).strip()
+                    break
+        if not command:
+            return []
+
+        command = re.split(
+            r"\b(?:after|then|reply|respond)\b",
+            command,
+            maxsplit=1,
+            flags=re.IGNORECASE,
+        )[0].strip()
+        command = command.strip("`'\" \n\t")
+        if command.endswith("."):
+            command = command[:-1].rstrip()
+        if not command:
+            return []
+
+        return self._extract_inline_tool_calls(
+            "<tool_call>"
+            + json.dumps(
+                {"name": "terminal", "arguments": {"command": command}},
+                ensure_ascii=False,
+            )
+            + "</tool_call>"
+        )
+
+    def _tool_parameters_for_name(self, tool_name: str) -> dict:
+        for tool in self.tools or []:
+            if not isinstance(tool, dict):
+                continue
+            func = tool.get("function") if isinstance(tool.get("function"), dict) else {}
+            if func.get("name") != tool_name:
+                continue
+            params = func.get("parameters") if isinstance(func.get("parameters"), dict) else {}
+            return params
+        return {}
+
+    @staticmethod
+    def _extract_named_argument_from_user(user_content: str, arg_name: str) -> str:
+        quoted = re.search(
+            rf"\b{re.escape(arg_name)}\s+[\"']([^\"']+)[\"']",
+            user_content,
+            flags=re.IGNORECASE,
+        )
+        if quoted:
+            return quoted.group(1).strip()
+
+        unquoted = re.search(
+            rf"\b{re.escape(arg_name)}\s+(.+?)(?:\.\s|\bafter\b|\bthen\b|\breply\b|$)",
+            user_content,
+            flags=re.IGNORECASE | re.DOTALL,
+        )
+        if unquoted:
+            return unquoted.group(1).strip().strip("`'\" .")
+        return ""
+
+    def _direct_named_tool_call_from_user_request(self, user_content: str) -> list:
+        if not isinstance(user_content, str) or not user_content.strip():
+            return []
+
+        lower = user_content.lower()
+        for tool_name in sorted(self.valid_tool_names, key=len, reverse=True):
+            if tool_name.lower() not in lower:
+                continue
+            params = self._tool_parameters_for_name(tool_name)
+            properties = params.get("properties") if isinstance(params, dict) else {}
+            required = params.get("required") if isinstance(params, dict) else []
+            if not isinstance(properties, dict):
+                properties = {}
+            if not isinstance(required, list):
+                required = []
+
+            arguments = {}
+            for arg_name in properties:
+                value = self._extract_named_argument_from_user(user_content, arg_name)
+                if value:
+                    arguments[arg_name] = value
+
+            if "query" in properties and "query" not in arguments:
+                value = self._extract_named_argument_from_user(
+                    user_content, "with query"
+                )
+                if value:
+                    arguments["query"] = value
+
+            missing = [name for name in required if name not in arguments]
+            if missing:
+                continue
+
+            return self._extract_inline_tool_calls(
+                "<tool_call>"
+                + json.dumps(
+                    {"name": tool_name, "arguments": arguments},
+                    ensure_ascii=False,
+                )
+                + "</tool_call>"
+            )
+        return []
+
+    def _recover_tool_calls_with_router(
+        self, messages: list, assistant_content: str
+    ) -> list:
+        if not self._should_attempt_tool_router_recovery(messages, assistant_content):
+            return []
+
+        user_content = self._last_user_content_for_tool_router(messages)
+        if not user_content:
+            return []
+
+        direct_tool_calls = self._direct_tool_call_from_user_request(user_content)
+        if direct_tool_calls:
+            return direct_tool_calls
+
+        direct_tool_calls = self._direct_named_tool_call_from_user_request(user_content)
+        if direct_tool_calls:
+            return direct_tool_calls
+
+        logger.info("Tool router recovery attempt for local/custom tool request")
+        self._tool_router_recovery_attempts = (
+            getattr(self, "_tool_router_recovery_attempts", 0) + 1
+        )
+        router_messages = [
+            {
+                "role": "system",
+                "content": (
+                    "You are a tool-call router for a local AI agent. "
+                    "Given the user's request and available tool schemas, decide whether "
+                    "the next assistant action must be a tool call. If a tool is needed, "
+                    "output exactly one XML tool call and nothing else: "
+                    "<tool_call>{\"name\":\"tool_name\",\"arguments\":{}}</tool_call>. "
+                    "Arguments must match the selected tool schema. If no tool can help, "
+                    "output exactly NO_TOOL."
+                ),
+            },
+            {
+                "role": "user",
+                "content": (
+                    "Available tools JSON:\n"
+                    f"{self._compact_tool_specs_for_router()}\n\n"
+                    "User request:\n"
+                    f"{user_content}"
+                ),
+            },
+        ]
+        router_kwargs = {
+            "model": self.model,
+            "messages": router_messages,
+            "timeout": min(float(self._resolved_api_call_timeout()), 180.0),
+            "temperature": 0,
+        }
+        router_kwargs.update(self._max_tokens_param(768))
+        try:
+            response = self.client.chat.completions.create(**router_kwargs)
+            content = response.choices[0].message.content or ""
+        except Exception as exc:
+            logger.warning("Tool router recovery failed: %s", exc)
+            return []
+
+        tool_calls = self._extract_inline_tool_calls(content)
+        if not tool_calls:
+            return []
+
+        valid_calls = [
+            tc for tc in tool_calls if tc.function.name in self.valid_tool_names
+        ]
+        if not valid_calls:
+            logger.warning("Tool router produced invalid tool call: %s", content[:300])
+            return []
+        return valid_calls[:1]
     
     def _strip_think_blocks(self, content: str) -> str:
         """Remove reasoning/thinking blocks from content, returning only visible text.
@@ -8707,6 +9075,7 @@ class AIAgent:
         self._incomplete_scratchpad_retries = 0
         self._codex_incomplete_retries = 0
         self._thinking_prefill_retries = 0
+        self._tool_router_recovery_attempts = 0
         self._post_tool_empty_retried = False
         self._last_content_with_tools = None
         self._last_content_tools_all_housekeeping = False
@@ -10954,6 +11323,27 @@ class AIAgent:
                         assistant_message.content = "\n".join(parts)
                     else:
                         assistant_message.content = str(raw)
+
+                if not getattr(assistant_message, "tool_calls", None):
+                    inline_tool_calls = self._extract_inline_tool_calls(
+                        assistant_message.content or ""
+                    )
+                    if inline_tool_calls:
+                        assistant_message.tool_calls = inline_tool_calls
+                        cleaned_content = self._strip_think_blocks(
+                            assistant_message.content or ""
+                        ).strip()
+                        assistant_message.content = cleaned_content or None
+                        finish_reason = "tool_calls"
+
+                if not getattr(assistant_message, "tool_calls", None):
+                    router_tool_calls = self._recover_tool_calls_with_router(
+                        messages, assistant_message.content or ""
+                    )
+                    if router_tool_calls:
+                        assistant_message.tool_calls = router_tool_calls
+                        assistant_message.content = None
+                        finish_reason = "tool_calls"
 
                 try:
                     from hermes_cli.plugins import invoke_hook as _invoke_hook

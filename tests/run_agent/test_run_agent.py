@@ -276,6 +276,181 @@ class TestHasContentAfterThinkBlock:
         assert agent._has_content_after_think_block("just normal content") is True
 
 
+class TestInlineToolCalls:
+    def test_extracts_single_tool_call(self, agent):
+        content = (
+            '<tool_call>{"name":"terminal",'
+            '"arguments":{"command":"pwd"}}</tool_call>'
+        )
+
+        tool_calls = agent._extract_inline_tool_calls(content)
+
+        assert len(tool_calls) == 1
+        assert tool_calls[0].function.name == "terminal"
+        assert json.loads(tool_calls[0].function.arguments) == {"command": "pwd"}
+
+    def test_extracts_function_call_alias(self, agent):
+        content = (
+            '<function_call>{"function":{"name":"read_file",'
+            '"arguments":{"path":"/tmp/example.txt"}}}</function_call>'
+        )
+
+        tool_calls = agent._extract_inline_tool_calls(content)
+
+        assert len(tool_calls) == 1
+        assert tool_calls[0].function.name == "read_file"
+        assert json.loads(tool_calls[0].function.arguments) == {
+            "path": "/tmp/example.txt"
+        }
+
+    def test_extracts_plural_tool_calls(self, agent):
+        content = (
+            '<tool_calls>[{"name":"terminal","arguments":{"command":"pwd"}},'
+            '{"name":"read_file","arguments":{"path":"/tmp/example.txt"}}]'
+            "</tool_calls>"
+        )
+
+        tool_calls = agent._extract_inline_tool_calls(content)
+
+        assert [tc.function.name for tc in tool_calls] == ["terminal", "read_file"]
+        assert len({tc.id for tc in tool_calls}) == 2
+
+    def test_extracts_markdown_fenced_payload(self, agent):
+        content = (
+            "<tool_call>```json\n"
+            '{"name":"terminal","arguments":{"command":"pwd"}}\n'
+            "```</tool_call>"
+        )
+
+        tool_calls = agent._extract_inline_tool_calls(content)
+
+        assert len(tool_calls) == 1
+        assert tool_calls[0].function.name == "terminal"
+
+    def test_extracts_terminal_shorthand(self, agent):
+        tool_calls = agent._extract_inline_tool_calls("<terminal>pwd</terminal>")
+
+        assert len(tool_calls) == 1
+        assert tool_calls[0].function.name == "terminal"
+        assert json.loads(tool_calls[0].function.arguments) == {"command": "pwd"}
+
+    def test_invalid_inline_payload_returns_no_calls(self, agent):
+        assert agent._extract_inline_tool_calls("<tool_call>nope</tool_call>") == []
+
+    def test_router_recovery_returns_valid_tool_call(self, agent):
+        agent.api_mode = "chat_completions"
+        agent.provider = "custom"
+        agent.base_url = "http://127.0.0.1:8090/v1"
+        agent.tools = _make_tool_defs("terminal")
+        agent.valid_tool_names = {"terminal"}
+        agent._tool_router_recovery_attempts = 0
+        agent.client.chat.completions.create.return_value = SimpleNamespace(
+            choices=[
+                SimpleNamespace(
+                    message=SimpleNamespace(
+                        content=(
+                            '<tool_call>{"name":"terminal",'
+                            '"arguments":{"command":"pwd"}}</tool_call>'
+                        )
+                    )
+                )
+            ]
+        )
+
+        tool_calls = agent._recover_tool_calls_with_router(
+            [{"role": "user", "content": "Use the terminal tool to run pwd."}],
+            "The terminal tool is not available.",
+        )
+
+        assert len(tool_calls) == 1
+        assert tool_calls[0].function.name == "terminal"
+        assert json.loads(tool_calls[0].function.arguments) == {"command": "pwd"}
+
+    def test_direct_terminal_recovery_from_user_request(self, agent):
+        agent.valid_tool_names = {"terminal"}
+
+        tool_calls = agent._direct_tool_call_from_user_request(
+            "Use the terminal tool to run pwd. Reply only with the output."
+        )
+
+        assert len(tool_calls) == 1
+        assert tool_calls[0].function.name == "terminal"
+        assert json.loads(tool_calls[0].function.arguments) == {"command": "pwd"}
+
+    def test_router_recovery_skips_after_tool_result(self, agent):
+        agent.api_mode = "chat_completions"
+        agent.tools = _make_tool_defs("terminal")
+        agent.valid_tool_names = {"terminal"}
+        messages = [
+            {"role": "user", "content": "Use the terminal tool to run pwd."},
+            {
+                "role": "assistant",
+                "tool_calls": [
+                    {
+                        "id": "call_1",
+                        "type": "function",
+                        "function": {"name": "terminal", "arguments": "{}"},
+                    }
+                ],
+            },
+            {"role": "tool", "tool_call_id": "call_1", "content": "/Users/ac"},
+        ]
+
+        assert agent._should_attempt_tool_router_recovery(messages, "") is False
+
+    def test_direct_named_tool_recovery_from_user_request(self, agent):
+        agent.tools = [
+            {
+                "type": "function",
+                "function": {
+                    "name": "mcp_alexandria_alexandria_search",
+                    "description": "Search Alexandria",
+                    "parameters": {
+                        "type": "object",
+                        "properties": {"query": {"type": "string"}},
+                        "required": ["query"],
+                    },
+                },
+            }
+        ]
+        agent.valid_tool_names = {"mcp_alexandria_alexandria_search"}
+
+        tool_calls = agent._direct_named_tool_call_from_user_request(
+            'Use the mcp_alexandria_alexandria_search tool with query "Hermes model routing".'
+        )
+
+        assert len(tool_calls) == 1
+        assert tool_calls[0].function.name == "mcp_alexandria_alexandria_search"
+        assert json.loads(tool_calls[0].function.arguments) == {
+            "query": "Hermes model routing"
+        }
+
+    def test_router_recovery_ignores_invalid_tool(self, agent):
+        agent.api_mode = "chat_completions"
+        agent.provider = "custom"
+        agent.base_url = "http://127.0.0.1:8090/v1"
+        agent.tools = _make_tool_defs("terminal")
+        agent.valid_tool_names = {"terminal"}
+        agent._tool_router_recovery_attempts = 0
+        agent.client.chat.completions.create.return_value = SimpleNamespace(
+            choices=[
+                SimpleNamespace(
+                    message=SimpleNamespace(
+                        content='<tool_call>{"name":"missing","arguments":{}}</tool_call>'
+                    )
+                )
+            ]
+        )
+
+        assert (
+            agent._recover_tool_calls_with_router(
+                [{"role": "user", "content": "Use a tool."}],
+                "I cannot access tools.",
+            )
+            == []
+        )
+
+
 class TestStripThinkBlocks:
     def test_none_returns_empty(self, agent):
         assert agent._strip_think_blocks(None) == ""
