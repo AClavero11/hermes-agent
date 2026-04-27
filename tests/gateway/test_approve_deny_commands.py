@@ -75,6 +75,8 @@ def _clear_approval_state():
     mod._session_approved.clear()
     mod._permanent_approved.clear()
     mod._pending.clear()
+    mod._external_action_events.clear()
+    mod._external_action_entries.clear()
 
 
 # ------------------------------------------------------------------

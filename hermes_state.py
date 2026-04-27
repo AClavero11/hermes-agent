@@ -15,6 +15,7 @@ Key design decisions:
 """
 
 import json
+import hashlib
 import logging
 import random
 import re
@@ -149,6 +150,30 @@ CREATE INDEX IF NOT EXISTS idx_org_tasks_updated ON org_tasks(updated_at DESC);
 CREATE INDEX IF NOT EXISTS idx_org_events_task ON org_events(task_id, created_at);
 """
 
+APPROVAL_REQUESTS_SQL = """
+CREATE TABLE IF NOT EXISTS approval_requests (
+    id TEXT PRIMARY KEY,
+    created_at REAL NOT NULL,
+    updated_at REAL NOT NULL,
+    status TEXT NOT NULL CHECK(status IN ('pending','approved','denied','expired','cancelled')),
+    action_type TEXT NOT NULL,
+    channel TEXT,
+    target TEXT,
+    payload_hash TEXT NOT NULL,
+    payload_preview TEXT,
+    requested_by TEXT,
+    decided_by TEXT,
+    decided_at REAL,
+    decision_reason TEXT,
+    org_task_id TEXT REFERENCES org_tasks(id) ON DELETE SET NULL,
+    metadata_json TEXT
+);
+
+CREATE INDEX IF NOT EXISTS idx_appr_status ON approval_requests(status);
+CREATE INDEX IF NOT EXISTS idx_appr_payload_hash ON approval_requests(payload_hash);
+CREATE INDEX IF NOT EXISTS idx_appr_action_type ON approval_requests(action_type);
+"""
+
 VALID_ORG_TASK_STATUSES = {
     "open",
     "pending",
@@ -192,6 +217,16 @@ ORG_TASK_STATUS_TRANSITIONS = {
     "completed": {"completed"},
     "cancelled": {"cancelled"},
 }
+
+VALID_APPROVAL_STATUSES = {
+    "pending",
+    "approved",
+    "denied",
+    "expired",
+    "cancelled",
+}
+
+VALID_APPROVAL_DECISIONS = VALID_APPROVAL_STATUSES - {"pending"}
 
 _UNSET = object()
 
@@ -340,10 +375,11 @@ class SessionDB:
         cursor.executescript(SCHEMA_SQL)
         try:
             cursor.execute("BEGIN")
-            for statement in ORG_TASK_LEDGER_SQL.split(";"):
-                statement = statement.strip()
-                if statement:
-                    cursor.execute(statement)
+            for ddl in (ORG_TASK_LEDGER_SQL, APPROVAL_REQUESTS_SQL):
+                for statement in ddl.split(";"):
+                    statement = statement.strip()
+                    if statement:
+                        cursor.execute(statement)
             cursor.execute("COMMIT")
         except Exception:
             cursor.execute("ROLLBACK")
@@ -1674,6 +1710,305 @@ class SessionDB:
                 created_at,
             ),
         )
+
+    @staticmethod
+    def _canonical_approval_payload_json(payload: Any) -> str:
+        """Return stable JSON for approval payload hashing."""
+        try:
+            return json.dumps(
+                payload,
+                ensure_ascii=False,
+                sort_keys=True,
+                separators=(",", ":"),
+            )
+        except (TypeError, ValueError) as exc:
+            raise ValueError("approval payload must be JSON-serializable") from exc
+
+    @classmethod
+    def _approval_payload_hash(cls, payload: Any) -> str:
+        canonical = cls._canonical_approval_payload_json(payload)
+        return hashlib.sha256(canonical.encode("utf-8")).hexdigest()
+
+    @classmethod
+    def _redact_approval_payload(cls, value: Any, field_name: str = "") -> Any:
+        lower_name = field_name.lower()
+        secret_markers = ("token", "key", "password", "secret", "cookie")
+        if any(part in lower_name for part in secret_markers):
+            return "[redacted]"
+        if isinstance(value, dict):
+            return {
+                str(key): cls._redact_approval_payload(item, str(key))
+                for key, item in value.items()
+            }
+        if isinstance(value, (list, tuple)):
+            return [cls._redact_approval_payload(item, field_name) for item in value]
+        return value
+
+    @classmethod
+    def _approval_payload_preview(cls, payload: Any) -> str:
+        redacted = cls._redact_approval_payload(payload)
+        try:
+            preview = json.dumps(
+                redacted,
+                ensure_ascii=False,
+                sort_keys=True,
+                default=str,
+            )
+        except (TypeError, ValueError):
+            preview = str(redacted)
+        return preview[:500]
+
+    @staticmethod
+    def _normalize_approval_decision(decision: Any) -> str:
+        normalized = str(decision or "").strip().lower()
+        if normalized not in VALID_APPROVAL_DECISIONS:
+            allowed = ", ".join(sorted(VALID_APPROVAL_DECISIONS))
+            raise ValueError(f"decision must be one of: {allowed}")
+        return normalized
+
+    @staticmethod
+    def _normalize_approval_status(status: Any) -> str:
+        normalized = str(status or "").strip().lower()
+        if normalized not in VALID_APPROVAL_STATUSES:
+            allowed = ", ".join(sorted(VALID_APPROVAL_STATUSES))
+            raise ValueError(f"approval status must be one of: {allowed}")
+        return normalized
+
+    def create_approval_request(
+        self,
+        action_type: str,
+        channel: str,
+        target: str,
+        payload: Any,
+        requested_by: str = None,
+        org_task_id: str = None,
+        metadata: Any = None,
+    ) -> Dict[str, Any]:
+        """Create a durable pending approval request."""
+        normalized_id = f"appr_{uuid.uuid4().hex}"
+        normalized_action_type = self._normalize_org_text(
+            action_type, "action_type", required=True
+        )
+        normalized_channel = self._normalize_org_text(channel, "channel")
+        normalized_target = self._normalize_org_text(target, "target")
+        normalized_requested_by = self._normalize_org_text(
+            requested_by, "requested_by"
+        )
+        normalized_metadata = self._normalize_org_json(metadata, "metadata")
+        payload_hash = self._approval_payload_hash(payload)
+        payload_preview = self._approval_payload_preview(payload)
+        now = time.time()
+
+        def _do(conn):
+            linked_task_id = self._normalize_org_text(org_task_id, "org_task_id")
+            if linked_task_id is None:
+                linked_task_id = f"orgtask_{uuid.uuid4().hex}"
+                intent_parts = [
+                    "approval",
+                    normalized_action_type,
+                    normalized_channel or "unknown",
+                    normalized_target or "unknown",
+                ]
+                # org_events.task_id is intentionally NOT migrated to nullable.
+                # Approval-only audit rows get a synthetic task so US-001's
+                # append-only event model remains intact and existing rows are
+                # never rewritten.
+                conn.execute(
+                    """INSERT INTO org_tasks
+                       (id, source, intent, entities_json, evidence_json,
+                        owner, status, next_action, created_at, updated_at,
+                        completed_at)
+                       VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
+                    (
+                        linked_task_id,
+                        "approval_system",
+                        ":".join(intent_parts),
+                        json.dumps(
+                            {
+                                "action_type": normalized_action_type,
+                                "channel": normalized_channel,
+                                "target": normalized_target,
+                            },
+                            ensure_ascii=False,
+                            sort_keys=True,
+                        ),
+                        json.dumps(
+                            {"approval_id": normalized_id, "payload_hash": payload_hash},
+                            ensure_ascii=False,
+                            sort_keys=True,
+                        ),
+                        normalized_requested_by,
+                        "pending",
+                        "await approval decision",
+                        now,
+                        now,
+                        None,
+                    ),
+                )
+                self._insert_org_event(
+                    conn,
+                    linked_task_id,
+                    "created",
+                    {
+                        "source": "approval_system",
+                        "intent": ":".join(intent_parts),
+                        "owner": normalized_requested_by,
+                        "status": "pending",
+                        "next_action": "await approval decision",
+                    },
+                    now,
+                )
+
+            conn.execute(
+                """INSERT INTO approval_requests
+                   (id, created_at, updated_at, status, action_type, channel,
+                    target, payload_hash, payload_preview, requested_by,
+                    decided_by, decided_at, decision_reason, org_task_id,
+                    metadata_json)
+                   VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
+                (
+                    normalized_id,
+                    now,
+                    now,
+                    "pending",
+                    normalized_action_type,
+                    normalized_channel,
+                    normalized_target,
+                    payload_hash,
+                    payload_preview,
+                    normalized_requested_by,
+                    None,
+                    None,
+                    None,
+                    linked_task_id,
+                    normalized_metadata,
+                ),
+            )
+            row = conn.execute(
+                "SELECT * FROM approval_requests WHERE id = ?", (normalized_id,)
+            ).fetchone()
+            return dict(row)
+
+        return self._execute_write(_do)
+
+    def get_approval_request(self, approval_id: str) -> Optional[Dict[str, Any]]:
+        """Fetch one approval request by ID."""
+        with self._lock:
+            row = self._conn.execute(
+                "SELECT * FROM approval_requests WHERE id = ?", (approval_id,)
+            ).fetchone()
+        return dict(row) if row else None
+
+    def decide_approval_request(
+        self,
+        approval_id: str,
+        decision: str,
+        decided_by: str,
+        reason: str = None,
+    ) -> Optional[Dict[str, Any]]:
+        """Transition a pending approval to a terminal decision and audit it."""
+        normalized_decision = self._normalize_approval_decision(decision)
+        normalized_decided_by = self._normalize_org_text(
+            decided_by, "decided_by", required=True
+        )
+        normalized_reason = self._normalize_org_text(reason, "reason")
+        now = time.time()
+
+        def _do(conn):
+            existing = conn.execute(
+                "SELECT * FROM approval_requests WHERE id = ?", (approval_id,)
+            ).fetchone()
+            if not existing:
+                return None
+            if existing["status"] != "pending":
+                raise ValueError(
+                    "approval request is no longer pending: "
+                    f"id={approval_id} status={existing['status']}"
+                )
+
+            conn.execute(
+                """UPDATE approval_requests
+                   SET status = ?, updated_at = ?, decided_at = ?,
+                       decided_by = ?, decision_reason = ?
+                   WHERE id = ?""",
+                (
+                    normalized_decision,
+                    now,
+                    now,
+                    normalized_decided_by,
+                    normalized_reason,
+                    approval_id,
+                ),
+            )
+
+            task_id = existing["org_task_id"]
+            if task_id:
+                task_status = (
+                    "completed"
+                    if normalized_decision in ("approved", "denied")
+                    else "cancelled"
+                )
+                conn.execute(
+                    """UPDATE org_tasks
+                       SET status = ?, updated_at = ?, completed_at = ?,
+                           next_action = ?
+                       WHERE id = ?""",
+                    (
+                        task_status,
+                        now,
+                        now,
+                        f"approval {normalized_decision}",
+                        task_id,
+                    ),
+                )
+                self._insert_org_event(
+                    conn,
+                    task_id,
+                    f"approval.{normalized_decision}",
+                    {
+                        "approval_id": approval_id,
+                        "action_type": existing["action_type"],
+                        "channel": existing["channel"],
+                        "target": existing["target"],
+                        "payload_hash": existing["payload_hash"],
+                        "decided_by": normalized_decided_by,
+                        "reason": normalized_reason,
+                    },
+                    now,
+                )
+
+            row = conn.execute(
+                "SELECT * FROM approval_requests WHERE id = ?", (approval_id,)
+            ).fetchone()
+            return dict(row)
+
+        return self._execute_write(_do)
+
+    def list_pending_approvals(
+        self,
+        action_type: str = None,
+        limit: int = 50,
+    ) -> List[Dict[str, Any]]:
+        """List pending approval requests, optionally filtered by action type."""
+        params: List[Any] = ["pending"]
+        where = "status = ?"
+        if action_type:
+            where += " AND action_type = ?"
+            params.append(self._normalize_org_text(
+                action_type, "action_type", required=True
+            ))
+        params.append(self._coerce_org_limit(limit, default=50, maximum=500))
+
+        with self._lock:
+            cursor = self._conn.execute(
+                f"""SELECT * FROM approval_requests
+                    WHERE {where}
+                    ORDER BY created_at ASC
+                    LIMIT ?""",
+                params,
+            )
+            rows = cursor.fetchall()
+        return [dict(row) for row in rows]
 
     def create_org_task(
         self,

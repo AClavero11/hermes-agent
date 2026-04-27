@@ -18,6 +18,22 @@ from agent.redact import redact_sensitive_text
 
 logger = logging.getLogger(__name__)
 
+_EXTERNAL_APPROVAL_CHANNELS = frozenset({
+    "telegram",
+    "discord",
+    "slack",
+    "signal",
+    "matrix",
+    "whatsapp",
+    "email",
+})
+_INTERNAL_APPROVAL_EXEMPT_CHANNELS = frozenset({
+    "cli",
+    "log",
+    "self",
+    "agent_cli",
+})
+
 _TELEGRAM_TOPIC_TARGET_RE = re.compile(r"^\s*(-?\d+)(?::(\d+))?\s*$")
 _FEISHU_TARGET_RE = re.compile(r"^\s*((?:oc|ou|on|chat|open)_[-A-Za-z0-9]+)(?::([-A-Za-z0-9_]+))?\s*$")
 _WEIXIN_TARGET_RE = re.compile(r"^\s*((?:wxid|gh|v\d+|wm|wb)_[A-Za-z0-9_-]+|[A-Za-z0-9._-]+@chatroom|filehelper)\s*$")
@@ -55,6 +71,65 @@ def _sanitize_error_text(text) -> str:
 def _error(message: str) -> dict:
     """Build a standardized error payload with redacted content."""
     return {"error": _sanitize_error_text(message)}
+
+
+def _env_flag(name: str) -> bool:
+    return os.getenv(name, "").strip().lower() in {"1", "true", "yes", "on"}
+
+
+def _requires_external_approval(
+    platform_name: str,
+    target_ref: str | None = None,
+) -> bool:
+    normalized = (platform_name or "").strip().lower()
+    if normalized in _INTERNAL_APPROVAL_EXEMPT_CHANNELS:
+        return False
+    if target_ref and target_ref.strip().startswith("#"):
+        return True
+    return normalized in _EXTERNAL_APPROVAL_CHANNELS
+
+
+def _external_approval_timeout() -> float:
+    raw = os.getenv("HERMES_EXTERNAL_APPROVAL_TIMEOUT", "").strip()
+    if not raw:
+        return 300.0
+    try:
+        return max(float(raw), 0.0)
+    except ValueError:
+        return 300.0
+
+
+def _normalize_media_files_for_approval(media_files):
+    normalized = []
+    for media_path, is_voice in media_files or []:
+        normalized.append({"path": str(media_path), "is_voice": bool(is_voice)})
+    return normalized
+
+
+def _build_external_approval_payload(
+    *,
+    raw_target: str,
+    channel: str,
+    target: str,
+    target_ref: str | None,
+    thread_id: str | None,
+    message: str,
+    media_files,
+) -> dict:
+    return {
+        "raw_target": raw_target,
+        "channel": channel,
+        "target": str(target),
+        "target_ref": target_ref,
+        "thread_id": thread_id,
+        "message": message,
+        "media_files": _normalize_media_files_for_approval(media_files),
+    }
+
+
+def _approval_payload_hash(payload: dict) -> str:
+    from hermes_state import SessionDB
+    return SessionDB._approval_payload_hash(payload)
 
 
 def _telegram_retry_delay(exc: Exception, attempt: int) -> float | None:
@@ -271,6 +346,80 @@ def _handle_send(args):
     if duplicate_skip:
         return json.dumps(duplicate_skip)
 
+    approval_id = None
+    if (
+        not _env_flag("HERMES_EXTERNAL_APPROVAL_DISABLED")
+        and _requires_external_approval(platform_name, target_ref)
+    ):
+        approval_payload = _build_external_approval_payload(
+            raw_target=target,
+            channel=platform_name,
+            target=chat_id,
+            target_ref=target_ref,
+            thread_id=thread_id,
+            message=cleaned_message,
+            media_files=media_files,
+        )
+        approved_payload_hash = _approval_payload_hash(approval_payload)
+        try:
+            from tools.approval import (
+                await_external_action_decision,
+                request_external_action_approval,
+            )
+            approval_id = request_external_action_approval(
+                action_type="external_send",
+                channel=platform_name,
+                target=str(chat_id),
+                payload=approval_payload,
+            )
+            decision = await_external_action_decision(
+                approval_id,
+                timeout=_external_approval_timeout(),
+            )
+        except Exception as exc:
+            return json.dumps({
+                "ok": False,
+                "success": False,
+                "reason": "approval_error",
+                "approval_id": approval_id,
+                "error": _sanitize_error_text(exc),
+            })
+
+        if not isinstance(decision, dict) or decision.get("status") != "approved":
+            status = decision.get("status") if isinstance(decision, dict) else "unknown"
+            reason = (
+                "denied_by_approver"
+                if status == "denied"
+                else f"approval_{status}"
+            )
+            return json.dumps({
+                "ok": False,
+                "success": False,
+                "reason": reason,
+                "approval_id": approval_id,
+                "status": status,
+            })
+
+        current_payload = _build_external_approval_payload(
+            raw_target=target,
+            channel=platform_name,
+            target=chat_id,
+            target_ref=target_ref,
+            thread_id=thread_id,
+            message=cleaned_message,
+            media_files=media_files,
+        )
+        if (
+            decision.get("payload_hash") != approved_payload_hash
+            or _approval_payload_hash(current_payload) != approved_payload_hash
+        ):
+            return json.dumps({
+                "ok": False,
+                "success": False,
+                "reason": "approval_payload_hash_mismatch",
+                "approval_id": approval_id,
+            })
+
     try:
         from model_tools import _run_async
         result = _run_async(
@@ -285,6 +434,8 @@ def _handle_send(args):
         )
         if used_home_channel and isinstance(result, dict) and result.get("success"):
             result["note"] = f"Sent to {platform_name} home channel (chat_id: {chat_id})"
+        if approval_id and isinstance(result, dict) and result.get("success"):
+            result["approval_id"] = approval_id
 
         # Mirror the sent message into the target's gateway session
         if isinstance(result, dict) and result.get("success") and mirror_text:

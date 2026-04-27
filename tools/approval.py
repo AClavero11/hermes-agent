@@ -1,11 +1,19 @@
-"""Dangerous command approval -- detection, prompting, and per-session state.
+"""Approval gates for dangerous commands and external actions.
 
-This module is the single source of truth for the dangerous command system:
+This module contains two parallel approval flows:
+
+Dangerous command approval:
 - Pattern detection (DANGEROUS_PATTERNS, detect_dangerous_command)
 - Per-session approval state (thread-safe, keyed by session_key)
 - Approval prompting (CLI interactive + gateway async)
 - Smart approval via auxiliary LLM (auto-approve low-risk commands)
 - Permanent allowlist persistence (config.yaml)
+
+External action approval:
+- Durable approval_requests rows in SessionDB
+- Blocking waiters keyed by approval_id
+- Gateway notification using the same per-session callback registry
+- Decision audit events written through the org task ledger
 """
 
 import contextvars
@@ -236,6 +244,8 @@ class _ApprovalEntry:
 
 _gateway_queues: dict[str, list] = {}        # session_key → [_ApprovalEntry, …]
 _gateway_notify_cbs: dict[str, object] = {}  # session_key → callable(approval_data)
+_external_action_events: dict[str, threading.Event] = {}
+_external_action_entries: dict[str, _ApprovalEntry] = {}
 
 
 def register_gateway_notify(session_key: str, cb) -> None:
@@ -296,6 +306,216 @@ def has_blocking_approval(session_key: str) -> bool:
     """Check if a session has one or more blocking gateway approvals waiting."""
     with _lock:
         return bool(_gateway_queues.get(session_key))
+
+
+def _get_session_db():
+    from hermes_state import SessionDB
+    return SessionDB()
+
+
+def _env_flag(name: str) -> bool:
+    return os.getenv(name, "").strip().lower() in {"1", "true", "yes", "on"}
+
+
+def _normalize_external_decision(decision: str) -> str:
+    normalized = str(decision or "").strip().lower()
+    mapping = {
+        "approve": "approved",
+        "approved": "approved",
+        "once": "approved",
+        "session": "approved",
+        "always": "approved",
+        "deny": "denied",
+        "denied": "denied",
+        "cancel": "cancelled",
+        "cancelled": "cancelled",
+        "expire": "expired",
+        "expired": "expired",
+    }
+    resolved = mapping.get(normalized)
+    if resolved is None:
+        raise ValueError("decision must be approved, denied, cancelled, or expired")
+    return resolved
+
+
+def _remove_external_gateway_entry_locked(approval_id: str) -> None:
+    entry = _external_action_entries.pop(approval_id, None)
+    if entry is None:
+        return
+    for session_key, queue in list(_gateway_queues.items()):
+        if entry in queue:
+            queue.remove(entry)
+        if not queue:
+            _gateway_queues.pop(session_key, None)
+
+
+def request_external_action_approval(
+    action_type: str,
+    channel: str,
+    target: str,
+    payload: dict,
+    requested_by: str = None,
+) -> str:
+    """Create and notify a durable external-action approval request."""
+    session_key = get_current_session_key(default="")
+    effective_requested_by = requested_by or session_key or None
+    db = _get_session_db()
+    row = db.create_approval_request(
+        action_type,
+        channel,
+        target,
+        payload,
+        requested_by=effective_requested_by,
+        metadata={"session_key": session_key} if session_key else None,
+    )
+    approval_id = row["id"]
+
+    with _lock:
+        _external_action_events[approval_id] = threading.Event()
+
+    if _env_flag("HERMES_EXTERNAL_APPROVAL_AUTO"):
+        decide_external_action(
+            approval_id,
+            "approved",
+            decided_by=effective_requested_by or "external_approval_auto",
+            reason="HERMES_EXTERNAL_APPROVAL_AUTO",
+        )
+        return approval_id
+
+    notify_key = session_key or effective_requested_by or ""
+    with _lock:
+        notify_cb = _gateway_notify_cbs.get(notify_key)
+
+    if notify_cb is None:
+        return approval_id
+
+    target_label = f"{channel}:{target}" if target else str(channel)
+    preview = row.get("payload_preview") or ""
+    approval_data = {
+        "approval_id": approval_id,
+        "external_action": True,
+        "action_type": action_type,
+        "channel": channel,
+        "target": target,
+        "payload_hash": row["payload_hash"],
+        "payload_preview": preview,
+        "description": f"external action '{action_type}' to {target_label}",
+        # Existing gateway/TUI callbacks expect command-like data. Keep the
+        # durable action fields above as the source of truth, and provide a
+        # redacted pseudo-command for current prompt renderers.
+        "command": (
+            f"{action_type} {target_label}\n"
+            f"payload_hash={row['payload_hash']}\n"
+            f"payload_preview={preview}"
+        ),
+        "pattern_key": f"external_action:{action_type}",
+        "pattern_keys": [f"external_action:{action_type}"],
+    }
+    entry = _ApprovalEntry(approval_data)
+    with _lock:
+        _gateway_queues.setdefault(notify_key, []).append(entry)
+        _external_action_entries[approval_id] = entry
+
+    try:
+        notify_cb(approval_data)
+    except Exception as exc:
+        logger.warning("External action approval notify failed: %s", exc)
+        with _lock:
+            _remove_external_gateway_entry_locked(approval_id)
+        decide_external_action(
+            approval_id,
+            "cancelled",
+            decided_by=effective_requested_by or "approval_system",
+            reason="gateway notification failed",
+        )
+
+    return approval_id
+
+
+def await_external_action_decision(
+    approval_id: str,
+    timeout: float = 300.0,
+) -> dict:
+    """Block until an external-action approval reaches a terminal state."""
+    db = _get_session_db()
+    try:
+        timeout_seconds = float(timeout)
+    except (TypeError, ValueError):
+        timeout_seconds = 300.0
+    timeout_seconds = max(timeout_seconds, 0.0)
+    deadline = time.monotonic() + timeout_seconds
+
+    with _lock:
+        event = _external_action_events.setdefault(approval_id, threading.Event())
+
+    while True:
+        row = db.get_approval_request(approval_id)
+        if row is None:
+            return {"id": approval_id, "status": "missing"}
+        if row["status"] != "pending":
+            with _lock:
+                _external_action_events.pop(approval_id, None)
+                _remove_external_gateway_entry_locked(approval_id)
+            return row
+
+        with _lock:
+            entry = _external_action_entries.get(approval_id)
+            entry_is_set = entry is not None and entry.event.is_set()
+            gateway_result = entry.result if entry_is_set else None
+            gateway_closed = entry_is_set and entry.result is None
+
+        if gateway_result is not None:
+            decision = _normalize_external_decision(gateway_result)
+            return decide_external_action(
+                approval_id,
+                decision,
+                decided_by=row.get("requested_by") or "gateway_user",
+                reason=f"gateway approval result: {gateway_result}",
+            )
+        if gateway_closed:
+            return decide_external_action(
+                approval_id,
+                "cancelled",
+                decided_by=row.get("requested_by") or "approval_system",
+                reason="gateway approval waiter closed",
+            )
+
+        remaining = deadline - time.monotonic()
+        if remaining <= 0:
+            try:
+                return decide_external_action(
+                    approval_id,
+                    "expired",
+                    decided_by="approval_timeout",
+                    reason="timed out waiting for external action approval",
+                )
+            except ValueError:
+                row = db.get_approval_request(approval_id)
+                return row or {"id": approval_id, "status": "missing"}
+
+        event.wait(timeout=min(0.25, remaining))
+
+
+def decide_external_action(
+    approval_id: str,
+    decision: str,
+    decided_by: str,
+    reason: str = None,
+) -> dict:
+    """Persist an external-action decision and wake any blocked senders."""
+    normalized_decision = _normalize_external_decision(decision)
+    row = _get_session_db().decide_approval_request(
+        approval_id,
+        normalized_decision,
+        decided_by=decided_by,
+        reason=reason,
+    )
+    with _lock:
+        _remove_external_gateway_entry_locked(approval_id)
+        event = _external_action_events.pop(approval_id, None)
+        if event is not None:
+            event.set()
+    return row
 
 
 def submit_pending(session_key: str, approval: dict):
