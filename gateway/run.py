@@ -11572,6 +11572,8 @@ async def start_gateway(config: Optional[GatewayConfig] = None, replace: bool = 
     atexit.register(remove_pid_file)
     atexit.register(release_gateway_runtime_lock)
 
+    api_server_task: Optional[asyncio.Task] = None
+
     # Start the gateway
     success = await runner.start()
     if not success:
@@ -11580,6 +11582,23 @@ async def start_gateway(config: Optional[GatewayConfig] = None, replace: bool = 
         if runner.exit_reason:
             logger.error("Gateway exiting cleanly: %s", runner.exit_reason)
         return True
+
+    service_key = os.environ.get("HERMES_SERVICE_KEY", "").strip()
+    if not service_key:
+        logger.warning("HERMES_SERVICE_KEY missing; skipping Hermes HTTP API server")
+    elif runner._session_db is None:
+        logger.warning("SessionDB unavailable; skipping Hermes HTTP API server")
+    else:
+        from gateway.api_server import run_api_server
+
+        api_port = int(os.environ.get("HERMES_API_PORT", "8642"))
+        api_server_task = asyncio.create_task(
+            run_api_server(
+                runner._session_db,
+                port=api_port,
+                service_key=service_key,
+            )
+        )
     
     # Start background cron ticker so scheduled jobs fire automatically.
     # Pass the event loop so cron delivery can use live adapters (E2EE support).
@@ -11595,6 +11614,15 @@ async def start_gateway(config: Optional[GatewayConfig] = None, replace: bool = 
     
     # Wait for shutdown
     await runner.wait_for_shutdown()
+
+    if api_server_task is not None:
+        api_server_task.cancel()
+        try:
+            await api_server_task
+        except asyncio.CancelledError:
+            pass
+        except Exception as exc:
+            logger.debug("Hermes HTTP API server task ended during shutdown: %s", exc)
 
     if runner.should_exit_with_failure:
         if runner.exit_reason:

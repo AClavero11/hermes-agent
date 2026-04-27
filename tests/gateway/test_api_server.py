@@ -22,6 +22,7 @@ import pytest
 from aiohttp import web
 from aiohttp.test_utils import AioHTTPTestCase, TestClient, TestServer
 
+from gateway.api_server import create_api_app
 from gateway.config import GatewayConfig, Platform, PlatformConfig
 from gateway.platforms.api_server import (
     APIServerAdapter,
@@ -33,6 +34,7 @@ from gateway.platforms.api_server import (
     cors_middleware,
     security_headers_middleware,
 )
+from hermes_state import SessionDB
 
 
 # ---------------------------------------------------------------------------
@@ -2182,3 +2184,347 @@ class TestSessionIdHeader:
             call_kwargs = mock_run.call_args.kwargs
             assert call_kwargs["conversation_history"] == []
             assert call_kwargs["session_id"] == "some-session"
+
+
+# ---------------------------------------------------------------------------
+# Hermes org task / approval API server
+# ---------------------------------------------------------------------------
+
+
+ORG_API_SERVICE_KEY = "test-service-key"
+
+
+def _org_auth_headers(key: str = ORG_API_SERVICE_KEY) -> dict:
+    return {"Authorization": f"Bearer {key}"}
+
+
+async def _create_org_api_test_app(db: SessionDB) -> web.Application:
+    return await create_api_app(db, service_key=ORG_API_SERVICE_KEY)
+
+
+@pytest.fixture
+def org_api_db(tmp_path):
+    db = SessionDB(db_path=tmp_path / "state.db")
+    try:
+        yield db
+    finally:
+        db.close()
+
+
+class TestHermesOrgAPIServer:
+    @pytest.mark.asyncio
+    async def test_health_no_auth_required(self, org_api_db):
+        app = await _create_org_api_test_app(org_api_db)
+        async with TestClient(TestServer(app)) as cli:
+            resp = await cli.get("/health")
+            assert resp.status == 200
+            data = await resp.json()
+            assert data["ok"] is True
+            assert "version" in data
+            assert "started_at" in data
+
+    @pytest.mark.asyncio
+    async def test_create_task_requires_auth(self, org_api_db):
+        app = await _create_org_api_test_app(org_api_db)
+        async with TestClient(TestServer(app)) as cli:
+            resp = await cli.post(
+                "/api/org/tasks",
+                json={"source": "test", "intent": "requires auth"},
+            )
+            assert resp.status == 401
+
+    @pytest.mark.asyncio
+    async def test_create_task_wrong_key_returns_403(self, org_api_db):
+        app = await _create_org_api_test_app(org_api_db)
+        async with TestClient(TestServer(app)) as cli:
+            resp = await cli.post(
+                "/api/org/tasks",
+                headers=_org_auth_headers("wrong-key"),
+                json={"source": "test", "intent": "wrong key"},
+            )
+            assert resp.status == 403
+
+    @pytest.mark.asyncio
+    async def test_create_task_with_correct_key_returns_201_and_task_dict(
+        self,
+        org_api_db,
+    ):
+        app = await _create_org_api_test_app(org_api_db)
+        async with TestClient(TestServer(app)) as cli:
+            resp = await cli.post(
+                "/api/org/tasks",
+                headers=_org_auth_headers(),
+                json={
+                    "source": "advanced-parts",
+                    "intent": "first task",
+                    "source_ref": "rfq:1001",
+                    "owner": "sales",
+                    "entities_json": {"part": "762367B"},
+                    "evidence_json": {"url": "https://example.test/rfq/1001"},
+                },
+            )
+            assert resp.status == 201
+            data = await resp.json()
+            task = data["task"]
+            assert task["id"].startswith("orgtask_")
+            assert task["source"] == "advanced-parts"
+            assert task["intent"] == "first task"
+            assert task["status"] == "open"
+            assert json.loads(task["entities_json"]) == {"part": "762367B"}
+            assert json.loads(task["evidence_json"])["source_ref"] == "rfq:1001"
+
+    @pytest.mark.asyncio
+    async def test_list_tasks_filters_by_status(self, org_api_db):
+        open_task = org_api_db.create_org_task(source="test", intent="open task")
+        org_api_db.create_org_task(
+            source="test",
+            intent="blocked task",
+            status="blocked",
+        )
+
+        app = await _create_org_api_test_app(org_api_db)
+        async with TestClient(TestServer(app)) as cli:
+            resp = await cli.get(
+                "/api/org/tasks?status=open",
+                headers=_org_auth_headers(),
+            )
+            assert resp.status == 200
+            data = await resp.json()
+            assert data["count"] == 1
+            assert [task["id"] for task in data["tasks"]] == [open_task["id"]]
+
+    @pytest.mark.asyncio
+    async def test_list_tasks_filters_by_source_ref(self, org_api_db):
+        app = await _create_org_api_test_app(org_api_db)
+        async with TestClient(TestServer(app)) as cli:
+            create_resp = await cli.post(
+                "/api/org/tasks",
+                headers=_org_auth_headers(),
+                json={
+                    "source": "advanced-parts",
+                    "intent": "dedupe target",
+                    "source_ref": "us007:dedupe",
+                },
+            )
+            assert create_resp.status == 201
+            created = (await create_resp.json())["task"]
+
+            await cli.post(
+                "/api/org/tasks",
+                headers=_org_auth_headers(),
+                json={
+                    "source": "advanced-parts",
+                    "intent": "other task",
+                    "source_ref": "us007:other",
+                },
+            )
+
+            resp = await cli.get(
+                "/api/org/tasks?source_ref=us007:dedupe",
+                headers=_org_auth_headers(),
+            )
+            assert resp.status == 200
+            data = await resp.json()
+            assert data["count"] == 1
+            assert [task["id"] for task in data["tasks"]] == [created["id"]]
+
+    @pytest.mark.asyncio
+    async def test_get_task_returns_task_or_404(self, org_api_db):
+        task = org_api_db.create_org_task(source="test", intent="read task")
+        app = await _create_org_api_test_app(org_api_db)
+        async with TestClient(TestServer(app)) as cli:
+            resp = await cli.get(
+                f"/api/org/tasks/{task['id']}",
+                headers=_org_auth_headers(),
+            )
+            assert resp.status == 200
+            assert (await resp.json())["task"]["id"] == task["id"]
+
+            missing = await cli.get(
+                "/api/org/tasks/orgtask_missing",
+                headers=_org_auth_headers(),
+            )
+            assert missing.status == 404
+
+    @pytest.mark.asyncio
+    async def test_patch_task_partial_update(self, org_api_db):
+        task = org_api_db.create_org_task(source="test", intent="patch task")
+        app = await _create_org_api_test_app(org_api_db)
+        async with TestClient(TestServer(app)) as cli:
+            resp = await cli.patch(
+                f"/api/org/tasks/{task['id']}",
+                headers=_org_auth_headers(),
+                json={
+                    "owner": "ops",
+                    "status": "in_progress",
+                    "next_action": "continue work",
+                },
+            )
+            assert resp.status == 200
+            updated = (await resp.json())["task"]
+            assert updated["owner"] == "ops"
+            assert updated["status"] == "in_progress"
+            assert updated["next_action"] == "continue work"
+
+    @pytest.mark.asyncio
+    async def test_patch_task_illegal_state_transition_returns_400(
+        self,
+        org_api_db,
+    ):
+        task = org_api_db.create_org_task(source="test", intent="closed task")
+        org_api_db.complete_org_task(task["id"])
+
+        app = await _create_org_api_test_app(org_api_db)
+        async with TestClient(TestServer(app)) as cli:
+            resp = await cli.patch(
+                f"/api/org/tasks/{task['id']}",
+                headers=_org_auth_headers(),
+                json={"status": "in_progress"},
+            )
+            assert resp.status == 400
+
+    @pytest.mark.asyncio
+    async def test_complete_task_idempotent(self, org_api_db):
+        task = org_api_db.create_org_task(source="test", intent="complete task")
+        app = await _create_org_api_test_app(org_api_db)
+        async with TestClient(TestServer(app)) as cli:
+            first_resp = await cli.put(
+                f"/api/org/tasks/{task['id']}/complete",
+                headers=_org_auth_headers(),
+                json={"next_action": "closed"},
+            )
+            assert first_resp.status == 200
+            first = (await first_resp.json())["task"]
+
+            second_resp = await cli.put(
+                f"/api/org/tasks/{task['id']}/complete",
+                headers=_org_auth_headers(),
+            )
+            assert second_resp.status == 200
+            second = (await second_resp.json())["task"]
+
+            assert first["status"] == "completed"
+            assert second["status"] == "completed"
+            assert second["completed_at"] == first["completed_at"]
+
+    @pytest.mark.asyncio
+    async def test_list_events_returns_events_for_task(self, org_api_db):
+        task = org_api_db.create_org_task(source="test", intent="event task")
+        org_api_db.update_org_task(task["id"], status="in_progress")
+        org_api_db.complete_org_task(task["id"])
+
+        app = await _create_org_api_test_app(org_api_db)
+        async with TestClient(TestServer(app)) as cli:
+            resp = await cli.get(
+                f"/api/org/tasks/{task['id']}/events",
+                headers=_org_auth_headers(),
+            )
+            assert resp.status == 200
+            data = await resp.json()
+            assert data["count"] == 3
+            assert [event["event_type"] for event in data["events"]] == [
+                "created",
+                "updated",
+                "completed",
+            ]
+
+    @pytest.mark.asyncio
+    async def test_request_external_action_approval_returns_approval_id_and_payload_hash(
+        self,
+        org_api_db,
+    ):
+        app = await _create_org_api_test_app(org_api_db)
+        async with TestClient(TestServer(app)) as cli:
+            resp = await cli.post(
+                "/api/org/external-actions/request_external_action_approval",
+                headers=_org_auth_headers(),
+                json={
+                    "action_type": "external_send",
+                    "channel": "telegram",
+                    "target": "-1001",
+                    "payload": {"message": "send quote"},
+                    "requested_by": "advanced-parts",
+                },
+            )
+            assert resp.status == 201
+            data = await resp.json()
+            assert data["approval_id"].startswith("appr_")
+            assert len(data["payload_hash"]) == 64
+            assert data["status"] == "pending"
+            assert isinstance(data["created_at"], float)
+
+            row = org_api_db.get_approval_request(data["approval_id"])
+            assert row["payload_hash"] == data["payload_hash"]
+
+    @pytest.mark.asyncio
+    async def test_request_external_action_approval_payload_hash_is_deterministic_for_same_payload(
+        self,
+        org_api_db,
+    ):
+        app = await _create_org_api_test_app(org_api_db)
+        payload_a = {"message": "hello", "nested": {"b": 2, "a": 1}}
+        payload_b = {"nested": {"a": 1, "b": 2}, "message": "hello"}
+
+        async with TestClient(TestServer(app)) as cli:
+            first_resp = await cli.post(
+                "/api/org/external-actions/request_external_action_approval",
+                headers=_org_auth_headers(),
+                json={
+                    "action_type": "external_send",
+                    "channel": "telegram",
+                    "target": "-1001",
+                    "payload": payload_a,
+                },
+            )
+            second_resp = await cli.post(
+                "/api/org/external-actions/request_external_action_approval",
+                headers=_org_auth_headers(),
+                json={
+                    "action_type": "external_send",
+                    "channel": "telegram",
+                    "target": "-1001",
+                    "payload": payload_b,
+                },
+            )
+            assert first_resp.status == 201
+            assert second_resp.status == 201
+            first = await first_resp.json()
+            second = await second_resp.json()
+            assert first["payload_hash"] == second["payload_hash"]
+            assert first["approval_id"] != second["approval_id"]
+
+    @pytest.mark.asyncio
+    async def test_endpoints_with_malformed_json_return_400(self, org_api_db):
+        task = org_api_db.create_org_task(source="test", intent="malformed json")
+        app = await _create_org_api_test_app(org_api_db)
+        malformed_headers = {
+            **_org_auth_headers(),
+            "Content-Type": "application/json",
+        }
+
+        async with TestClient(TestServer(app)) as cli:
+            create_resp = await cli.post(
+                "/api/org/tasks",
+                headers=malformed_headers,
+                data="{",
+            )
+            patch_resp = await cli.patch(
+                f"/api/org/tasks/{task['id']}",
+                headers=malformed_headers,
+                data="{",
+            )
+            complete_resp = await cli.put(
+                f"/api/org/tasks/{task['id']}/complete",
+                headers=malformed_headers,
+                data="{",
+            )
+            approval_resp = await cli.post(
+                "/api/org/external-actions/request_external_action_approval",
+                headers=malformed_headers,
+                data="{",
+            )
+
+            assert create_resp.status == 400
+            assert patch_resp.status == 400
+            assert complete_resp.status == 400
+            assert approval_resp.status == 400
