@@ -1,5 +1,6 @@
 """Tests for gateway /status behavior and token persistence."""
 
+import json
 from datetime import datetime
 import time
 from types import SimpleNamespace
@@ -111,6 +112,304 @@ async def test_status_command_includes_session_title_when_present():
 
     assert "**Session ID:** `sess-1`" in result
     assert "**Title:** My titled session" in result
+
+
+@pytest.mark.asyncio
+async def test_status_command_includes_studio_inference_state(monkeypatch, tmp_path):
+    monkeypatch.setenv("DEEPSEEK_LOCAL_BASE_URL", "http://studio.local:8090/v1")
+    monkeypatch.setenv("DEEPSEEK_LOCAL_MODEL", "deepseek-coder")
+    monkeypatch.setenv("DEEPSEEK_V4_BASE_URL", "http://studio.local:8091/v1")
+    monkeypatch.setenv("DEEPSEEK_V4_MODEL", "deepseek-v4")
+    monkeypatch.setenv("HERMES_STATUS_INCLUDE_LAUNCHD", "0")
+    eval_state_file = tmp_path / "eval_last.json"
+    eval_state_file.write_text(json.dumps({
+        "ok": True,
+        "completed_at": "2026-04-25T18:27:00+00:00",
+        "checks": [
+            {"name": "models", "ok": True},
+            {"name": "exact_string", "ok": True},
+            {"name": "json_contract", "ok": True},
+            {"name": "code_expression", "ok": True},
+        ],
+    }))
+    monkeypatch.setenv("HERMES_EVAL_STATE_FILE", str(eval_state_file))
+    session_entry = SessionEntry(
+        session_key=build_session_key(_make_source()),
+        session_id="sess-1",
+        created_at=datetime.now(),
+        updated_at=datetime.now(),
+        platform=Platform.TELEGRAM,
+        chat_type="dm",
+        total_tokens=0,
+    )
+    runner = _make_runner(session_entry)
+
+    result = await runner._handle_message(_make_event("/status"))
+
+    assert "**Studio Inference:**" in result
+    assert "**Production:** `deepseek-coder` @ `http://studio.local:8090/v1`" in result
+    assert "**Experimental V4:** `deepseek-v4` @ `http://studio.local:8091/v1`" in result
+    assert "**Last Eval:** PASS `4/4` at `2026-04-25T18:27:00+00:00`" in result
+
+
+def test_gateway_model_resolution_expands_env_placeholders(monkeypatch):
+    from gateway.run import _resolve_gateway_model
+
+    monkeypatch.setenv("HERMES_PLANNER_MODEL", "deepseek-coder")
+
+    result = _resolve_gateway_model({
+        "model": {
+            "default": "${HERMES_PLANNER_MODEL}",
+            "provider": "${HERMES_PLANNER_PROVIDER}",
+        },
+    })
+
+    assert result == "deepseek-coder"
+
+
+def test_message_requests_alexandria_context():
+    from gateway.run import _message_requests_alexandria_context
+
+    assert _message_requests_alexandria_context("Look in Alexandria for Hermes status")
+    assert _message_requests_alexandria_context("Check stock for 762367B")
+    assert not _message_requests_alexandria_context(
+        "planner live diagnostic: respond exactly HERMES_V4_64K_OK"
+    )
+    assert not _message_requests_alexandria_context(
+        "https://x.com/steipete/status/2047982647264059734?s=46"
+    )
+    assert not _message_requests_alexandria_context("hello")
+
+
+def test_extract_alexandria_rel_paths_from_search_outputs():
+    from gateway.run import _extract_alexandria_rel_paths
+
+    qmd_output = "qmd://alexandria/advanced/czar/CONTEXT.md:77 #abc123"
+    json_output = json.dumps({
+        "results": [
+            {"rel_path": "advanced/pricing/CONTEXT.md"},
+            {"path": "/Users/ac/alexandria/advanced/products/CONTEXT.md"},
+        ]
+    })
+
+    assert _extract_alexandria_rel_paths(qmd_output) == ["advanced/czar/CONTEXT.md"]
+    assert _extract_alexandria_rel_paths(json_output) == [
+        "advanced/pricing/CONTEXT.md",
+        "advanced/products/CONTEXT.md",
+    ]
+
+
+def test_build_alexandria_context_prompt_includes_guardrails(monkeypatch):
+    import gateway.run as gateway_run
+
+    monkeypatch.setattr(
+        gateway_run,
+        "_run_alexandria_context_command",
+        lambda args, timeout=20.0: "qmd://alexandria/advanced/czar/CONTEXT.md:1\nStudio target",
+    )
+    monkeypatch.setattr(
+        gateway_run,
+        "_read_alexandria_source_snippets",
+        lambda paths: "Source: advanced/czar/CONTEXT.md\nArchitecture target: office Studio powers Hermes.",
+    )
+
+    result = gateway_run._build_alexandria_context_prompt(
+        "Look in Alexandria for Hermes architecture"
+    )
+
+    assert "Never answer with generic chatbot disclaimers" in result
+    assert "Architecture target: office Studio powers Hermes." in result
+    assert "QMD semantic search" in result
+
+
+def test_build_alexandria_context_prompt_includes_release_context(monkeypatch):
+    import gateway.run as gateway_run
+
+    monkeypatch.setattr(
+        gateway_run,
+        "_run_alexandria_context_command",
+        lambda args, timeout=20.0: "",
+    )
+    monkeypatch.setattr(
+        gateway_run,
+        "_read_alexandria_source_snippets",
+        lambda paths, max_chars=9000: "Source: advanced/czar/CONTEXT.md\nStudio target",
+    )
+    monkeypatch.setattr(
+        gateway_run,
+        "_read_hermes_release_context_snippet",
+        lambda message, max_chars=5000: "Source: RELEASE_v0.11.0.md\nInk TUI and pluggable transports",
+    )
+
+    result = gateway_run._build_alexandria_context_prompt(
+        "Read the Hermes agent newest GitHub release"
+    )
+
+    assert "Retrieved Hermes GitHub release notes" in result
+    assert "Ink TUI and pluggable transports" in result
+    assert "If asked for Hermes status or a 1-100 score" in result
+
+
+def test_build_sonnet_era_continuity_prompt_includes_alexandria_bridge(monkeypatch):
+    import gateway.run as gateway_run
+
+    monkeypatch.setattr(
+        gateway_run,
+        "_read_alexandria_source_snippets",
+        lambda paths, max_chars=9000: "Source: _system/ACTIVE_CONTEXT.md\nCurrent priority: Hermes.",
+    )
+
+    result = gateway_run._build_sonnet_era_continuity_prompt("what should we do now?")
+
+    assert "Sonnet-era Hermes continuity bridge" in result
+    assert "not a fresh generic chat" in result
+    assert "Current priority: Hermes." in result
+
+
+def test_build_sonnet_era_continuity_prompt_skips_exact_diagnostics():
+    import gateway.run as gateway_run
+
+    result = gateway_run._build_sonnet_era_continuity_prompt(
+        "reply exactly HERMES_V4_64K_OK"
+    )
+
+    assert result == ""
+
+
+def test_build_hermes_direct_answer_for_docs_access(monkeypatch):
+    import gateway.run as gateway_run
+
+    monkeypatch.setattr(
+        gateway_run,
+        "_read_alexandria_source_snippets",
+        lambda paths, max_chars=4500: "Source: advanced/czar/CONTEXT.md\nStudio target",
+    )
+
+    result = gateway_run._build_hermes_direct_answer(
+        "Are you able to view Alexandria docs?"
+    )
+
+    assert result.startswith("Yes. I pulled Alexandria source context")
+    assert "advanced/czar/CONTEXT.md" in result
+    assert "browse paths manually" in result
+
+
+def test_build_hermes_direct_answer_for_release_status(monkeypatch):
+    import gateway.run as gateway_run
+
+    monkeypatch.setattr(
+        gateway_run,
+        "_read_alexandria_source_snippets",
+        lambda paths, max_chars=4500: "Source: advanced/czar/CONTEXT.md\nStudio target",
+    )
+    monkeypatch.setattr(
+        gateway_run,
+        "_read_hermes_release_context_snippet",
+        lambda message, max_chars=3500: "Source: RELEASE_v0.11.0.md\n/steer and orchestrator delegation",
+    )
+
+    result = gateway_run._build_hermes_direct_answer(
+        "hows your hermes agent status 1-100 if i read the hermes newest github?"
+    )
+
+    assert "Hermes agent status: 94/100." in result
+    assert "v2026.4.23 / v0.11.0" in result
+    assert "Blockers to 100/100" in result
+    assert "V4 planner is active" in result
+
+
+def test_build_hermes_direct_answer_for_test_probe():
+    import gateway.run as gateway_run
+
+    result = gateway_run._build_hermes_direct_answer("Test")
+
+    assert result.startswith("Hermes online.")
+    assert "custom:office-deepseek-v4" in result
+    assert "operator mode" in result
+
+
+def test_build_hermes_direct_answer_for_finish_it_probe():
+    import gateway.run as gateway_run
+
+    result = gateway_run._build_hermes_direct_answer("Finish it")
+
+    assert result.startswith("Hermes will not run an unbounded")
+    assert "2026-04-25-hermes-deepseek-openai-telegram.md" in result
+    assert "operator mode" in result
+
+
+def test_build_hermes_direct_answer_for_social_link_only():
+    import gateway.run as gateway_run
+
+    result = gateway_run._build_hermes_direct_answer(
+        "https://x.com/steipete/status/2047982647264059734?s=46"
+    )
+
+    assert result == ""
+
+
+def test_build_x_link_context_prompt_uses_scraper(monkeypatch):
+    import tools.x_scraper_tool as x_scraper_tool
+    import gateway.run as gateway_run
+
+    monkeypatch.setattr(
+        x_scraper_tool,
+        "x_scrape_tool",
+        lambda urls: json.dumps({
+            "content": "Built clawsweeper, which runs 50 codex in parallel.",
+            "source": "test",
+        }),
+    )
+
+    result = gateway_run._build_x_link_context_prompt(
+        "https://x.com/steipete/status/2047982647264059734?s=46"
+    )
+
+    assert "Fetched X/Twitter context" in result
+    assert "Built clawsweeper" in result
+    assert "Do not say you cannot access the link" in result
+
+
+def test_build_hermes_direct_answer_for_self_upgrade_prompt(monkeypatch):
+    import gateway.run as gateway_run
+
+    monkeypatch.setattr(
+        gateway_run,
+        "_read_alexandria_source_snippets",
+        lambda paths, max_chars=4500: "Source: advanced/czar/CONTEXT.md\nStudio target",
+    )
+    monkeypatch.setattr(
+        gateway_run,
+        "_read_hermes_release_context_snippet",
+        lambda message, max_chars=3500: "Source: RELEASE_v0.11.0.md\n/steer and orchestrator delegation",
+    )
+
+    result = gateway_run._build_hermes_direct_answer("Bring yourself to 100/100")
+
+    assert result.startswith("Hermes self-heal status: 94/100.")
+    assert "Prevented this prompt class from reaching terminal/tool execution." in result
+    assert "V4 planner active" in result
+    assert "Current operating mode: local-first Studio Hermes" in result
+
+
+def test_build_hermes_direct_answer_for_self_heal_prompt(monkeypatch):
+    import gateway.run as gateway_run
+
+    monkeypatch.setattr(
+        gateway_run,
+        "_read_alexandria_source_snippets",
+        lambda paths, max_chars=4500: "Source: advanced/czar/CONTEXT.md\nStudio target",
+    )
+    monkeypatch.setattr(
+        gateway_run,
+        "_read_hermes_release_context_snippet",
+        lambda message, max_chars=3500: "Source: RELEASE_v0.11.0.md\n/steer and orchestrator delegation",
+    )
+
+    result = gateway_run._build_hermes_direct_answer("Can you self heal?")
+
+    assert result.startswith("Hermes self-heal status: 94/100.")
+    assert "AC Telegram operator mode enabled" in result
 
 
 @pytest.mark.asyncio
