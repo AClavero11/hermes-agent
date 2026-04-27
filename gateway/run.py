@@ -89,6 +89,7 @@ sys.path.insert(0, str(Path(__file__).parent.parent))
 
 # Resolve Hermes home directory (respects HERMES_HOME override)
 from hermes_constants import get_hermes_home
+from gateway import context_router as alexandria_router
 from utils import atomic_yaml_write, base_url_host_matches, is_truthy_value
 _hermes_home = get_hermes_home()
 
@@ -522,56 +523,6 @@ def _resolve_gateway_model(config: dict | None = None) -> str:
     return ""
 
 
-_ALEXANDRIA_CONTEXT_TERMS = (
-    "alexandria",
-    "v11",
-    "v 11",
-    "aac",
-    "advanced aerospace",
-    "hermes",
-    "czar",
-    "telegram",
-    "part number",
-    "pricing",
-    "quote",
-    "rfq",
-    "customer",
-    "inventory",
-    "sales order",
-    "purchase order",
-    "idg",
-    "csd",
-)
-
-_ALEXANDRIA_V11_TERMS = (
-    "v11",
-    "v 11",
-    "inventory",
-    "stock",
-    "part number",
-    "sales order",
-    "purchase order",
-)
-
-_ALEXANDRIA_HERMES_TERMS = (
-    "hermes",
-    "czar",
-    "telegram",
-    "gateway",
-    "deepseek",
-    "agent",
-)
-
-_HERMES_RELEASE_TERMS = (
-    "github",
-    "release",
-    "newest",
-    "latest",
-    "nous",
-    "v2026.4.23",
-    "v0.11.0",
-)
-
 _HERMES_STATUS_TERMS = (
     "status 1-100",
     "1-100",
@@ -599,21 +550,10 @@ _HERMES_SELF_UPGRADE_TERMS = (
     "100/100",
 )
 
-_ALEXANDRIA_PART_NUMBER_RE = re.compile(
-    r"\b(?:\d{5,}[A-Z]?|\d{2,}[A-Z]-?\d+[A-Z0-9-]*|[A-Z]{1,4}\d{4,}[A-Z0-9-]*)\b",
-    re.IGNORECASE,
-)
-
-_URL_RE = re.compile(r"https?://\S+", re.IGNORECASE)
 _X_URL_RE = re.compile(
     r"https?://(?:(?:www|mobile)\.)?(?:x\.com|twitter\.com|fxtwitter\.com|vxtwitter\.com|t\.co)/\S+",
     re.IGNORECASE,
 )
-
-
-def _strip_urls_for_routing(message: str) -> str:
-    """Remove URLs before keyword/part-number routing decisions."""
-    return _URL_RE.sub(" ", message or "")
 
 
 def _message_is_social_link_only(message: str) -> bool:
@@ -623,7 +563,7 @@ def _message_is_social_link_only(message: str) -> bool:
     lowered = text.lower()
     if not ("x.com/" in lowered or "twitter.com/" in lowered):
         return False
-    without_urls = _strip_urls_for_routing(text).strip()
+    without_urls = alexandria_router.strip_urls_for_routing(text).strip()
     return not without_urls
 
 
@@ -685,170 +625,14 @@ def _build_x_link_context_prompt(message: str) -> str:
     )
 
 
-def _message_requests_alexandria_context(message: str) -> bool:
-    """Return True when a gateway turn should be grounded in Alexandria/V11."""
-    text = (message or "").strip()
-    if not text:
-        return False
-    routing_text = _strip_urls_for_routing(text).strip()
-    if not routing_text:
-        return False
-    lowered = routing_text.lower()
-    if "reply exactly" in lowered or "respond exactly" in lowered:
-        return False
-    if any(term in lowered for term in _ALEXANDRIA_CONTEXT_TERMS):
-        return True
-    if "hermes" in lowered and any(term in lowered for term in _HERMES_RELEASE_TERMS):
-        return True
-    return bool(_ALEXANDRIA_PART_NUMBER_RE.search(routing_text))
-
-
-def _alexandria_context_env() -> dict:
-    """Environment for Alexandria search commands in non-interactive launchd shells."""
-    home = Path.home()
-    path_entries = [
-        home / "alexandria" / "_system" / "scripts",
-        home / "alexandria" / "advanced" / "operations" / "scripts",
-        home / "bin",
-        home / "bin" / "bin",
-        home / ".bun" / "bin",
-        Path("/opt/homebrew/bin"),
-        Path("/usr/local/bin"),
-        Path("/usr/bin"),
-        Path("/bin"),
-    ]
-    env = os.environ.copy()
-    env["HOME"] = str(home)
-    env["PATH"] = ":".join(str(p) for p in path_entries) + ":" + env.get("PATH", "")
-    return env
-
-
-def _run_alexandria_context_command(args: List[str], timeout: float = 20.0) -> str:
-    """Run a bounded Alexandria retrieval command and return stdout or a short error."""
-    try:
-        result = subprocess.run(
-            args,
-            capture_output=True,
-            text=True,
-            timeout=timeout,
-            env=_alexandria_context_env(),
-        )
-    except FileNotFoundError:
-        return ""
-    except subprocess.TimeoutExpired:
-        logger.debug("Alexandria context command timed out: %s", args[0])
-        return ""
-    except Exception as exc:
-        logger.debug("Alexandria context command failed: %s", exc)
-        return ""
-
-    output = (result.stdout or "").strip()
-    if result.returncode == 0:
-        return output
-    stderr = (result.stderr or "").strip()
-    return stderr[:800] if stderr else output
-
-
 def _truncate_context_text(text: str, max_chars: int) -> str:
     if len(text) <= max_chars:
         return text
     return text[: max_chars - 40].rstrip() + "\n[truncated]"
 
 
-def _extract_alexandria_rel_paths(search_output: str) -> List[str]:
-    """Extract Alexandria relative paths from qmd/alex-search output."""
-    if not search_output:
-        return []
-
-    paths: List[str] = []
-
-    try:
-        data = json.loads(search_output)
-    except Exception:
-        data = None
-    if isinstance(data, dict):
-        for item in data.get("results", []) or []:
-            if not isinstance(item, dict):
-                continue
-            rel_path = item.get("rel_path")
-            if isinstance(rel_path, str) and rel_path:
-                paths.append(rel_path)
-            else:
-                raw_path = item.get("path")
-                if isinstance(raw_path, str) and "/alexandria/" in raw_path:
-                    paths.append(raw_path.split("/alexandria/", 1)[1])
-
-    for match in re.finditer(r"qmd://alexandria/([^:\s#]+)(?::\d+)?", search_output):
-        paths.append(match.group(1))
-    for match in re.finditer(r"^\s*\d+\.\s+([^ \[]+\.md)\s+\[", search_output, re.MULTILINE):
-        paths.append(match.group(1))
-
-    unique: List[str] = []
-    seen = set()
-    for path in paths:
-        normalized = path.strip().lstrip("/")
-        if not normalized or normalized in seen:
-            continue
-        seen.add(normalized)
-        unique.append(normalized)
-    return unique
-
-
-def _direct_alexandria_context_paths(message: str) -> List[str]:
-    """Route high-value gateway prompts to known Alexandria context files."""
-    lowered = (message or "").lower()
-    paths = ["_system/ROUTING.md"]
-
-    if any(term in lowered for term in _ALEXANDRIA_HERMES_TERMS) or "alexandria" in lowered:
-        paths.append("advanced/czar/CONTEXT.md")
-    if "pricing" in lowered or "quote" in lowered or "rfq" in lowered:
-        paths.append("advanced/pricing/CONTEXT.md")
-    if "customer" in lowered:
-        paths.append("advanced/customers/CONTEXT.md")
-    if any(term in lowered for term in _ALEXANDRIA_V11_TERMS) or _ALEXANDRIA_PART_NUMBER_RE.search(message or ""):
-        paths.append("advanced/operations/CONTEXT.md")
-        paths.append("advanced/products/CONTEXT.md")
-    if "idg" in lowered or "csd" in lowered:
-        paths.append("advanced/idg/IDG_PLATFORM_MAPPING.md")
-
-    unique: List[str] = []
-    seen = set()
-    for path in paths:
-        if path not in seen:
-            seen.add(path)
-            unique.append(path)
-    return unique
-
-
 def _read_alexandria_source_snippets(rel_paths: List[str], max_chars: int = 9000) -> str:
-    """Read bounded snippets from Alexandria files without allowing path traversal."""
-    root = (Path.home() / "alexandria").resolve()
-    parts: List[str] = []
-    total = 0
-
-    for rel_path in rel_paths:
-        if total >= max_chars:
-            break
-        candidate = (root / rel_path).resolve()
-        try:
-            candidate.relative_to(root)
-        except ValueError:
-            continue
-        if not candidate.is_file():
-            continue
-        try:
-            text = candidate.read_text(encoding="utf-8", errors="replace").strip()
-        except Exception:
-            continue
-        if not text:
-            continue
-        remaining = max_chars - total
-        per_file_limit = 6000 if rel_path == "advanced/czar/CONTEXT.md" else 3000
-        snippet = _truncate_context_text(text, min(per_file_limit, remaining))
-        parts.append(f"Source: {rel_path}\n{snippet}")
-        total += len(snippet)
-
-    return "\n\n".join(parts)
+    return alexandria_router.read_alexandria_source_snippets(rel_paths, max_chars=max_chars)
 
 
 def _build_sonnet_era_continuity_prompt(message: str) -> str:
@@ -882,33 +666,7 @@ def _build_sonnet_era_continuity_prompt(message: str) -> str:
 
 
 def _read_hermes_release_context_snippet(message: str, max_chars: int = 5000) -> str:
-    """Return local GitHub-release notes when the user asks about Hermes releases."""
-    lowered = (message or "").lower()
-    if not ("hermes" in lowered and any(term in lowered for term in _HERMES_RELEASE_TERMS)):
-        return ""
-
-    repo_root = Path(__file__).resolve().parents[1]
-    candidates = [
-        repo_root / "RELEASE_v0.11.0.md",
-        Path.home() / ".hermes" / "hermes-agent-v2026.4.23" / "RELEASE_v0.11.0.md",
-        Path.home() / ".hermes" / "hermes-agent" / "RELEASE_v0.11.0.md",
-    ]
-
-    for candidate in candidates:
-        if not candidate.is_file():
-            continue
-        try:
-            text = candidate.read_text(encoding="utf-8", errors="replace").strip()
-        except Exception:
-            continue
-        if not text:
-            continue
-        return (
-            "Source: NousResearch/hermes-agent RELEASE_v0.11.0.md "
-            "(GitHub tag v2026.4.23)\n"
-            + _truncate_context_text(text, max_chars)
-        )
-    return ""
+    return alexandria_router.read_hermes_release_context_snippet(message, max_chars=max_chars)
 
 
 def _build_hermes_direct_answer(message: str) -> str:
@@ -941,13 +699,15 @@ def _build_hermes_direct_answer(message: str) -> str:
         term in lowered
         for term in ("able", "access", "view", "pull", "docs")
     )
-    asks_release = mentions_hermes and any(term in lowered for term in _HERMES_RELEASE_TERMS)
+    asks_release = mentions_hermes and any(
+        term in lowered for term in alexandria_router.HERMES_RELEASE_TERMS
+    )
     asks_status = (mentions_hermes or asks_self_upgrade) and any(term in lowered for term in _HERMES_STATUS_TERMS)
 
     if not (asks_docs_access or asks_release or asks_status):
         return ""
 
-    rel_paths = _direct_alexandria_context_paths(text)
+    rel_paths = alexandria_router.direct_alexandria_context_paths(text)
     source_snippets = _read_alexandria_source_snippets(rel_paths, max_chars=4500)
     release_snippet = _read_hermes_release_context_snippet(text, max_chars=3500)
 
@@ -1009,69 +769,7 @@ def _build_hermes_direct_answer(message: str) -> str:
 
 
 def _build_alexandria_context_prompt(message: str) -> str:
-    """Build deterministic Alexandria/V11 context for gateway turns.
-
-    This is intentionally outside model tool-calling. It gives local worker
-    models enough source material to avoid generic "I cannot access
-    Alexandria" answers when tool use is weak or unavailable.
-    """
-    if not _message_requests_alexandria_context(message):
-        return ""
-
-    query = (message or "").strip()
-    lowered = query.lower()
-    search_outputs: List[str] = []
-
-    qmd_output = _run_alexandria_context_command(["qmd", "query", query, "-n", "4"], timeout=12)
-    if qmd_output:
-        search_outputs.append("QMD semantic search:\n" + _truncate_context_text(qmd_output, 6000))
-    else:
-        alex_output = _run_alexandria_context_command(
-            ["alex-search", query, "-n", "5", "--format", "json"],
-            timeout=12,
-        )
-        if alex_output:
-            search_outputs.append("Alexandria LSH search:\n" + _truncate_context_text(alex_output, 5000))
-
-    if any(term in lowered for term in _ALEXANDRIA_V11_TERMS) or _ALEXANDRIA_PART_NUMBER_RE.search(query):
-        v11_output = _run_alexandria_context_command(
-            ["v11-search", query, "-n", "5", "--format", "json"],
-            timeout=12,
-        )
-        if v11_output:
-            search_outputs.append("V11 search:\n" + _truncate_context_text(v11_output, 4000))
-
-    rel_paths = _direct_alexandria_context_paths(query)
-    for output in search_outputs:
-        rel_paths.extend(_extract_alexandria_rel_paths(output))
-
-    source_snippets = _read_alexandria_source_snippets(rel_paths)
-    context_parts = []
-    if source_snippets:
-        context_parts.append("Retrieved Alexandria source files:\n" + source_snippets)
-    release_snippet = _read_hermes_release_context_snippet(query)
-    if release_snippet:
-        context_parts.append("Retrieved Hermes GitHub release notes:\n" + release_snippet)
-    context_parts.extend(search_outputs)
-
-    if not context_parts:
-        context_parts.append(
-            "Alexandria retrieval was attempted, but no source output was returned. "
-            "State that retrieval returned no results instead of claiming no access."
-        )
-
-    return (
-        "[System note: Alexandria/V11 retrieval for this turn]\n"
-        "Answer as Hermes for AAC using the source material below. Never answer with "
-        "generic chatbot disclaimers such as 'as an AI language model', 'I cannot access "
-        "Alexandria', or 'navigate to the specified paths'. If asked whether you can view "
-        "or pull Alexandria docs, say that the docs were pulled and cite the source paths. "
-        "If asked for Hermes status or a 1-100 score, give the score first, then blockers. "
-        "If the material is insufficient, say exactly what was searched and what remains unknown.\n"
-        f"User query: {query}\n\n"
-        + "\n\n".join(context_parts)
-        + "\n[End Alexandria/V11 retrieval]"
-    )
+    return alexandria_router.build_alexandria_context_prompt(message)
 
 
 def _resolve_hermes_bin() -> Optional[list[str]]:
@@ -10752,9 +10450,15 @@ class GatewayRunner:
                     + message
                 )
 
-            _alexandria_context = _build_alexandria_context_prompt(message)
+            _alexandria_context_result = alexandria_router.collect_alexandria_context(message)
+            _alexandria_context = str(_alexandria_context_result.get("context_text") or "")
             if _alexandria_context:
-                logger.info("Injected Alexandria/V11 retrieval context for %s turn", platform_key)
+                logger.info(
+                    "Injected Alexandria/V11 retrieval context for %s turn (succeeded=%s, sources=%s)",
+                    platform_key,
+                    bool(_alexandria_context_result.get("retrieval_succeeded")),
+                    len(_alexandria_context_result.get("source_paths") or []),
+                )
                 message = (
                     _alexandria_context
                     + "\n\n[User message]\n"

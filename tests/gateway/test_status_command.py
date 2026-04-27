@@ -168,21 +168,21 @@ def test_gateway_model_resolution_expands_env_placeholders(monkeypatch):
 
 
 def test_message_requests_alexandria_context():
-    from gateway.run import _message_requests_alexandria_context
+    from gateway import context_router
 
-    assert _message_requests_alexandria_context("Look in Alexandria for Hermes status")
-    assert _message_requests_alexandria_context("Check stock for 762367B")
-    assert not _message_requests_alexandria_context(
+    assert context_router.message_requests_alexandria_context("Look in Alexandria for Hermes status")
+    assert context_router.message_requests_alexandria_context("Check stock for 762367B")
+    assert not context_router.message_requests_alexandria_context(
         "planner live diagnostic: respond exactly HERMES_V4_64K_OK"
     )
-    assert not _message_requests_alexandria_context(
+    assert not context_router.message_requests_alexandria_context(
         "https://x.com/steipete/status/2047982647264059734?s=46"
     )
-    assert not _message_requests_alexandria_context("hello")
+    assert not context_router.message_requests_alexandria_context("hello")
 
 
 def test_extract_alexandria_rel_paths_from_search_outputs():
-    from gateway.run import _extract_alexandria_rel_paths
+    from gateway import context_router
 
     qmd_output = "qmd://alexandria/advanced/czar/CONTEXT.md:77 #abc123"
     json_output = json.dumps({
@@ -192,8 +192,8 @@ def test_extract_alexandria_rel_paths_from_search_outputs():
         ]
     })
 
-    assert _extract_alexandria_rel_paths(qmd_output) == ["advanced/czar/CONTEXT.md"]
-    assert _extract_alexandria_rel_paths(json_output) == [
+    assert context_router.extract_alexandria_rel_paths(qmd_output) == ["advanced/czar/CONTEXT.md"]
+    assert context_router.extract_alexandria_rel_paths(json_output) == [
         "advanced/pricing/CONTEXT.md",
         "advanced/products/CONTEXT.md",
     ]
@@ -201,14 +201,15 @@ def test_extract_alexandria_rel_paths_from_search_outputs():
 
 def test_build_alexandria_context_prompt_includes_guardrails(monkeypatch):
     import gateway.run as gateway_run
+    from gateway import context_router
 
     monkeypatch.setattr(
-        gateway_run,
+        context_router,
         "_run_alexandria_context_command",
         lambda args, timeout=20.0: "qmd://alexandria/advanced/czar/CONTEXT.md:1\nStudio target",
     )
     monkeypatch.setattr(
-        gateway_run,
+        context_router,
         "_read_alexandria_source_snippets",
         lambda paths: "Source: advanced/czar/CONTEXT.md\nArchitecture target: office Studio powers Hermes.",
     )
@@ -224,19 +225,20 @@ def test_build_alexandria_context_prompt_includes_guardrails(monkeypatch):
 
 def test_build_alexandria_context_prompt_includes_release_context(monkeypatch):
     import gateway.run as gateway_run
+    from gateway import context_router
 
     monkeypatch.setattr(
-        gateway_run,
+        context_router,
         "_run_alexandria_context_command",
         lambda args, timeout=20.0: "",
     )
     monkeypatch.setattr(
-        gateway_run,
+        context_router,
         "_read_alexandria_source_snippets",
         lambda paths, max_chars=9000: "Source: advanced/czar/CONTEXT.md\nStudio target",
     )
     monkeypatch.setattr(
-        gateway_run,
+        context_router,
         "_read_hermes_release_context_snippet",
         lambda message, max_chars=5000: "Source: RELEASE_v0.11.0.md\nInk TUI and pluggable transports",
     )
