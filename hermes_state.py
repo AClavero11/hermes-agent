@@ -21,6 +21,7 @@ import re
 import sqlite3
 import threading
 import time
+import uuid
 from pathlib import Path
 from hermes_constants import get_hermes_home
 from typing import Any, Callable, Dict, List, Optional, TypeVar
@@ -117,6 +118,82 @@ CREATE TRIGGER IF NOT EXISTS messages_fts_update AFTER UPDATE ON messages BEGIN
     INSERT INTO messages_fts(rowid, content) VALUES (new.id, new.content);
 END;
 """
+
+ORG_TASK_LEDGER_SQL = """
+CREATE TABLE IF NOT EXISTS org_tasks (
+    id TEXT PRIMARY KEY,
+    source TEXT NOT NULL,
+    intent TEXT NOT NULL,
+    entities_json TEXT NOT NULL DEFAULT '{}',
+    evidence_json TEXT NOT NULL DEFAULT '{}',
+    owner TEXT,
+    status TEXT NOT NULL DEFAULT 'open',
+    next_action TEXT,
+    created_at REAL NOT NULL,
+    updated_at REAL NOT NULL,
+    completed_at REAL
+);
+
+CREATE TABLE IF NOT EXISTS org_events (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    task_id TEXT NOT NULL REFERENCES org_tasks(id) ON DELETE CASCADE,
+    event_type TEXT NOT NULL,
+    payload_json TEXT NOT NULL DEFAULT '{}',
+    created_at REAL NOT NULL
+);
+
+CREATE INDEX IF NOT EXISTS idx_org_tasks_status ON org_tasks(status);
+CREATE INDEX IF NOT EXISTS idx_org_tasks_owner ON org_tasks(owner);
+CREATE INDEX IF NOT EXISTS idx_org_tasks_source ON org_tasks(source);
+CREATE INDEX IF NOT EXISTS idx_org_tasks_updated ON org_tasks(updated_at DESC);
+CREATE INDEX IF NOT EXISTS idx_org_events_task ON org_events(task_id, created_at);
+"""
+
+VALID_ORG_TASK_STATUSES = {
+    "open",
+    "pending",
+    "in_progress",
+    "blocked",
+    "completed",
+    "cancelled",
+}
+
+ORG_TASK_STATUS_TRANSITIONS = {
+    "open": {
+        "open",
+        "pending",
+        "in_progress",
+        "blocked",
+        "cancelled",
+        "completed",
+    },
+    "pending": {
+        "open",
+        "pending",
+        "in_progress",
+        "blocked",
+        "cancelled",
+        "completed",
+    },
+    "in_progress": {
+        "in_progress",
+        "blocked",
+        "pending",
+        "cancelled",
+        "completed",
+    },
+    "blocked": {
+        "blocked",
+        "in_progress",
+        "pending",
+        "cancelled",
+        "completed",
+    },
+    "completed": {"completed"},
+    "cancelled": {"cancelled"},
+}
+
+_UNSET = object()
 
 
 class SessionDB:
@@ -261,6 +338,16 @@ class SessionDB:
         cursor = self._conn.cursor()
 
         cursor.executescript(SCHEMA_SQL)
+        try:
+            cursor.execute("BEGIN")
+            for statement in ORG_TASK_LEDGER_SQL.split(";"):
+                statement = statement.strip()
+                if statement:
+                    cursor.execute(statement)
+            cursor.execute("COMMIT")
+        except Exception:
+            cursor.execute("ROLLBACK")
+            raise
 
         # Check schema version and run migrations
         cursor.execute("SELECT version FROM schema_version LIMIT 1")
@@ -1477,6 +1564,438 @@ class SessionDB:
 
         return self._execute_write(_do)
 
+    # =========================================================================
+    # Org task ledger
+    # =========================================================================
+
+    @staticmethod
+    def _normalize_org_json(value: Any, field_name: str) -> str:
+        """Return canonical JSON text for org ledger JSON columns."""
+        if value is None:
+            return "{}"
+        if isinstance(value, str):
+            raw = value.strip()
+            if not raw:
+                return "{}"
+            try:
+                parsed = json.loads(raw)
+            except json.JSONDecodeError as exc:
+                raise ValueError(f"{field_name} must be valid JSON") from exc
+            return json.dumps(parsed, ensure_ascii=False, sort_keys=True)
+        try:
+            return json.dumps(value, ensure_ascii=False, sort_keys=True)
+        except (TypeError, ValueError) as exc:
+            raise ValueError(f"{field_name} must be JSON-serializable") from exc
+
+    @staticmethod
+    def _normalize_org_text(
+        value: Any,
+        field_name: str,
+        *,
+        required: bool = False,
+    ) -> Optional[str]:
+        if value is None:
+            if required:
+                raise ValueError(f"{field_name} is required")
+            return None
+        text = str(value).strip()
+        if not text:
+            if required:
+                raise ValueError(f"{field_name} is required")
+            return None
+        return text
+
+    @staticmethod
+    def _normalize_org_status(value: Any, default: str = "open") -> str:
+        if value is None:
+            return default
+        status = str(value).strip().lower()
+        if not status:
+            return default
+        if status not in VALID_ORG_TASK_STATUSES:
+            allowed = ", ".join(sorted(VALID_ORG_TASK_STATUSES))
+            raise ValueError(f"status must be one of: {allowed}")
+        return status
+
+    @staticmethod
+    def _validate_org_status_transition(
+        current_status: str,
+        requested_status: str,
+    ) -> None:
+        allowed = ORG_TASK_STATUS_TRANSITIONS.get(current_status, set())
+        if requested_status not in allowed:
+            raise ValueError(
+                "illegal org task status transition: "
+                f"current_status={current_status} "
+                f"requested_status={requested_status}"
+            )
+
+    @staticmethod
+    def _coerce_org_limit(limit: int, *, default: int, maximum: int) -> int:
+        try:
+            parsed = int(limit)
+        except (TypeError, ValueError):
+            parsed = default
+        return max(1, min(parsed, maximum))
+
+    @staticmethod
+    def _coerce_org_offset(offset: int) -> int:
+        try:
+            parsed = int(offset)
+        except (TypeError, ValueError):
+            parsed = 0
+        return max(0, parsed)
+
+    @staticmethod
+    def _escape_like(value: str) -> str:
+        return (
+            value
+            .replace("\\", "\\\\")
+            .replace("%", "\\%")
+            .replace("_", "\\_")
+        )
+
+    @staticmethod
+    def _insert_org_event(
+        conn: sqlite3.Connection,
+        task_id: str,
+        event_type: str,
+        payload: Dict[str, Any],
+        created_at: float,
+    ) -> None:
+        conn.execute(
+            """INSERT INTO org_events
+               (task_id, event_type, payload_json, created_at)
+               VALUES (?, ?, ?, ?)""",
+            (
+                task_id,
+                event_type,
+                json.dumps(payload, ensure_ascii=False, sort_keys=True),
+                created_at,
+            ),
+        )
+
+    def create_org_task(
+        self,
+        source: str,
+        intent: str,
+        *,
+        entities_json: Any = None,
+        evidence_json: Any = None,
+        owner: str = None,
+        status: str = "open",
+        next_action: str = None,
+        task_id: str = None,
+    ) -> Dict[str, Any]:
+        """Create a durable org task and its audit event."""
+        normalized_id = self._normalize_org_text(task_id, "task_id") or (
+            f"orgtask_{uuid.uuid4().hex}"
+        )
+        normalized_source = self._normalize_org_text(source, "source", required=True)
+        normalized_intent = self._normalize_org_text(intent, "intent", required=True)
+        normalized_entities = self._normalize_org_json(entities_json, "entities_json")
+        normalized_evidence = self._normalize_org_json(evidence_json, "evidence_json")
+        normalized_owner = self._normalize_org_text(owner, "owner")
+        normalized_status = self._normalize_org_status(status)
+        normalized_next_action = self._normalize_org_text(next_action, "next_action")
+        now = time.time()
+        completed_at = now if normalized_status == "completed" else None
+
+        def _do(conn):
+            conn.execute(
+                """INSERT INTO org_tasks
+                   (id, source, intent, entities_json, evidence_json, owner,
+                    status, next_action, created_at, updated_at, completed_at)
+                   VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
+                (
+                    normalized_id,
+                    normalized_source,
+                    normalized_intent,
+                    normalized_entities,
+                    normalized_evidence,
+                    normalized_owner,
+                    normalized_status,
+                    normalized_next_action,
+                    now,
+                    now,
+                    completed_at,
+                ),
+            )
+            self._insert_org_event(
+                conn,
+                normalized_id,
+                "created",
+                {
+                    "source": normalized_source,
+                    "intent": normalized_intent,
+                    "owner": normalized_owner,
+                    "status": normalized_status,
+                    "next_action": normalized_next_action,
+                },
+                now,
+            )
+            row = conn.execute(
+                "SELECT * FROM org_tasks WHERE id = ?", (normalized_id,)
+            ).fetchone()
+            return dict(row)
+
+        return self._execute_write(_do)
+
+    def get_org_task(self, task_id: str) -> Optional[Dict[str, Any]]:
+        """Fetch one org task by ID."""
+        with self._lock:
+            row = self._conn.execute(
+                "SELECT * FROM org_tasks WHERE id = ?", (task_id,)
+            ).fetchone()
+        return dict(row) if row else None
+
+    def list_org_tasks(
+        self,
+        *,
+        status: str = None,
+        owner: str = None,
+        source: str = None,
+        limit: int = 50,
+        offset: int = 0,
+    ) -> List[Dict[str, Any]]:
+        """List org tasks, optionally filtered by status, owner, or source."""
+        where_clauses = []
+        params: List[Any] = []
+        if status:
+            where_clauses.append("status = ?")
+            params.append(self._normalize_org_status(status))
+        if owner:
+            where_clauses.append("owner = ?")
+            params.append(str(owner).strip())
+        if source:
+            where_clauses.append("source = ?")
+            params.append(str(source).strip())
+
+        where_sql = f"WHERE {' AND '.join(where_clauses)}" if where_clauses else ""
+        params.extend([
+            self._coerce_org_limit(limit, default=50, maximum=500),
+            self._coerce_org_offset(offset),
+        ])
+
+        with self._lock:
+            cursor = self._conn.execute(
+                f"""SELECT * FROM org_tasks
+                    {where_sql}
+                    ORDER BY updated_at DESC, created_at DESC
+                    LIMIT ? OFFSET ?""",
+                params,
+            )
+            rows = cursor.fetchall()
+        return [dict(row) for row in rows]
+
+    def update_org_task(
+        self,
+        task_id: str,
+        *,
+        source: Any = _UNSET,
+        intent: Any = _UNSET,
+        entities_json: Any = _UNSET,
+        evidence_json: Any = _UNSET,
+        owner: Any = _UNSET,
+        status: Any = _UNSET,
+        next_action: Any = _UNSET,
+    ) -> Optional[Dict[str, Any]]:
+        """Partially update an org task and append an audit event."""
+        updates: Dict[str, Any] = {}
+        if source is not _UNSET:
+            updates["source"] = self._normalize_org_text(source, "source", required=True)
+        if intent is not _UNSET:
+            updates["intent"] = self._normalize_org_text(intent, "intent", required=True)
+        if entities_json is not _UNSET:
+            updates["entities_json"] = self._normalize_org_json(
+                entities_json, "entities_json"
+            )
+        if evidence_json is not _UNSET:
+            updates["evidence_json"] = self._normalize_org_json(
+                evidence_json, "evidence_json"
+            )
+        if owner is not _UNSET:
+            updates["owner"] = self._normalize_org_text(owner, "owner")
+        if status is not _UNSET:
+            updates["status"] = self._normalize_org_status(status)
+        if next_action is not _UNSET:
+            updates["next_action"] = self._normalize_org_text(
+                next_action, "next_action"
+            )
+
+        now = time.time()
+        if "status" in updates:
+            updates["completed_at"] = now if updates["status"] == "completed" else None
+        if not updates:
+            return self.get_org_task(task_id)
+        updates["updated_at"] = now
+
+        def _do(conn):
+            existing = conn.execute(
+                "SELECT id, status FROM org_tasks WHERE id = ?", (task_id,)
+            ).fetchone()
+            if not existing:
+                return None
+            current_status = existing["status"]
+            requested_status = updates.get("status", current_status)
+            self._validate_org_status_transition(current_status, requested_status)
+
+            assignments = ", ".join(f"{column} = ?" for column in updates)
+            conn.execute(
+                f"UPDATE org_tasks SET {assignments} WHERE id = ?",
+                [*updates.values(), task_id],
+            )
+            changed_fields = sorted(
+                column for column in updates if column != "updated_at"
+            )
+            if changed_fields:
+                self._insert_org_event(
+                    conn,
+                    task_id,
+                    "updated",
+                    {"fields": changed_fields},
+                    now,
+                )
+            row = conn.execute(
+                "SELECT * FROM org_tasks WHERE id = ?", (task_id,)
+            ).fetchone()
+            return dict(row)
+
+        return self._execute_write(_do)
+
+    def complete_org_task(
+        self,
+        task_id: str,
+        *,
+        next_action: Any = _UNSET,
+    ) -> Optional[Dict[str, Any]]:
+        """Mark an org task completed and append a completion event."""
+        updates: Dict[str, Any] = {
+            "status": "completed",
+            "completed_at": time.time(),
+        }
+        if next_action is not _UNSET:
+            updates["next_action"] = self._normalize_org_text(
+                next_action, "next_action"
+            )
+        now = updates["completed_at"]
+        updates["updated_at"] = now
+
+        def _do(conn):
+            existing = conn.execute(
+                "SELECT * FROM org_tasks WHERE id = ?", (task_id,)
+            ).fetchone()
+            if not existing:
+                return None
+            if existing["status"] == "completed":
+                return dict(existing)
+            self._validate_org_status_transition(existing["status"], "completed")
+
+            assignments = ", ".join(f"{column} = ?" for column in updates)
+            conn.execute(
+                f"UPDATE org_tasks SET {assignments} WHERE id = ?",
+                [*updates.values(), task_id],
+            )
+            self._insert_org_event(
+                conn,
+                task_id,
+                "completed",
+                {
+                    "status": "completed",
+                    "next_action": updates.get("next_action"),
+                },
+                now,
+            )
+            row = conn.execute(
+                "SELECT * FROM org_tasks WHERE id = ?", (task_id,)
+            ).fetchone()
+            return dict(row)
+
+        return self._execute_write(_do)
+
+    def search_org_tasks(
+        self,
+        query: str,
+        *,
+        status: str = None,
+        owner: str = None,
+        limit: int = 20,
+        offset: int = 0,
+    ) -> List[Dict[str, Any]]:
+        """Search org tasks across intent, source, owner, action, and JSON fields."""
+        text = self._normalize_org_text(query, "query")
+        if not text:
+            return []
+
+        pattern = f"%{self._escape_like(text)}%"
+        searchable_columns = [
+            "id",
+            "source",
+            "intent",
+            "entities_json",
+            "evidence_json",
+            "owner",
+            "status",
+            "next_action",
+        ]
+        where_clauses = [
+            "("
+            + " OR ".join(
+                f"{column} LIKE ? ESCAPE '\\'" for column in searchable_columns
+            )
+            + ")"
+        ]
+        params: List[Any] = [pattern for _ in searchable_columns]
+        if status:
+            where_clauses.append("status = ?")
+            params.append(self._normalize_org_status(status))
+        if owner:
+            where_clauses.append("owner = ?")
+            params.append(str(owner).strip())
+
+        params.extend([
+            self._coerce_org_limit(limit, default=20, maximum=200),
+            self._coerce_org_offset(offset),
+        ])
+        with self._lock:
+            cursor = self._conn.execute(
+                f"""SELECT * FROM org_tasks
+                    WHERE {' AND '.join(where_clauses)}
+                    ORDER BY updated_at DESC, created_at DESC
+                    LIMIT ? OFFSET ?""",
+                params,
+            )
+            rows = cursor.fetchall()
+        return [dict(row) for row in rows]
+
+    def list_org_events(
+        self,
+        *,
+        task_id: str = None,
+        limit: int = 50,
+        offset: int = 0,
+    ) -> List[Dict[str, Any]]:
+        """List org task audit events."""
+        params: List[Any] = []
+        where_sql = ""
+        if task_id:
+            where_sql = "WHERE task_id = ?"
+            params.append(task_id)
+        params.extend([
+            self._coerce_org_limit(limit, default=50, maximum=500),
+            self._coerce_org_offset(offset),
+        ])
+        with self._lock:
+            cursor = self._conn.execute(
+                f"""SELECT * FROM org_events
+                    {where_sql}
+                    ORDER BY created_at ASC, id ASC
+                    LIMIT ? OFFSET ?""",
+                params,
+            )
+            rows = cursor.fetchall()
+        return [dict(row) for row in rows]
+
     # ── Meta key/value (for scheduler bookkeeping) ──
 
     def get_meta(self, key: str) -> Optional[str]:
@@ -1588,4 +2107,3 @@ class SessionDB:
             result["error"] = str(exc)
 
         return result
-
