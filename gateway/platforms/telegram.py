@@ -784,8 +784,6 @@ class TelegramAdapter(BasePlatformAdapter):
                         await asyncio.sleep(wait)
                     else:
                         raise
-            await self._app.start()
-
             # Decide between webhook and polling mode
             webhook_url = os.getenv("TELEGRAM_WEBHOOK_URL", "").strip()
 
@@ -803,6 +801,8 @@ class TelegramAdapter(BasePlatformAdapter):
                 # See GHSA-3vpc-7q5r-276h.
                 webhook_port = int(os.getenv("TELEGRAM_WEBHOOK_PORT", "8443"))
                 webhook_secret = os.getenv("TELEGRAM_WEBHOOK_SECRET", "").strip()
+                webhook_bootstrap_retries = int(os.getenv("TELEGRAM_WEBHOOK_BOOTSTRAP_RETRIES", "30"))
+                webhook_ip_address = os.getenv("TELEGRAM_WEBHOOK_IP_ADDRESS", "").strip() or None
                 if not webhook_secret:
                     raise RuntimeError(
                         "TELEGRAM_WEBHOOK_SECRET is required when "
@@ -827,6 +827,8 @@ class TelegramAdapter(BasePlatformAdapter):
                     secret_token=webhook_secret,
                     allowed_updates=Update.ALL_TYPES,
                     drop_pending_updates=True,
+                    bootstrap_retries=webhook_bootstrap_retries,
+                    ip_address=webhook_ip_address,
                 )
                 self._webhook_mode = True
                 logger.info(
@@ -862,6 +864,13 @@ class TelegramAdapter(BasePlatformAdapter):
                     drop_pending_updates=True,
                     error_callback=_polling_error_callback,
                 )
+
+            # Match python-telegram-bot's run_polling/run_webhook lifecycle:
+            # initialize -> start update transport -> start application
+            # processing. Starting the application first can leave polling
+            # recovery paths racing an already-running updater.
+            if not self._app.running:
+                await self._app.start()
             
             # Register bot commands so Telegram shows a hint menu when users type /
             # List is derived from the central COMMAND_REGISTRY — adding a new

@@ -340,6 +340,55 @@ def test_build_hermes_direct_answer_for_finish_it_probe():
     assert "operator mode" in result
 
 
+def test_build_hermes_direct_answer_for_quality_score(monkeypatch, tmp_path):
+    import gateway.run as gateway_run
+
+    reports_dir = tmp_path / "canary" / "reports"
+    reports_dir.mkdir(parents=True)
+    (reports_dir / "latest.json").write_text(
+        json.dumps(
+            {
+                "status": "warn",
+                "score": 190.0,
+                "effective_max_score": 210.0,
+                "percent": 90.48,
+                "overall_quality": {"score": 8.5},
+                "readiness": {
+                    "status": "not_frontier_ready",
+                    "passed": 6,
+                    "total": 10,
+                    "open_gates": [
+                        {"name": "local_model_reasoning"},
+                        {"name": "hermes_reasoning_eval"},
+                        {"name": "frontier_wrapper"},
+                        {"name": "telegram_e2e"},
+                    ],
+                },
+                "results": [
+                    {
+                        "name": "live.telegram_e2e",
+                        "status": "warn",
+                        "summary": "No live Telegram E2E latency/restart evidence",
+                    }
+                ],
+            }
+        ),
+        encoding="utf-8",
+    )
+    monkeypatch.setattr(gateway_run, "_hermes_home", tmp_path)
+
+    result = gateway_run._build_hermes_direct_answer(
+        "Score your quality score we measure your performance by"
+    )
+
+    assert result.startswith("Latest Hermes metrics: WARN.")
+    assert "Frontier readiness: NOT_FRONTIER_READY (6/10 gates passed)." in result
+    assert "Open gates: local_model_reasoning, hermes_reasoning_eval, frontier_wrapper, telegram_e2e" in result
+    assert "Telegram E2E gate: WARN" in result
+    assert "no single quality score claim" in result
+    assert str(reports_dir / "latest.json") in result
+
+
 def test_build_hermes_direct_answer_for_social_link_only():
     import gateway.run as gateway_run
 

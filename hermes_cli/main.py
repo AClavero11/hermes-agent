@@ -11,6 +11,7 @@ Usage:
     hermes gateway status      # Show gateway status
     hermes gateway install     # Install gateway service
     hermes gateway uninstall   # Uninstall gateway service
+    hermes runtime status      # Show active runtime repo/model/health resolver
     hermes setup               # Interactive setup wizard
     hermes logout              # Clear stored authentication
     hermes status              # Show status of all components
@@ -1191,6 +1192,20 @@ def cmd_gateway(args):
     from hermes_cli.gateway import gateway_command
 
     gateway_command(args)
+
+
+def cmd_canary(args):
+    """Run Hermes canary/product-eval metrics."""
+    from hermes_cli.canary import cmd_canary as _cmd_canary
+
+    _cmd_canary(args)
+
+
+def cmd_runtime(args):
+    """Show runtime path/model/health resolver."""
+    from hermes_cli.runtime_status import cmd_runtime as _cmd_runtime
+
+    _cmd_runtime(args)
 
 
 def cmd_whatsapp(args):
@@ -7092,6 +7107,160 @@ For more help on a command:
     )
 
     gateway_parser.set_defaults(func=cmd_gateway)
+
+    # =========================================================================
+    # canary command
+    # =========================================================================
+    canary_parser = subparsers.add_parser(
+        "canary",
+        aliases=["eval"],
+        help="Run Hermes canary/product-eval metrics",
+        description="Run read-only Hermes canary checks and write JSON/Markdown metrics reports.",
+    )
+    canary_parser.add_argument(
+        "--gateway-url",
+        default=os.getenv("HERMES_CANARY_GATEWAY_URL", "http://127.0.0.1:8642"),
+        help="Gateway base URL for live health checks",
+    )
+    canary_parser.add_argument(
+        "--env-wrapper",
+        type=Path,
+        default=None,
+        help="Path to hermes-env.sh for runtime model selection checks",
+    )
+    canary_parser.add_argument("--repo-root", type=Path, default=PROJECT_ROOT)
+    canary_parser.add_argument(
+        "--hermes-home",
+        type=Path,
+        default=get_hermes_home(),
+        help="Hermes home used for report output",
+    )
+    canary_parser.add_argument(
+        "--output-dir",
+        type=Path,
+        default=None,
+        help="Directory for JSON and Markdown metrics reports",
+    )
+    canary_parser.add_argument(
+        "--require-live",
+        action="store_true",
+        help="Fail if live HTTP/network canaries are unavailable",
+    )
+    canary_parser.add_argument(
+        "--live-behavior",
+        action="store_true",
+        help="Run live /v1/responses behavior goldens using the API key",
+    )
+    canary_parser.add_argument(
+        "--reasoning-eval",
+        action="store_true",
+        help="Run deterministic reasoning/guardrail evals against direct DeepSeek and full Hermes paths",
+    )
+    canary_parser.add_argument(
+        "--frontier-eval",
+        action="store_true",
+        help="Run frontier wrapper probe with structured reasoning controls",
+    )
+    canary_parser.add_argument(
+        "--frontier-model",
+        default=os.getenv("OPENAI_FRONTIER_MODEL", os.getenv("HERMES_FRONTIER_MODEL", "gpt-5.5")),
+        help="OpenAI frontier model for --frontier-eval",
+    )
+    canary_parser.add_argument(
+        "--frontier-base-url",
+        default=os.getenv("HERMES_FRONTIER_BASE_URL", "https://api.openai.com/v1"),
+        help="OpenAI-compatible base URL for --frontier-eval",
+    )
+    canary_parser.add_argument(
+        "--frontier-api-key",
+        default=os.getenv("HERMES_FRONTIER_API_KEY", os.getenv("OPENAI_API_KEY", "")),
+        help="OpenAI-compatible API key for --frontier-eval; Gemini uses GEMINI_API_KEY/GOOGLE_API_KEY",
+    )
+    canary_parser.add_argument(
+        "--api-key",
+        default=os.getenv("HERMES_CANARY_API_KEY", ""),
+        help="API key for live /v1/responses canaries",
+    )
+    canary_parser.add_argument("--timeout", type=float, default=8.0)
+    canary_parser.add_argument(
+        "--fail-under",
+        type=float,
+        default=80.0,
+        help="Minimum score percentage for zero exit",
+    )
+    canary_parser.add_argument(
+        "--x-url",
+        action="append",
+        default=[],
+        help="Optional live X/Twitter URL canary; repeatable",
+    )
+    canary_parser.add_argument(
+        "--json",
+        action="store_true",
+        dest="json_output",
+        help="Print the metrics JSON to stdout",
+    )
+    canary_parser.set_defaults(func=cmd_canary)
+
+    # =========================================================================
+    # runtime command
+    # =========================================================================
+    runtime_parser = subparsers.add_parser(
+        "runtime",
+        help="Show active runtime repo, model route, health URL, and git SHA",
+        description=(
+            "Resolve the active Hermes launchd path, wrapper-selected repo, "
+            "Python path, model route, health URL, and git SHA."
+        ),
+    )
+
+    def _add_runtime_status_args(target_parser):
+        target_parser.add_argument(
+            "--env-wrapper",
+            type=Path,
+            default=None,
+            help="Path to hermes-env.sh for wrapper-selected runtime checks",
+        )
+        target_parser.add_argument(
+            "--health-url",
+            default=os.getenv(
+                "HERMES_RUNTIME_HEALTH_URL",
+                os.getenv("HERMES_CANARY_GATEWAY_URL", "http://127.0.0.1:8643"),
+            ),
+            help="Gateway health URL or base URL",
+        )
+        target_parser.add_argument(
+            "--launchd-label",
+            default=os.getenv(
+                "HERMES_RUNTIME_LAUNCHD_LABEL",
+                "ai.hermes.deepseek-gateway",
+            ),
+            help="launchd label to inspect",
+        )
+        target_parser.add_argument("--repo-root", type=Path, default=PROJECT_ROOT)
+        target_parser.add_argument(
+            "--hermes-home",
+            type=Path,
+            default=get_hermes_home(),
+            help="Hermes home used for gateway state discovery",
+        )
+        target_parser.add_argument("--timeout", type=float, default=4.0)
+        target_parser.add_argument(
+            "--json",
+            action="store_true",
+            dest="json_output",
+            help="Print runtime status JSON",
+        )
+
+    _add_runtime_status_args(runtime_parser)
+    runtime_subparsers = runtime_parser.add_subparsers(dest="runtime_command")
+    runtime_status_parser = runtime_subparsers.add_parser(
+        "status",
+        help="Show active runtime resolver",
+    )
+    _add_runtime_status_args(runtime_status_parser)
+    runtime_parser.set_defaults(func=cmd_runtime, runtime_command="status")
+    runtime_status_parser.set_defaults(func=cmd_runtime, runtime_command="status")
 
     # =========================================================================
     # setup command

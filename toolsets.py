@@ -30,7 +30,7 @@ from typing import List, Dict, Any, Set, Optional
 # Edit this once to update all platforms simultaneously.
 _HERMES_CORE_TOOLS = [
     # Web
-    "web_search", "web_extract",
+    "web_search", "web_extract", "x_scrape",
     # Terminal + process management
     "terminal", "process",
     # File manipulation
@@ -46,8 +46,8 @@ _HERMES_CORE_TOOLS = [
     "browser_vision", "browser_console", "browser_cdp",
     # Text-to-speech
     "text_to_speech",
-    # Planning & memory
-    "todo", "memory",
+    # Planning, workspace, and memory
+    "todo", "workspace", "memory",
     # Session history search
     "session_search",
     # Clarifying questions
@@ -69,7 +69,7 @@ TOOLSETS = {
     # Basic toolsets - individual tool categories
     "web": {
         "description": "Web research and content extraction tools",
-        "tools": ["web_search", "web_extract"],
+        "tools": ["web_search", "web_extract", "x_scrape"],
         "includes": []  # No other toolsets included
     },
     
@@ -161,6 +161,12 @@ TOOLSETS = {
         "tools": ["todo"],
         "includes": []
     },
+
+    "workspace": {
+        "description": "Durable Workspace control plane for cross-session tasks, evidence, inbox captures, and reports",
+        "tools": ["workspace"],
+        "includes": []
+    },
     
     "memory": {
         "description": "Persistent memory across sessions (personal notes + user profile)",
@@ -250,7 +256,7 @@ TOOLSETS = {
             "browser_type", "browser_scroll", "browser_back",
             "browser_press", "browser_get_images",
             "browser_vision", "browser_console", "browser_cdp",
-            "todo", "memory",
+            "todo", "workspace", "memory",
             "session_search",
             "execute_code", "delegate_task",
         ],
@@ -276,7 +282,7 @@ TOOLSETS = {
             "browser_press", "browser_get_images",
             "browser_vision", "browser_console", "browser_cdp",
             # Planning & memory
-            "todo", "memory",
+            "todo", "workspace", "memory",
             # Session history search
             "session_search",
             # Code execution + delegation

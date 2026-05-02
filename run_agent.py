@@ -38,13 +38,16 @@ import time
 import threading
 from types import SimpleNamespace
 import uuid
-from typing import List, Dict, Any, Optional
+from typing import List, Dict, Any, Optional, TYPE_CHECKING
 from openai import OpenAI
 import fire
 from datetime import datetime
 from pathlib import Path
 
 from hermes_constants import get_hermes_home
+
+if TYPE_CHECKING:
+    from agent.rate_limit_tracker import RateLimitState
 
 # Load .env from ~/.hermes/.env first, then project root as dev fallback.
 # User-managed env files should override stale shell exports on restart.
@@ -83,6 +86,7 @@ from agent.retry_utils import jittered_backoff
 from agent.error_classifier import classify_api_error, FailoverReason
 from agent.prompt_builder import (
     DEFAULT_AGENT_IDENTITY, PLATFORM_HINTS,
+    DETERMINISTIC_OUTPUT_GUIDANCE, OPERATOR_SAFETY_GUIDANCE,
     MEMORY_GUIDANCE, SESSION_SEARCH_GUIDANCE, SKILLS_GUIDANCE,
     build_nous_subscription_prompt,
 )
@@ -4450,6 +4454,9 @@ class AIAgent:
         if not _soul_loaded:
             # Fallback to hardcoded identity
             prompt_parts = [DEFAULT_AGENT_IDENTITY]
+
+        prompt_parts.append(DETERMINISTIC_OUTPUT_GUIDANCE)
+        prompt_parts.append(OPERATOR_SAFETY_GUIDANCE)
 
         # Tool-aware behavioral guidance: only inject when the tools are loaded
         tool_guidance = []

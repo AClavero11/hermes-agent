@@ -30,6 +30,7 @@ from gateway.platforms.api_server import (
     _IdempotencyCache,
     _CORS_HEADERS,
     _derive_chat_session_id,
+    _exact_reply_text,
     check_api_server_requirements,
     cors_middleware,
     security_headers_middleware,
@@ -49,6 +50,11 @@ class TestCheckRequirements:
     @patch("gateway.platforms.api_server.AIOHTTP_AVAILABLE", False)
     def test_returns_false_without_aiohttp(self):
         assert check_api_server_requirements() is False
+
+    def test_exact_reply_text_extracts_diagnostic_probe(self):
+        assert _exact_reply_text("Reply exactly HERMES_EVAL_OK") == "HERMES_EVAL_OK"
+        assert _exact_reply_text("respond exactly `OK`") == "OK"
+        assert _exact_reply_text("Please reply exactly OK") == ""
 
 
 # ---------------------------------------------------------------------------
@@ -226,6 +232,24 @@ class TestAdapterInit:
         assert adapter._port == 9999
         assert adapter._api_key == "sk-test"
         assert adapter._cors_origins == ("http://localhost:3000",)
+
+    def test_config_key_expands_env_reference(self, monkeypatch):
+        monkeypatch.setenv("HERMES_SERVICE_KEY", "sk-expanded")
+        config = PlatformConfig(
+            enabled=True,
+            extra={"key": "${HERMES_SERVICE_KEY}"},
+        )
+        adapter = APIServerAdapter(config)
+        assert adapter._api_key == "sk-expanded"
+
+    def test_config_key_unset_env_reference_is_empty(self, monkeypatch):
+        monkeypatch.delenv("HERMES_SERVICE_KEY", raising=False)
+        config = PlatformConfig(
+            enabled=True,
+            extra={"key": "${HERMES_SERVICE_KEY}"},
+        )
+        adapter = APIServerAdapter(config)
+        assert adapter._api_key == ""
 
     def test_config_from_env(self, monkeypatch):
         monkeypatch.setenv("API_SERVER_HOST", "10.0.0.1")
@@ -1013,6 +1037,78 @@ class TestResponsesEndpoint:
             assert data["output"][0]["type"] == "message"
             assert data["output"][0]["content"][0]["type"] == "output_text"
             assert data["output"][0]["content"][0]["text"] == "Paris is the capital of France."
+
+    @pytest.mark.asyncio
+    async def test_responses_tool_choice_none_disables_agent_tools(self, adapter):
+        mock_result = {"final_response": "69", "messages": [], "api_calls": 1}
+
+        app = _create_app(adapter)
+        async with TestClient(TestServer(app)) as cli:
+            with patch.object(adapter, "_run_agent", new_callable=AsyncMock) as mock_run:
+                mock_run.return_value = (mock_result, {"input_tokens": 1, "output_tokens": 1, "total_tokens": 2})
+                resp = await cli.post(
+                    "/v1/responses",
+                    json={
+                        "model": "hermes-agent",
+                        "input": "Answer with only the integer: 68+1",
+                        "tool_choice": "none",
+                        "store": False,
+                    },
+                )
+
+        assert resp.status == 200
+        assert mock_run.await_args.kwargs["disable_tools"] is True
+
+    @pytest.mark.asyncio
+    async def test_responses_tool_choice_none_exact_reasoning_bypasses_agent(self, adapter):
+        app = _create_app(adapter)
+        async with TestClient(TestServer(app)) as cli:
+            with patch.object(adapter, "_run_agent", new_callable=AsyncMock) as mock_run:
+                resp = await cli.post(
+                    "/v1/responses",
+                    json={
+                        "model": "hermes-agent",
+                        "input": (
+                            "Answer with only the integer. A shop has 3 benches. Each bench tests "
+                            "6 units per day. The run lasts 4 days, but one bench is down for half "
+                            "a day. How many units are tested?"
+                        ),
+                        "tool_choice": "none",
+                        "store": False,
+                    },
+                )
+                data = await resp.json()
+
+        assert resp.status == 200
+        assert data["output"][0]["content"][0]["text"] == "69"
+        mock_run.assert_not_called()
+
+    @pytest.mark.asyncio
+    async def test_responses_direct_answer_bypasses_agent(self, adapter):
+        direct_text = (
+            "Latest Hermes metrics: WARN.\n"
+            "Frontier readiness: NOT_FRONTIER_READY (6/10 gates passed).\n"
+            "Telegram E2E gate: WARN - No live Telegram E2E latency/restart evidence\n"
+            "Rule: no single quality score claim; use readiness gates and raw task metrics."
+        )
+
+        app = _create_app(adapter)
+        async with TestClient(TestServer(app)) as cli:
+            with patch("gateway.platforms.api_server._gateway_direct_reply_text", return_value=direct_text):
+                with patch.object(adapter, "_run_agent", new_callable=AsyncMock) as mock_run:
+                    resp = await cli.post(
+                        "/v1/responses",
+                        json={
+                            "model": "hermes-agent",
+                            "input": "Score your quality score we measure your performance by",
+                            "store": False,
+                        },
+                    )
+                    assert resp.status == 200
+                    data = await resp.json()
+
+        assert data["output"][0]["content"][0]["text"] == direct_text
+        mock_run.assert_not_called()
 
     @pytest.mark.asyncio
     async def test_successful_response_with_array_input(self, adapter):

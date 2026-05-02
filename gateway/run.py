@@ -527,6 +527,8 @@ _HERMES_STATUS_TERMS = (
     "status 1-100",
     "1-100",
     "score",
+    "quality",
+    "performance",
     "100/100",
     "self heal",
     "self-heal",
@@ -534,6 +536,16 @@ _HERMES_STATUS_TERMS = (
     "full functioning",
     "elite",
     "unleashed",
+)
+
+_HERMES_QUALITY_SCORE_TERMS = (
+    "quality score",
+    "score your quality",
+    "measure your performance",
+    "performance score",
+    "overall hermes score",
+    "hermes score",
+    "how do you score",
 )
 
 _HERMES_SELF_UPGRADE_TERMS = (
@@ -550,10 +562,52 @@ _HERMES_SELF_UPGRADE_TERMS = (
     "100/100",
 )
 
+_HARD_TASK_TERMS = (
+    "architecture",
+    "architect",
+    "debug",
+    "diagnose",
+    "root cause",
+    "migration",
+    "production",
+    "deploy",
+    "quote",
+    "rfq",
+    "v11",
+    "pricing",
+    "strategy",
+    "hard task",
+    "complex",
+)
+
+_HIGH_RISK_TERMS = (
+    "customer",
+    "external",
+    "finance",
+    "payment",
+    "production",
+    "quote",
+    "rfq",
+    "restart",
+    "deploy",
+    "migration",
+)
+
 _X_URL_RE = re.compile(
     r"https?://(?:(?:www|mobile)\.)?(?:x\.com|twitter\.com|fxtwitter\.com|vxtwitter\.com|t\.co)/\S+",
     re.IGNORECASE,
 )
+
+
+def _int_env(name: str, default: int, minimum: int = 1) -> int:
+    try:
+        return max(minimum, int(os.getenv(name, str(default))))
+    except ValueError:
+        return default
+
+
+_X_CONTEXT_MAX_URLS = _int_env("HERMES_MAX_X_URLS_PER_MESSAGE", 12)
+_X_CONTEXT_CHAR_LIMIT = _int_env("HERMES_X_CONTEXT_CHAR_LIMIT", 16000, minimum=1000)
 
 
 def _message_is_social_link_only(message: str) -> bool:
@@ -584,11 +638,12 @@ def _build_x_link_context_prompt(message: str) -> str:
     urls = _extract_x_urls(message)
     if not urls:
         return ""
+    selected_urls = urls[:_X_CONTEXT_MAX_URLS]
 
     try:
         from tools.x_scraper_tool import x_scrape_tool
 
-        raw = x_scrape_tool(urls[:3])
+        raw = x_scrape_tool(selected_urls)
     except Exception as exc:
         raw = json.dumps({"error": f"x_scrape failed: {type(exc).__name__}: {exc}"})
 
@@ -607,15 +662,19 @@ def _build_x_link_context_prompt(message: str) -> str:
         content = str(data).strip()
 
     if content:
-        fetched = _truncate_context_text(content, 5000)
+        fetched = _truncate_context_text(content, _X_CONTEXT_CHAR_LIMIT)
     else:
         fetched = f"Fetch attempted but returned no content. Actual error: {error or 'unknown'}"
+
+    omitted = len(urls) - len(selected_urls)
+    omitted_note = f"\nOmitted URLs over cap: {omitted}\n" if omitted > 0 else ""
 
     return (
         "[Fetched X/Twitter context]\n"
         f"Source tool: {source}\n"
         "URLs:\n"
-        + "\n".join(f"- {url}" for url in urls[:3])
+        + "\n".join(f"- {url}" for url in selected_urls)
+        + omitted_note
         + "\n\n"
         + fetched
         + "\n\n"
@@ -633,6 +692,59 @@ def _truncate_context_text(text: str, max_chars: int) -> str:
 
 def _read_alexandria_source_snippets(rel_paths: List[str], max_chars: int = 9000) -> str:
     return alexandria_router.read_alexandria_source_snippets(rel_paths, max_chars=max_chars)
+
+
+def _read_latest_canary_scorecard() -> dict[str, Any]:
+    report_path = _hermes_home / "canary" / "reports" / "latest.json"
+    try:
+        payload = json.loads(report_path.read_text(encoding="utf-8"))
+    except (OSError, json.JSONDecodeError):
+        return {"path": str(report_path), "found": False}
+    if not isinstance(payload, dict):
+        return {"path": str(report_path), "found": False}
+
+    quality = payload.get("overall_quality", {})
+    if not isinstance(quality, dict):
+        quality = {}
+    readiness = payload.get("readiness", {})
+    if not isinstance(readiness, dict):
+        readiness = {}
+    telegram_result: dict[str, Any] = {}
+    for result in payload.get("results") or []:
+        if isinstance(result, dict) and result.get("name") == "live.telegram_e2e":
+            telegram_result = result
+            break
+
+    return {
+        "path": str(report_path),
+        "found": True,
+        "status": str(payload.get("status") or "unknown"),
+        "points": payload.get("score"),
+        "max_points": payload.get("effective_max_score"),
+        "percent": payload.get("percent"),
+        "score": quality.get("score"),
+        "readiness_status": str(readiness.get("status") or "unknown"),
+        "readiness_passed": readiness.get("passed"),
+        "readiness_total": readiness.get("total"),
+        "open_gates": [
+            str(gate.get("name"))
+            for gate in readiness.get("open_gates", [])
+            if isinstance(gate, dict) and gate.get("name")
+        ],
+        "telegram_status": str(telegram_result.get("status") or "missing"),
+        "telegram_summary": str(
+            telegram_result.get("summary")
+            or "No live Telegram E2E canary evidence in latest metrics report"
+        ),
+    }
+
+
+def _asks_hermes_quality_score(lowered: str, normalized: str) -> bool:
+    if any(term in lowered for term in _HERMES_QUALITY_SCORE_TERMS):
+        return True
+    if "score" in lowered and any(term in lowered for term in ("quality", "performance")):
+        return True
+    return "scoreyourquality" in normalized or "measureyourperformance" in normalized
 
 
 def _build_sonnet_era_continuity_prompt(message: str) -> str:
@@ -665,6 +777,40 @@ def _build_sonnet_era_continuity_prompt(message: str) -> str:
     )
 
 
+def _build_hard_task_planner_prompt(message: str) -> str:
+    """Return a hard-task routing note for complex or high-risk operator turns."""
+    text = (message or "").strip()
+    if not text or text.startswith("/"):
+        return ""
+    lowered = text.lower()
+    if "reply exactly" in lowered or "respond exactly" in lowered:
+        return ""
+
+    without_urls = alexandria_router.strip_urls_for_routing(text).strip()
+    if not without_urls:
+        return ""
+    hard_signal = any(term in lowered for term in _HARD_TASK_TERMS)
+    risk_signal = any(term in lowered for term in _HIGH_RISK_TERMS)
+    long_turn = len(without_urls) >= 280
+    multi_step = len(re.findall(r"\b(?:and|then|also|after|before|because)\b", lowered)) >= 2
+    if not (hard_signal and (risk_signal or long_turn or multi_step)):
+        return ""
+
+    return (
+        "[System note: Hard task planner route]\n"
+        "This turn has hard-task or high-risk signals. Treat `custom:office-deepseek-v4` "
+        "as the active local planner and `model_aliases.frontier` as the stronger planner "
+        "route when the runtime reports frontier availability. Use the stronger route for "
+        "architecture decisions, root-cause debugging, production changes, quote/RFQ work, "
+        "and finance/customer-facing decisions when available; otherwise keep the task "
+        "bounded under the active planner and compensate with retrieval, explicit checks, "
+        "and canary verification. Follow `docs/HERMES_SELF_HEAL_PLAYBOOKS.md` if a gateway, "
+        "model, API, Telegram, or canary regression appears. Destructive commands and "
+        "external sends remain approval-gated.\n"
+        "[End hard task planner route]"
+    )
+
+
 def _read_hermes_release_context_snippet(message: str, max_chars: int = 5000) -> str:
     return alexandria_router.read_hermes_release_context_snippet(message, max_chars=max_chars)
 
@@ -689,6 +835,45 @@ def _build_hermes_direct_answer(message: str) -> str:
             "- `~/alexandria/_system/handoffs/2026-04-25-hermes-deepseek-openai-telegram.md`\n"
             "- `~/alexandria/advanced/czar/CONTEXT.md`\n\n"
             "AC Telegram DM is operator mode now. Say the concrete target and Hermes can use file/terminal/code/delegation with approval gates for destructive or external actions."
+        )
+    if _asks_hermes_quality_score(lowered, normalized):
+        scorecard = _read_latest_canary_scorecard()
+        if not scorecard.get("found"):
+            return (
+                "No local Hermes metrics report was found yet.\n\n"
+                "Measured metrics: unknown.\n"
+                "Rule: no frontier-ready claim until the metrics harness exists and all readiness gates pass.\n"
+                f"Expected source: `{scorecard.get('path')}`"
+            )
+        status = str(scorecard.get("status") or "unknown").upper()
+        points = scorecard.get("points")
+        max_points = scorecard.get("max_points")
+        percent = scorecard.get("percent")
+        if isinstance(points, (int, float)) and isinstance(max_points, (int, float)):
+            points_line = f"Canary points: {float(points):.1f}/{float(max_points):.1f}"
+            if isinstance(percent, (int, float)):
+                points_line += f" ({float(percent):.1f}%)"
+        else:
+            points_line = "Canary points: unknown"
+        telegram_status = str(scorecard.get("telegram_status") or "missing").upper()
+        telegram_summary = str(scorecard.get("telegram_summary") or "")
+        readiness_status = str(scorecard.get("readiness_status") or "unknown").upper()
+        passed = scorecard.get("readiness_passed")
+        total = scorecard.get("readiness_total")
+        if isinstance(passed, int) and isinstance(total, int) and total:
+            readiness_line = f"Frontier readiness: {readiness_status} ({passed}/{total} gates passed)."
+        else:
+            readiness_line = f"Frontier readiness: {readiness_status}."
+        open_gates = scorecard.get("open_gates") or []
+        open_gate_line = "Open gates: " + ", ".join(open_gates[:8]) if open_gates else "Open gates: none reported"
+        return (
+            f"Latest Hermes metrics: {status}.\n"
+            f"{points_line}.\n"
+            f"{readiness_line}\n"
+            f"{open_gate_line}\n"
+            f"Telegram E2E gate: {telegram_status} - {telegram_summary}\n"
+            "Rule: no single quality score claim; use readiness gates and raw task metrics.\n"
+            f"Source: `{scorecard.get('path')}`"
         )
     mentions_alexandria = "alexandria" in lowered
     mentions_hermes = "hermes" in lowered or "nous" in lowered
@@ -873,6 +1058,7 @@ class GatewayRunner:
     _restart_via_service: bool = False
     _stop_task: Optional[asyncio.Task] = None
     _session_model_overrides: Dict[str, Dict[str, str]] = {}
+    _goal_continuation_inflight: set[str] = set()
     
     def __init__(self, config: Optional[GatewayConfig] = None):
         self.config = config or load_gateway_config()
@@ -918,6 +1104,7 @@ class GatewayRunner:
         self._pending_messages: Dict[str, str] = {}  # Queued messages during interrupt
         self._busy_ack_ts: Dict[str, float] = {}  # last busy-ack timestamp per session (debounce)
         self._session_run_generation: Dict[str, int] = {}
+        self._goal_continuation_inflight: set[str] = set()
 
         # Cache AIAgent instances per session to preserve prompt caching.
         # Without this, a new AIAgent is created per message, rebuilding the
@@ -3385,6 +3572,588 @@ class GatewayRunner:
             return "ignore"
 
         return "pair"
+
+    def _goal_max_turns(self) -> int:
+        raw = os.getenv("HERMES_GOAL_MAX_TURNS", "").strip()
+        if not raw:
+            try:
+                extra = getattr(self.config, "extra", {}) or {}
+                goals_cfg = extra.get("goals") or extra.get("goal") or {}
+                if isinstance(goals_cfg, dict):
+                    raw = str(goals_cfg.get("max_turns") or "").strip()
+            except Exception:
+                raw = ""
+        try:
+            turns = int(raw) if raw else 20
+        except ValueError:
+            turns = 20
+        return max(1, min(turns, 100))
+
+    def _goal_manager_for_session_key(self, session_key: str):
+        from hermes_cli.goals import GoalManager
+
+        return GoalManager(session_key, default_max_turns=self._goal_max_turns())
+
+    def _goal_manager_for_event(self, event: MessageEvent):
+        return self._goal_manager_for_session_key(self._session_key_for_source(event.source))
+
+    def _schedule_goal_prompt(
+        self,
+        event: MessageEvent,
+        session_key: str,
+        prompt: str,
+        *,
+        delay_seconds: float = 0.75,
+    ) -> bool:
+        if not session_key or not prompt:
+            return False
+        if session_key in self._goal_continuation_inflight:
+            logger.debug("Goal continuation already scheduled for %s", session_key[:20])
+            return False
+
+        self._goal_continuation_inflight.add(session_key)
+
+        async def _deliver_goal_prompt() -> None:
+            try:
+                source = event.source
+                for attempt in range(6):
+                    await asyncio.sleep(delay_seconds if attempt == 0 else 3.0)
+                    adapter = self.adapters.get(source.platform)
+                    if not adapter:
+                        logger.debug("No adapter available for goal continuation on %s", source.platform)
+                        return
+                    active_sessions = getattr(adapter, "_active_sessions", {}) or {}
+                    pending_messages = getattr(adapter, "_pending_messages", {}) or {}
+                    if (
+                        session_key not in active_sessions
+                        and session_key not in self._running_agents
+                        and session_key not in pending_messages
+                    ):
+                        continuation_event = MessageEvent(
+                            text=prompt,
+                            message_type=MessageType.TEXT,
+                            source=source,
+                            message_id=None,
+                            channel_prompt=getattr(event, "channel_prompt", None),
+                            internal=True,
+                        )
+                        await adapter.handle_message(continuation_event)
+                        logger.info("Scheduled /goal continuation for %s", session_key[:20])
+                        return
+                    logger.debug(
+                        "Deferring /goal continuation for busy session %s (attempt %d)",
+                        session_key[:20],
+                        attempt + 1,
+                    )
+                logger.info("Skipped /goal continuation for busy session %s", session_key[:20])
+            except Exception as exc:
+                logger.warning("Failed to schedule /goal continuation for %s: %s", session_key[:20], exc)
+            finally:
+                self._goal_continuation_inflight.discard(session_key)
+
+        asyncio.create_task(_deliver_goal_prompt())
+        return True
+
+    async def _handle_goal_command(self, event: MessageEvent) -> str:
+        args = event.get_command_args().strip()
+        session_key = self._session_key_for_source(event.source)
+        manager = self._goal_manager_for_session_key(session_key)
+
+        if not args or args.lower() == "status":
+            return manager.status_message()
+
+        verb, _, rest = args.partition(" ")
+        verb = verb.lower().strip()
+
+        if verb in {"pause", "stop"}:
+            state = manager.pause()
+            if not state:
+                return "No active goal to pause."
+            self._update_goal_workspace_task(
+                state.workspace_task_id,
+                status="blocked",
+                next_action="Goal paused by user.",
+                note="Goal paused by user.",
+            )
+            return "Goal paused."
+
+        if verb in {"resume", "continue"}:
+            state = manager.resume()
+            if not state:
+                return "No active goal to resume."
+            workspace_task_id = self._ensure_goal_workspace_task(event, manager, state)
+            self._update_goal_workspace_task(
+                workspace_task_id,
+                status="in_progress",
+                next_action="Goal resumed; run next /goal continuation.",
+                note="Goal resumed by user.",
+            )
+            prompt = manager.continuation_prompt(state, "Goal resumed by user.")
+            self._schedule_goal_prompt(event, session_key, prompt)
+            return f"Goal resumed. Turns: {state.turn_count}/{state.max_turns}"
+
+        if verb in {"done", "complete", "completed"}:
+            state = manager.load()
+            if state:
+                self._update_goal_workspace_task(
+                    state.workspace_task_id,
+                    status="done",
+                    next_action="",
+                    note="Goal marked done by user.",
+                )
+            manager.clear()
+            return "Goal marked done and cleared."
+
+        if verb in {"clear", "reset"}:
+            state = manager.load()
+            if state:
+                self._update_goal_workspace_task(
+                    state.workspace_task_id,
+                    status="cancelled",
+                    next_action="",
+                    note="Goal cleared by user.",
+                )
+            manager.clear()
+            return "Goal cleared."
+
+        goal_text = args if verb not in {"set"} else rest.strip()
+        if not goal_text:
+            return "Usage: /goal <objective>"
+
+        try:
+            workspace_task_id = self._create_goal_workspace_task(event, goal_text)
+        except Exception as exc:
+            logger.warning("Failed to create Workspace task for /goal: %s", exc)
+            return f"Goal error: failed to create Workspace task: {exc}"
+        state = manager.set_goal(goal_text, workspace_task_id=workspace_task_id)
+        prompt = manager.continuation_prompt(state, "Goal just set.")
+        self._schedule_goal_prompt(event, session_key, prompt)
+        return (
+            f"Goal set. Workspace task: `{workspace_task_id}`. "
+            f"Max turns: {state.max_turns}. Use `/goal status`, `/goal pause`, or `/goal clear`."
+        )
+
+    async def _post_turn_goal_continuation(
+        self,
+        event: MessageEvent,
+        session_key: str,
+        final_response: str,
+        *,
+        failed: bool = False,
+        agent_result: Optional[dict] = None,
+    ) -> None:
+        if not session_key or event.get_command() == "goal":
+            return
+        if not final_response and not failed:
+            return
+        try:
+            manager = self._goal_manager_for_session_key(session_key)
+            prompt = await asyncio.to_thread(
+                manager.evaluate_after_turn,
+                str(final_response or ""),
+                failed=failed,
+            )
+            try:
+                await asyncio.to_thread(
+                    self._capture_goal_workspace_after_turn,
+                    event,
+                    manager,
+                    str(final_response or ""),
+                    agent_result or {},
+                    failed,
+                )
+            except Exception as capture_exc:
+                logger.warning(
+                    "Workspace auto-capture failed for goal session %s: %s",
+                    session_key[:20],
+                    capture_exc,
+                )
+            if prompt:
+                self._schedule_goal_prompt(event, session_key, prompt, delay_seconds=1.0)
+        except Exception as exc:
+            logger.warning("Goal continuation evaluation failed for %s: %s", session_key[:20], exc)
+
+    def _create_goal_workspace_task(self, event: MessageEvent, goal_text: str) -> str:
+        from hermes_cli.workspace import WorkspaceStore
+
+        task = WorkspaceStore().create_task(
+            f"Goal: {goal_text}",
+            owner=getattr(event.source, "user_name", None) or getattr(event.source, "user_id", None),
+            priority="high",
+            project="hermes-goals",
+            source=self._workspace_source_label(event),
+            next_action="Run first /goal continuation.",
+            status="in_progress",
+            note="Created automatically from /goal.",
+        )
+        return task["id"]
+
+    def _ensure_goal_workspace_task(self, event: MessageEvent, manager, state) -> str:
+        workspace_task_id = getattr(state, "workspace_task_id", "") or ""
+        if workspace_task_id:
+            try:
+                from hermes_cli.workspace import WorkspaceStore
+
+                WorkspaceStore().get_task(workspace_task_id)
+                return workspace_task_id
+            except Exception:
+                logger.warning(
+                    "Linked Workspace task missing for goal session %s; recreating",
+                    getattr(state, "session_key", "")[:20],
+                )
+        workspace_task_id = self._create_goal_workspace_task(event, state.goal)
+        state.workspace_task_id = workspace_task_id
+        manager.save(state)
+        return workspace_task_id
+
+    def _update_goal_workspace_task(
+        self,
+        workspace_task_id: str,
+        *,
+        status: str,
+        next_action: str = "",
+        note: str = "",
+    ) -> None:
+        if not workspace_task_id:
+            return
+        try:
+            from hermes_cli.workspace import WorkspaceStore
+
+            WorkspaceStore().update_task(
+                workspace_task_id,
+                status=status,
+                next_action=next_action,
+                note=note or None,
+            )
+        except Exception as exc:
+            logger.warning("Workspace task update failed for %s: %s", workspace_task_id, exc)
+
+    def _collect_workspace_artifacts(
+        self,
+        final_response: str,
+        agent_result: dict,
+    ) -> dict[str, Any]:
+        url_re = re.compile(r"https?://[^\s<>)\"']+")
+        path_re = re.compile(
+            r"(?:~|/Users|/tmp|/var|/opt|/workspace|/output)/[^\s`'\"<>)]{2,}"
+        )
+        text_parts = [final_response or ""]
+        tool_calls: list[str] = []
+
+        for message in (agent_result or {}).get("messages", [])[-40:]:
+            if not isinstance(message, dict):
+                continue
+            content = message.get("content")
+            if isinstance(content, str):
+                text_parts.append(content)
+            elif content is not None:
+                try:
+                    text_parts.append(json.dumps(content, ensure_ascii=False)[:4000])
+                except Exception:
+                    pass
+            for tool_call in message.get("tool_calls") or []:
+                if not isinstance(tool_call, dict):
+                    continue
+                function = tool_call.get("function")
+                name = ""
+                if isinstance(function, dict):
+                    name = function.get("name") or ""
+                name = name or tool_call.get("name") or ""
+                if name:
+                    tool_calls.append(str(name))
+
+        combined = "\n".join(text_parts)
+        urls = []
+        for match in url_re.findall(combined):
+            cleaned = match.rstrip(".,;]")
+            if cleaned not in urls:
+                urls.append(cleaned)
+            if len(urls) >= 8:
+                break
+
+        paths = []
+        for match in path_re.findall(combined):
+            cleaned = match.rstrip(".,;]")
+            if cleaned not in paths:
+                paths.append(cleaned)
+            if len(paths) >= 12:
+                break
+
+        verification_lines = []
+        verification_re = re.compile(
+            r"\b(pytest|ruff|vitest|tsc|build|compile|py_compile|passed|failed|health|smoke)\b",
+            re.IGNORECASE,
+        )
+        for line in (final_response or "").splitlines():
+            line = line.strip()
+            if line and verification_re.search(line):
+                verification_lines.append(line[:300])
+            if len(verification_lines) >= 12:
+                break
+
+        return {
+            "tool_calls": sorted(set(tool_calls)),
+            "urls": urls,
+            "paths": paths,
+            "verification_lines": verification_lines,
+        }
+
+    def _capture_goal_workspace_after_turn(
+        self,
+        event: MessageEvent,
+        manager,
+        final_response: str,
+        agent_result: dict,
+        failed: bool,
+    ) -> None:
+        state = manager.load()
+        if not state:
+            return
+
+        from hermes_cli.workspace import WorkspaceStore
+
+        store = WorkspaceStore()
+        workspace_task_id = self._ensure_goal_workspace_task(event, manager, state)
+        status = "in_progress"
+        next_action = f"Continue /goal turn {state.turn_count + 1}/{state.max_turns}."
+        task_note = ""
+        if failed:
+            status = "blocked"
+            next_action = state.last_judgment or "Last goal turn failed."
+            task_note = next_action
+        elif state.status == "done":
+            status = "done"
+            next_action = ""
+            task_note = state.last_judgment or "Goal completed."
+        elif state.paused or state.status == "paused":
+            status = "blocked"
+            next_action = state.last_judgment or "Goal paused."
+            task_note = next_action
+
+        store.update_task(
+            workspace_task_id,
+            status=status,
+            next_action=next_action,
+            note=task_note or None,
+        )
+
+        artifacts = self._collect_workspace_artifacts(final_response, agent_result or {})
+        metadata = {
+            "session_key": state.session_key,
+            "turn_count": state.turn_count,
+            "max_turns": state.max_turns,
+            "goal_status": state.status,
+            "failed": failed,
+            "api_calls": (agent_result or {}).get("api_calls", 0),
+            "model": (agent_result or {}).get("model") or "",
+            "session_id": (agent_result or {}).get("session_id") or "",
+            "tool_calls": artifacts["tool_calls"],
+        }
+        summary_parts = []
+        if state.last_judgment:
+            summary_parts.append(f"Judgment: {state.last_judgment}")
+        if final_response:
+            summary_parts.append(f"Response: {final_response[:1200]}")
+        store.add_evidence(
+            task_id=workspace_task_id,
+            title=f"Goal turn {state.turn_count}",
+            summary="\n\n".join(summary_parts)[:1800],
+            kind="note",
+            metadata=metadata,
+        )
+
+        if artifacts["verification_lines"]:
+            store.add_evidence(
+                task_id=workspace_task_id,
+                title=f"Verification evidence turn {state.turn_count}",
+                summary="\n".join(artifacts["verification_lines"]),
+                kind="command",
+                metadata={"session_key": state.session_key},
+            )
+
+        existing_locators = {
+            item.get("locator")
+            for item in store.read().get("evidence", {}).values()
+            if item.get("task_id") == workspace_task_id and item.get("locator")
+        }
+        for url in artifacts["urls"]:
+            if url in existing_locators:
+                continue
+            store.add_evidence(
+                task_id=workspace_task_id,
+                title="URL referenced during goal turn",
+                locator=url,
+                summary=url,
+                kind="url",
+                metadata={"turn_count": state.turn_count},
+            )
+            existing_locators.add(url)
+        for path in artifacts["paths"]:
+            if path in existing_locators:
+                continue
+            kind = "artifact" if path.endswith((".md", ".json", ".txt", ".log")) else "file"
+            store.add_evidence(
+                task_id=workspace_task_id,
+                title="File/artifact referenced during goal turn",
+                locator=path,
+                summary=path,
+                kind=kind,
+                metadata={"turn_count": state.turn_count},
+            )
+            existing_locators.add(path)
+
+    def _workspace_swarm_snapshot(self) -> dict[str, int]:
+        running_processes = 0
+        try:
+            from tools.process_registry import process_registry
+
+            running_processes = sum(
+                1 for proc in process_registry.list_sessions()
+                if proc.get("status") == "running"
+            )
+        except Exception:
+            running_processes = 0
+        return {
+            "running_agents": len(self._snapshot_running_agents()),
+            "running_processes": running_processes,
+            "goal_continuations": len(getattr(self, "_goal_continuation_inflight", set()) or set()),
+        }
+
+    def _workspace_source_label(self, event: MessageEvent) -> str:
+        source = event.source
+        platform = source.platform.value if source and source.platform else "unknown"
+        chat_id = getattr(source, "chat_id", "") or ""
+        user_id = getattr(source, "user_id", "") or ""
+        return ":".join(part for part in (platform, chat_id, user_id) if part)
+
+    async def _handle_workspace_command(self, event: MessageEvent) -> str:
+        from hermes_cli.workspace import (
+            WorkspaceStore,
+            format_task,
+            format_workspace_status,
+        )
+
+        store = WorkspaceStore()
+        args = event.get_command_args().strip()
+        command, _, rest = args.partition(" ")
+        command = command.lower().strip() or "status"
+
+        try:
+            if command in {"status", "summary"}:
+                return format_workspace_status(
+                    store.read(),
+                    swarm=self._workspace_swarm_snapshot(),
+                )
+
+            if command in {"list", "tasks"}:
+                status_arg = rest.strip().lower() or None
+                include_done = status_arg in {"all", "done", "complete", "completed", "cancelled"}
+                tasks = store.list_tasks(
+                    status=None if status_arg == "all" else status_arg,
+                    include_done=include_done,
+                    limit=20,
+                )
+                if not tasks:
+                    return "No matching workspace tasks."
+                return "Workspace tasks:\n" + "\n".join(
+                    "- " + format_task(task).replace("\n", "\n  ")
+                    for task in tasks
+                )
+
+            if command in {"add", "create", "task"}:
+                if not rest.strip():
+                    return "Usage: /workspace add <task title>"
+                task = store.create_task(
+                    rest.strip(),
+                    source=self._workspace_source_label(event),
+                    owner=getattr(event.source, "user_name", None) or getattr(event.source, "user_id", None),
+                )
+                return f"Workspace task created: `{task['id']}`\n{task['title']}"
+
+            if command in {"start", "doing", "progress"}:
+                task_id, _, note = rest.partition(" ")
+                task = store.update_task(
+                    task_id,
+                    status="in_progress",
+                    note=note.strip() or None,
+                )
+                return f"Workspace task started: `{task['id']}`"
+
+            if command in {"block", "blocked"}:
+                task_id, _, reason = rest.partition(" ")
+                task = store.update_task(
+                    task_id,
+                    status="blocked",
+                    next_action=reason.strip() or None,
+                    note=reason.strip() or None,
+                )
+                return f"Workspace task blocked: `{task['id']}`"
+
+            if command in {"done", "complete", "completed"}:
+                task_id, _, note = rest.partition(" ")
+                task = store.update_task(
+                    task_id,
+                    status="done",
+                    note=note.strip() or None,
+                )
+                return f"Workspace task done: `{task['id']}`"
+
+            if command in {"cancel", "cancelled"}:
+                task_id, _, note = rest.partition(" ")
+                task = store.update_task(
+                    task_id,
+                    status="cancelled",
+                    note=note.strip() or None,
+                )
+                return f"Workspace task cancelled: `{task['id']}`"
+
+            if command == "note":
+                task_id, _, note = rest.partition(" ")
+                if not note.strip():
+                    return "Usage: /workspace note <task_id> <note>"
+                task = store.update_task(task_id, note=note.strip())
+                return f"Workspace note added: `{task['id']}`"
+
+            if command in {"read", "get"}:
+                task = store.get_task(rest.strip())
+                lines = [format_task(task)]
+                notes = task.get("notes") or []
+                if notes:
+                    lines.append("notes:")
+                    for note in notes[-5:]:
+                        lines.append(f"- {note.get('text', '')}")
+                return "\n".join(lines)
+
+            if command in {"evidence", "ev"}:
+                task_id, _, payload = rest.partition(" ")
+                if not task_id or not payload.strip():
+                    return "Usage: /workspace evidence <task_id> <url|path|note>"
+                evidence = store.add_evidence(
+                    task_id=task_id,
+                    locator=payload.strip(),
+                    summary=payload.strip(),
+                )
+                return f"Workspace evidence added: `{evidence['id']}`"
+
+            if command == "inbox":
+                if not rest.strip():
+                    return "Usage: /workspace inbox <text>"
+                item = store.add_inbox_item(
+                    rest.strip(),
+                    source=self._workspace_source_label(event),
+                )
+                return f"Workspace inbox captured: `{item['id']}`"
+
+            if command == "report":
+                report = store.create_report(title=rest.strip() or None)
+                return f"Workspace report created: `{report['id']}`\n{report['path']}"
+
+            return (
+                "Usage: /workspace [status|list|add|start|block|done|note|"
+                "read|evidence|inbox|report]"
+            )
+        except Exception as exc:
+            return f"Workspace error: {exc}"
     
     async def _handle_message(self, event: MessageEvent) -> Optional[str]:
         """
@@ -3547,6 +4316,15 @@ class GatewayRunner:
             )
             _evt_cmd = event.get_command()
             _cmd_def_inner = _resolve_cmd_inner(_evt_cmd) if _evt_cmd else None
+
+            if _cmd_def_inner and _cmd_def_inner.name == "goal":
+                goal_args = event.get_command_args().strip().lower()
+                if goal_args in {"", "status", "pause", "stop", "resume", "continue", "clear", "reset", "done"}:
+                    return await self._handle_goal_command(event)
+                return "Agent is running - wait for the current turn or use `/stop` before setting a new goal."
+
+            if _cmd_def_inner and _cmd_def_inner.name == "workspace":
+                return await self._handle_workspace_command(event)
 
             if _cmd_def_inner and _cmd_def_inner.name == "restart":
                 return await self._handle_restart_command(event)
@@ -3980,6 +4758,12 @@ class GatewayRunner:
             # Do NOT return — fall through to _handle_message_with_agent
             # at the end of this function so the rewritten text is sent
             # to the agent as a regular user turn.
+
+        if canonical == "goal":
+            return await self._handle_goal_command(event)
+
+        if canonical == "workspace":
+            return await self._handle_workspace_command(event)
 
         if canonical == "voice":
             return await self._handle_voice_command(event)
@@ -5056,6 +5840,20 @@ class GatewayRunner:
             _already_sent = bool(agent_result.get("already_sent"))
             if self._should_send_voice_reply(event, response, agent_messages, already_sent=_already_sent):
                 await self._send_voice_reply(event, response)
+
+            if response or agent_result.get("failed"):
+                try:
+                    asyncio.create_task(
+                        self._post_turn_goal_continuation(
+                            event,
+                            session_key,
+                            response or "",
+                            failed=bool(agent_result.get("failed")),
+                            agent_result=agent_result,
+                        )
+                    )
+                except RuntimeError:
+                    pass
 
             # If streaming already delivered the response, extract and
             # deliver any MEDIA: files before returning None.  Streaming
@@ -10441,6 +11239,7 @@ class GatewayRunner:
             if _msn:
                 message = _msn + "\n\n" + message
 
+            _planner_route_message = message
             _x_link_context = _build_x_link_context_prompt(message)
             if _x_link_context:
                 logger.info("Injected X/Twitter link context for %s turn", platform_key)
@@ -10473,6 +11272,15 @@ class GatewayRunner:
                         + "\n\n[User message]\n"
                         + message
                     )
+
+            _hard_task_context = _build_hard_task_planner_prompt(_planner_route_message)
+            if _hard_task_context:
+                logger.info("Injected hard-task planner route for %s turn", platform_key)
+                message = (
+                    _hard_task_context
+                    + "\n\n[User message]\n"
+                    + message
+                )
 
             # Auto-continue: if the loaded history ends with a tool result,
             # the previous agent turn was interrupted mid-work (gateway

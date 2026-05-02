@@ -223,6 +223,7 @@ def _direct_alexandria_context_paths(message: str) -> List[str]:
         paths.append("advanced/czar/CONTEXT.md")
     if "pricing" in lowered or "quote" in lowered or "rfq" in lowered:
         paths.append("advanced/pricing/CONTEXT.md")
+        paths.append("advanced/customers/CONTEXT.md")
     if "customer" in lowered:
         paths.append("advanced/customers/CONTEXT.md")
     if any(term in lowered for term in V11_TERMS) or PART_NUMBER_RE.search(routing_text):

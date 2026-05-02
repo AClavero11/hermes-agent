@@ -160,6 +160,8 @@ def resolve_proxy_url(platform_env_var: str | None = None) -> str | None:
     """
     if platform_env_var:
         value = (os.environ.get(platform_env_var) or "").strip()
+        if value.lower() in {"none", "direct", "off", "false", "0"}:
+            return None
         if value:
             return normalize_proxy_url(value)
     for key in ("HTTPS_PROXY", "HTTP_PROXY", "ALL_PROXY",
