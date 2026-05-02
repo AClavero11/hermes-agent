@@ -35,6 +35,7 @@ These files define the reproducible Hermes control-plane patch stack:
 | `docs/HERMES_SELF_HEAL_PLAYBOOKS.md` | Bounded self-heal policy |
 | `docs/patch-manifests/hermes-control-plane-2026-05-02.md` | This manifest |
 | `scripts/deploy-hermes-control-plane.sh` | Exact-file deploy script for local-to-Studio sync and runtime SHA metadata |
+| `scripts/hermes-canary-daily` | Daily canary wrapper with signed Telegram webhook simulation |
 
 ## External Runtime Files
 
@@ -51,6 +52,7 @@ These files live outside the repo and are copied by `scripts/deploy-hermes-contr
 | `/Users/ac/.hermes/services/quote_pdf_server.py` | `/Users/anthonyclavero/.hermes/services/quote_pdf_server.py` |
 | `/Users/ac/.hermes/services/shipment_watcher.py` | `/Users/anthonyclavero/.hermes/services/shipment_watcher.py` |
 | `/Users/ac/.hermes-deepseek/bin/hermes-env.sh` | `/Users/anthonyclavero/.hermes-deepseek/bin/hermes-env.sh` |
+| `scripts/hermes-canary-daily` | `/Users/anthonyclavero/.hermes-deepseek/bin/hermes-canary-daily` |
 
 ## Deploy Targets
 
@@ -75,3 +77,4 @@ hermes canary --require-live --live-behavior --reasoning-eval --frontier-eval --
 
 Every canary JSON/Markdown report now records a `runtime` object with the runtime repo SHA and wrapper-selected repo.
 For rsync-only Studio trees without `.git`, the deploy script writes `.hermes-runtime-version.json` so `hermes runtime status` and canary reports still record the source SHA.
+The daily canary runs `--telegram-webhook-sim` so the Telegram gate can be exercised through the signed webhook path without requiring a visible DM for every scheduled run.

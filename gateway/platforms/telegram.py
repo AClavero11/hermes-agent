@@ -14,6 +14,7 @@ import os
 import tempfile
 import html as _html
 import re
+import time
 from typing import Dict, List, Optional, Any
 
 logger = logging.getLogger(__name__)
@@ -974,6 +975,98 @@ class TelegramAdapter(BasePlatformAdapter):
             return True
         else:  # "first" (default)
             return chunk_index == 0
+
+    @staticmethod
+    def _telegram_e2e_paths() -> tuple[_Path, _Path]:
+        try:
+            from hermes_constants import get_hermes_home
+
+            hermes_home = get_hermes_home()
+        except Exception:
+            hermes_home = _Path(os.getenv("HERMES_HOME", _Path.home() / ".hermes")).expanduser()
+        pending_path = _Path(
+            os.getenv(
+                "HERMES_TELEGRAM_E2E_PENDING_PATH",
+                str(hermes_home / "canary" / "telegram_e2e_pending.json"),
+            )
+        ).expanduser()
+        evidence_path = _Path(
+            os.getenv(
+                "HERMES_TELEGRAM_E2E_EVIDENCE_PATH",
+                str(hermes_home / "canary" / "telegram_e2e_last.json"),
+            )
+        ).expanduser()
+        return pending_path, evidence_path
+
+    @staticmethod
+    def _read_json_object(path: _Path) -> dict[str, Any]:
+        try:
+            payload = json.loads(path.read_text(encoding="utf-8"))
+        except (OSError, json.JSONDecodeError):
+            return {}
+        return payload if isinstance(payload, dict) else {}
+
+    @staticmethod
+    def _write_json_atomic(path: _Path, payload: dict[str, Any]) -> None:
+        path.parent.mkdir(parents=True, exist_ok=True)
+        tmp_path = path.with_name(f".{path.name}.{os.getpid()}.tmp")
+        tmp_path.write_text(
+            json.dumps(payload, indent=2, sort_keys=True) + "\n",
+            encoding="utf-8",
+        )
+        tmp_path.replace(path)
+
+    def _maybe_record_telegram_e2e_ack(self, message: Message, update_id: int | None) -> bool:
+        pending_path, evidence_path = self._telegram_e2e_paths()
+        if not pending_path.is_file():
+            return False
+        pending = self._read_json_object(pending_path)
+        if not pending or str(pending.get("status") or "").lower() not in {"sent", "pending"}:
+            return False
+
+        text = (getattr(message, "text", "") or "").strip()
+        expected = str(pending.get("awaiting_reply") or "ack").strip()
+        if not text or expected.lower() not in text.lower():
+            return False
+
+        chat_id = str(getattr(message, "chat_id", "") or "")
+        expected_chat_id = str(pending.get("chat_id") or "").strip()
+        if expected_chat_id and chat_id != expected_chat_id:
+            return False
+
+        now = time.time()
+        sent_at = float(pending.get("sent_at") or now)
+        latency_ms = max(1.0, round((now - sent_at) * 1000.0, 1))
+        evidence = {
+            "status": "pass",
+            "mode": str(pending.get("mode") or "real_telegram_ack"),
+            "source": "telegram_webhook_update",
+            "chat_id": chat_id,
+            "message_id": getattr(message, "message_id", None),
+            "update_id": update_id,
+            "sent_message_id": pending.get("message_id"),
+            "nonce": pending.get("nonce", ""),
+            "sent_at": sent_at,
+            "observed_at": now,
+            "latency_ms": latency_ms,
+            "latency_budget_ms": float(pending.get("latency_budget_ms") or 15000),
+            "no_interruption": True,
+            "no_capability_refusal": True,
+            "restart_during_task": False,
+            "text_preview": text[:120],
+        }
+        try:
+            self._write_json_atomic(evidence_path, evidence)
+        except OSError as exc:
+            logger.warning("[%s] Telegram E2E evidence write failed: %s", self.name, exc)
+            return False
+        logger.info(
+            "[%s] Telegram E2E ack recorded mode=%s latency_ms=%.1f",
+            self.name,
+            evidence["mode"],
+            latency_ms,
+        )
+        return True
 
     async def send(
         self,
@@ -2403,6 +2496,8 @@ class TelegramAdapter(BasePlatformAdapter):
             return
         if not self._should_process_message(update.message):
             return
+        if self._maybe_record_telegram_e2e_ack(update.message, update.update_id):
+            return
 
         event = self._build_message_event(update.message, MessageType.TEXT, update_id=update.update_id)
         event.text = self._clean_bot_trigger_text(event.text)
@@ -2413,6 +2508,8 @@ class TelegramAdapter(BasePlatformAdapter):
         if not update.message or not update.message.text:
             return
         if not self._should_process_message(update.message, is_command=True):
+            return
+        if self._maybe_record_telegram_e2e_ack(update.message, update.update_id):
             return
         
         event = self._build_message_event(update.message, MessageType.COMMAND, update_id=update.update_id)

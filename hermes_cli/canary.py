@@ -37,6 +37,7 @@ class CanaryOptions:
     frontier_model: str = ""
     frontier_api_key: str = ""
     frontier_base_url: str = "https://api.openai.com/v1"
+    telegram_webhook_sim: bool = False
     require_live: bool = False
     timeout: float = 8.0
     fail_under: float = 80.0
@@ -860,7 +861,8 @@ def _resolve_service_key_from_wrapper(options: CanaryOptions) -> str:
         return ""
     if proc.returncode != 0:
         return ""
-    return (proc.stdout or "").strip().splitlines()[-1].strip() if proc.stdout else ""
+    lines = [line.strip() for line in (proc.stdout or "").splitlines() if line.strip()]
+    return lines[-1] if lines else ""
 
 
 def _resolve_api_key(options: CanaryOptions) -> tuple[str, str]:
@@ -1709,24 +1711,30 @@ def _canary_frontier_wrapper(options: CanaryOptions) -> CanaryResult:
 
 
 def _canary_telegram_e2e(options: CanaryOptions) -> CanaryResult:
+    simulation: dict[str, Any] = {}
+    if options.telegram_webhook_sim:
+        simulation = _run_telegram_webhook_simulation(options)
     evidence_path = options.hermes_home / "canary" / "telegram_e2e_last.json"
     if not evidence_path.is_file():
+        details: dict[str, Any] = {
+            "evidence_path": str(evidence_path),
+            "required_evidence": {
+                "status": "pass",
+                "latency_ms": "<= latency_budget_ms",
+                "no_interruption": True,
+                "no_capability_refusal": True,
+                "restart_during_task": False,
+            },
+        }
+        if simulation:
+            details["simulation"] = simulation
         return _result(
             "live.telegram_e2e",
             WARN,
             0,
             20,
             "No live Telegram E2E latency/restart evidence; frontier readiness is capped until this passes",
-            {
-                "evidence_path": str(evidence_path),
-                "required_evidence": {
-                    "status": "pass",
-                    "latency_ms": "<= latency_budget_ms",
-                    "no_interruption": True,
-                    "no_capability_refusal": True,
-                    "restart_during_task": False,
-                },
-            },
+            details,
         )
 
     try:
@@ -1759,6 +1767,8 @@ def _canary_telegram_e2e(options: CanaryOptions) -> CanaryResult:
         "no_capability_refusal": bool(payload.get("no_capability_refusal")),
         "no_restart_during_task": not bool(payload.get("restart_during_task")),
     }
+    if simulation.get("nonce"):
+        checks["simulation_nonce_match"] = payload.get("nonce") == simulation.get("nonce")
     failed = [name for name, ok in checks.items() if not ok]
     if failed:
         return _result(
@@ -1772,6 +1782,7 @@ def _canary_telegram_e2e(options: CanaryOptions) -> CanaryResult:
                 "failed": failed,
                 "checks": checks,
                 "payload": payload,
+                "simulation": simulation,
             },
         )
 
@@ -1785,8 +1796,169 @@ def _canary_telegram_e2e(options: CanaryOptions) -> CanaryResult:
             "evidence_path": str(evidence_path),
             "checks": checks,
             "payload": payload,
+            "simulation": simulation,
         },
     )
+
+
+def _telegram_e2e_channel_id(options: CanaryOptions) -> str:
+    env_value = os.getenv("HERMES_CANARY_TELEGRAM_CHAT_ID", "").strip()
+    if env_value:
+        return env_value
+    channel_directory = options.hermes_home / "channel_directory.json"
+    try:
+        payload = json.loads(channel_directory.read_text(encoding="utf-8"))
+    except (OSError, json.JSONDecodeError):
+        return ""
+    platforms = payload.get("platforms") if isinstance(payload, dict) else {}
+    telegram_channels = platforms.get("telegram") if isinstance(platforms, dict) else []
+    if isinstance(telegram_channels, list):
+        for item in telegram_channels:
+            if isinstance(item, dict) and item.get("id"):
+                return str(item["id"])
+    return ""
+
+
+def _post_telegram_webhook_update(
+    *,
+    url: str,
+    secret: str,
+    update: dict[str, Any],
+    timeout: float,
+) -> tuple[int, str]:
+    headers = {
+        "Accept": "application/json",
+        "Content-Type": "application/json",
+        "X-Telegram-Bot-Api-Secret-Token": secret,
+    }
+    req = urllib.request.Request(
+        url,
+        data=json.dumps(update).encode("utf-8"),
+        headers=headers,
+        method="POST",
+    )
+    with urllib.request.urlopen(req, timeout=timeout) as resp:
+        raw = resp.read(1024 * 1024).decode("utf-8", errors="replace")
+        return int(resp.status), raw[:1000]
+
+
+def _run_telegram_webhook_simulation(options: CanaryOptions) -> dict[str, Any]:
+    secret_path = options.hermes_home / "private" / "telegram-webhook-secret"
+    pending_path = options.hermes_home / "canary" / "telegram_e2e_pending.json"
+    evidence_path = options.hermes_home / "canary" / "telegram_e2e_last.json"
+    local_url = os.getenv(
+        "HERMES_CANARY_TELEGRAM_WEBHOOK_URL",
+        f"http://127.0.0.1:{os.getenv('TELEGRAM_WEBHOOK_PORT', '8443')}/telegram",
+    )
+    chat_id = _telegram_e2e_channel_id(options)
+    started = time.time()
+    details: dict[str, Any] = {
+        "mode": "signed_webhook_simulation",
+        "url": local_url,
+        "secret_path": str(secret_path),
+        "pending_path": str(pending_path),
+        "evidence_path": str(evidence_path),
+        "chat_id_present": bool(chat_id),
+    }
+    if not chat_id:
+        details.update({"ok": False, "error": "No Telegram channel id found"})
+        return details
+    try:
+        secret = secret_path.read_text(encoding="utf-8").strip()
+    except OSError as exc:
+        details.update({"ok": False, "error": f"webhook secret unavailable: {exc}"})
+        return details
+    if not secret:
+        details.update({"ok": False, "error": "webhook secret is empty"})
+        return details
+
+    nonce = f"sim-{int(started * 1000)}"
+    ack = f"ack {nonce}"
+    pending = {
+        "status": "sent",
+        "mode": "signed_webhook_simulation",
+        "chat_id": chat_id,
+        "sent_at": started,
+        "awaiting_reply": ack,
+        "latency_budget_ms": 15000,
+        "nonce": nonce,
+        "text": f"Hermes signed webhook simulation {nonce}",
+    }
+    pending_path.parent.mkdir(parents=True, exist_ok=True)
+    pending_path.write_text(
+        json.dumps(pending, indent=2, sort_keys=True) + "\n",
+        encoding="utf-8",
+    )
+
+    try:
+        chat_id_int = int(chat_id)
+    except ValueError:
+        details.update({"ok": False, "error": "Telegram channel id is not an integer"})
+        return details
+    update_id = int(started * 1000) % 2_000_000_000
+    update = {
+        "update_id": update_id,
+        "message": {
+            "message_id": update_id % 1_000_000,
+            "from": {
+                "id": chat_id_int,
+                "is_bot": False,
+                "first_name": "Hermes",
+                "username": "hermes_e2e",
+            },
+            "chat": {
+                "id": chat_id_int,
+                "type": "private",
+                "first_name": "Hermes",
+            },
+            "date": int(started),
+            "text": ack,
+        },
+    }
+    try:
+        status, raw = _post_telegram_webhook_update(
+            url=local_url,
+            secret=secret,
+            update=update,
+            timeout=max(options.timeout, 10.0),
+        )
+    except Exception as exc:
+        details.update(
+            {
+                "ok": False,
+                "nonce": nonce,
+                "error": f"{type(exc).__name__}: {exc}",
+                "duration_ms": round((time.time() - started) * 1000.0, 1),
+            }
+        )
+        return details
+
+    deadline = time.time() + max(3.0, min(options.timeout, 10.0))
+    evidence: dict[str, Any] = {}
+    while time.time() < deadline:
+        try:
+            evidence_payload = json.loads(evidence_path.read_text(encoding="utf-8"))
+        except (OSError, json.JSONDecodeError):
+            time.sleep(0.2)
+            continue
+        if isinstance(evidence_payload, dict) and evidence_payload.get("nonce") == nonce:
+            evidence = evidence_payload
+            break
+        time.sleep(0.2)
+    details.update(
+        {
+            "ok": bool(evidence),
+            "nonce": nonce,
+            "status": status,
+            "raw_preview": raw[:200],
+            "duration_ms": round((time.time() - started) * 1000.0, 1),
+            "evidence_observed": bool(evidence),
+            "evidence_latency_ms": evidence.get("latency_ms") if evidence else None,
+        }
+    )
+    if not evidence:
+        details["error"] = "Webhook POST returned but no matching evidence was written"
+    return details
 
 
 def _canary_scorecard_trend(options: CanaryOptions) -> CanaryResult:
@@ -2906,6 +3078,12 @@ def build_arg_parser() -> argparse.ArgumentParser:
         help="OpenAI-compatible API key for --frontier-eval; Gemini uses GEMINI_API_KEY/GOOGLE_API_KEY",
     )
     parser.add_argument(
+        "--telegram-webhook-sim",
+        action="store_true",
+        default=os.getenv("HERMES_CANARY_TELEGRAM_WEBHOOK_SIM", "").strip().lower() in {"1", "true", "yes", "on"},
+        help="Run a signed local Telegram webhook simulation and require matching E2E evidence",
+    )
+    parser.add_argument(
         "--api-key",
         default=os.getenv("HERMES_CANARY_API_KEY", ""),
         help="API key for live /v1/responses canaries; defaults to HERMES_CANARY_API_KEY",
@@ -2949,6 +3127,7 @@ def options_from_args(args: argparse.Namespace) -> CanaryOptions:
         frontier_model=str(getattr(args, "frontier_model", "") or ""),
         frontier_api_key=str(getattr(args, "frontier_api_key", "") or ""),
         frontier_base_url=str(getattr(args, "frontier_base_url", "") or "https://api.openai.com/v1"),
+        telegram_webhook_sim=bool(getattr(args, "telegram_webhook_sim", False)),
         require_live=bool(args.require_live),
         timeout=float(args.timeout),
         fail_under=float(args.fail_under),

@@ -1,0 +1,45 @@
+#!/bin/zsh
+
+set -euo pipefail
+
+script_dir="${0:A:h}"
+if [[ -f "$script_dir/hermes-env.sh" ]]; then
+  source "$script_dir/hermes-env.sh"
+else
+  source "$HOME/.hermes-deepseek/bin/hermes-env.sh"
+fi
+aac_configure_hermes_deepseek_env
+
+if [[ -z "${HERMES_SERVICE_KEY:-}" && -f "$HOME/.hermes/.env" ]]; then
+  service_key_line="$(grep -E '^HERMES_SERVICE_KEY=' "$HOME/.hermes/.env" | tail -n 1 || true)"
+  if [[ -n "$service_key_line" ]]; then
+    service_key="${service_key_line#HERMES_SERVICE_KEY=}"
+    service_key="${service_key%\"}"
+    service_key="${service_key#\"}"
+    service_key="${service_key%\'}"
+    service_key="${service_key#\'}"
+    export HERMES_SERVICE_KEY="$service_key"
+  fi
+fi
+
+repo="${AAC_HERMES_DEEPSEEK_REPO:-$HOME/.hermes/hermes-agent-v2026.4.23}"
+python_bin="${AAC_HERMES_DEEPSEEK_PYTHON:-$repo/.venv/bin/python3}"
+hermes_home="${AAC_HERMES_DEEPSEEK_HOME:-${HERMES_HOME:-$HOME/.hermes-deepseek}}"
+gateway_url="${HERMES_CANARY_GATEWAY_URL:-http://127.0.0.1:8643}"
+timeout_seconds="${HERMES_CANARY_TIMEOUT:-30}"
+x_url="${HERMES_CANARY_X_URL:-https://x.com/lmstudio/status/2049878775039406221?s=12}"
+
+mkdir -p "$hermes_home/canary/logs"
+cd "$repo"
+
+exec "$python_bin" -m hermes_cli.main canary \
+  --timeout "$timeout_seconds" \
+  --gateway-url "$gateway_url" \
+  --hermes-home "$hermes_home" \
+  --env-wrapper "$hermes_home/bin/hermes-env.sh" \
+  --live-behavior \
+  --reasoning-eval \
+  --frontier-eval \
+  --telegram-webhook-sim \
+  --x-url "$x_url" \
+  "$@"

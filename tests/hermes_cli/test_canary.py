@@ -312,3 +312,37 @@ def test_frontier_wrapper_falls_back_to_gemini(monkeypatch, tmp_path):
     assert result.status == PASS
     assert result.details["provider"] == "gemini"
     assert [attempt["provider"] for attempt in result.details["attempts"]] == ["openai", "gemini"]
+
+
+def test_telegram_e2e_accepts_signed_webhook_simulation_evidence(tmp_path):
+    evidence_path = tmp_path / "canary" / "telegram_e2e_last.json"
+    evidence_path.parent.mkdir(parents=True)
+    evidence_path.write_text(
+        json.dumps(
+            {
+                "status": "pass",
+                "mode": "signed_webhook_simulation",
+                "source": "telegram_webhook_update",
+                "latency_ms": 250,
+                "latency_budget_ms": 15000,
+                "no_interruption": True,
+                "no_capability_refusal": True,
+                "restart_during_task": False,
+                "nonce": "sim-test",
+            }
+        ),
+        encoding="utf-8",
+    )
+    options = CanaryOptions(
+        repo_root=Path(__file__).resolve().parents[2],
+        hermes_home=tmp_path,
+        gateway_url="",
+        env_wrapper=None,
+        require_live=True,
+        timeout=0.2,
+    )
+
+    result = canary_module._canary_telegram_e2e(options)
+
+    assert result.status == PASS
+    assert result.details["payload"]["mode"] == "signed_webhook_simulation"

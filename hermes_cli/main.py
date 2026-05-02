@@ -7177,6 +7177,12 @@ For more help on a command:
         help="OpenAI-compatible API key for --frontier-eval; Gemini uses GEMINI_API_KEY/GOOGLE_API_KEY",
     )
     canary_parser.add_argument(
+        "--telegram-webhook-sim",
+        action="store_true",
+        default=os.getenv("HERMES_CANARY_TELEGRAM_WEBHOOK_SIM", "").strip().lower() in {"1", "true", "yes", "on"},
+        help="Run a signed local Telegram webhook simulation and require matching E2E evidence",
+    )
+    canary_parser.add_argument(
         "--api-key",
         default=os.getenv("HERMES_CANARY_API_KEY", ""),
         help="API key for live /v1/responses canaries",

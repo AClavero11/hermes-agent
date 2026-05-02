@@ -41,6 +41,7 @@ REPO_FILES=(
   docs/AAC_MIGRATION_v2026.4.23.md
   docs/HERMES_SELF_HEAL_PLAYBOOKS.md
   docs/patch-manifests/hermes-control-plane-2026-05-02.md
+  scripts/hermes-canary-daily
   scripts/deploy-hermes-control-plane.sh
 )
 
@@ -56,6 +57,7 @@ SERVICE_FILES=(
 )
 
 WRAPPER_FILE="${HERMES_DEEPSEEK_ENV_WRAPPER:-/Users/ac/.hermes-deepseek/bin/hermes-env.sh}"
+CANARY_DAILY_FILE="${HERMES_DEEPSEEK_CANARY_DAILY:-${ROOT}/scripts/hermes-canary-daily}"
 RUNTIME_VERSION_FILE="$(mktemp)"
 trap 'rm -f "${RUNTIME_VERSION_FILE}"' EXIT
 
@@ -66,7 +68,7 @@ for file in "${REPO_FILES[@]}"; do
     missing=1
   fi
 done
-for file in "${SERVICE_FILES[@]}" "${WRAPPER_FILE}"; do
+for file in "${SERVICE_FILES[@]}" "${WRAPPER_FILE}" "${CANARY_DAILY_FILE}"; do
   if [[ ! -f "${file}" ]]; then
     echo "missing runtime file: ${file}" >&2
     missing=1
@@ -113,5 +115,6 @@ deploy_repo_target "${STUDIO_ACTIVE_TARGET}"
 "${SSH_CMD[@]}" "${STUDIO_HOST}" "mkdir -p '${STUDIO_SERVICES_TARGET}' '${STUDIO_DEEPSEEK_BIN_TARGET}'"
 rsync -a -e "${RSYNC_RSH}" "${SERVICE_FILES[@]}" "${STUDIO_HOST}:${STUDIO_SERVICES_TARGET}/"
 rsync -a -e "${RSYNC_RSH}" "${WRAPPER_FILE}" "${STUDIO_HOST}:${STUDIO_DEEPSEEK_BIN_TARGET}/hermes-env.sh"
+rsync -a -e "${RSYNC_RSH}" "${CANARY_DAILY_FILE}" "${STUDIO_HOST}:${STUDIO_DEEPSEEK_BIN_TARGET}/hermes-canary-daily"
 
 echo "deployed Hermes control-plane patch stack to ${STUDIO_HOST}"
