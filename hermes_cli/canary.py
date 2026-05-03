@@ -42,6 +42,8 @@ class CanaryOptions:
     frontier_api_key: str = ""
     frontier_base_url: str = "https://api.openai.com/v1"
     telegram_webhook_sim: bool = False
+    telegram_visible_probe: bool = False
+    telegram_visible_wait: float = 15.0
     rfq_dry_run: bool = False
     require_live: bool = False
     timeout: float = 8.0
@@ -1966,6 +1968,224 @@ def _run_telegram_webhook_simulation(options: CanaryOptions) -> dict[str, Any]:
     return details
 
 
+def _telegram_api_request(
+    bot_token: str,
+    method: str,
+    payload: dict[str, Any] | None,
+    timeout: float,
+) -> dict[str, Any]:
+    url = f"https://api.telegram.org/bot{bot_token}/{method}"
+    data = None
+    headers = {"Accept": "application/json"}
+    if payload is not None:
+        data = urllib.parse.urlencode(
+            {key: str(value) for key, value in payload.items()}
+        ).encode("utf-8")
+        headers["Content-Type"] = "application/x-www-form-urlencoded"
+    req = urllib.request.Request(
+        url,
+        data=data,
+        headers=headers,
+        method="POST" if payload is not None else "GET",
+    )
+    with urllib.request.urlopen(req, timeout=timeout) as resp:
+        decoded = json.loads(resp.read().decode("utf-8"))
+    return decoded if isinstance(decoded, dict) else {}
+
+
+def _run_telegram_visible_probe(options: CanaryOptions) -> dict[str, Any]:
+    _load_canary_env_files()
+    bot_token = _env_value("TELEGRAM_BOT_TOKEN")
+    chat_id = os.getenv("HERMES_CANARY_TELEGRAM_CHAT_ID", "").strip()
+    if not chat_id:
+        chat_id = os.getenv("TELEGRAM_HOME_CHANNEL", "").strip()
+    if not chat_id:
+        chat_id = _telegram_e2e_channel_id(options)
+
+    pending_path = options.hermes_home / "canary" / "telegram_e2e_pending.json"
+    evidence_path = options.hermes_home / "canary" / "telegram_e2e_last.json"
+    details: dict[str, Any] = {
+        "mode": "real_visible_delivery_probe",
+        "chat_id_present": bool(chat_id),
+        "pending_path": str(pending_path),
+        "evidence_path": str(evidence_path),
+    }
+    if not bot_token:
+        details.update({"ok": False, "error": "TELEGRAM_BOT_TOKEN is not configured"})
+        return details
+    if not chat_id:
+        details.update({"ok": False, "error": "Telegram chat id is not configured"})
+        return details
+
+    started = time.time()
+    nonce = f"real-{int(started)}"
+    ack = f"ack {nonce}"
+    text = f"Hermes visible delivery probe {nonce}. Reply exactly: {ack}"
+    try:
+        get_me = _telegram_api_request(
+            bot_token,
+            "getMe",
+            None,
+            max(options.timeout, 10.0),
+        )
+        chat = _telegram_api_request(
+            bot_token,
+            "getChat",
+            {"chat_id": chat_id},
+            max(options.timeout, 10.0),
+        )
+        webhook = _telegram_api_request(
+            bot_token,
+            "getWebhookInfo",
+            None,
+            max(options.timeout, 10.0),
+        )
+        sent = _telegram_api_request(
+            bot_token,
+            "sendMessage",
+            {
+                "chat_id": chat_id,
+                "text": text,
+                "disable_notification": "false",
+            },
+            max(options.timeout, 10.0),
+        )
+    except Exception as exc:
+        details.update(
+            {
+                "ok": False,
+                "error": f"{type(exc).__name__}: {exc}",
+                "failure_class": "telegram_delivery_failure",
+            }
+        )
+        return details
+
+    message = sent.get("result") if isinstance(sent.get("result"), dict) else {}
+    pending = {
+        "status": "sent",
+        "mode": "real_visible_delivery_probe",
+        "chat_id": str(chat_id),
+        "sent_at": time.time(),
+        "awaiting_reply": ack,
+        "latency_budget_ms": 60_000,
+        "nonce": nonce,
+        "text": text,
+        "message_id": message.get("message_id"),
+    }
+    pending_path.parent.mkdir(parents=True, exist_ok=True)
+    pending_path.write_text(
+        json.dumps(pending, indent=2, sort_keys=True) + "\n",
+        encoding="utf-8",
+    )
+
+    wait_seconds = max(0.0, min(float(options.telegram_visible_wait), 120.0))
+    deadline = time.time() + wait_seconds
+    evidence: dict[str, Any] = {}
+    while time.time() < deadline:
+        try:
+            payload = json.loads(evidence_path.read_text(encoding="utf-8"))
+        except (OSError, json.JSONDecodeError):
+            time.sleep(0.5)
+            continue
+        if isinstance(payload, dict) and payload.get("nonce") == nonce:
+            evidence = payload
+            break
+        time.sleep(0.5)
+
+    bot = get_me.get("result") if isinstance(get_me.get("result"), dict) else {}
+    chat_result = chat.get("result") if isinstance(chat.get("result"), dict) else {}
+    webhook_result = (
+        webhook.get("result") if isinstance(webhook.get("result"), dict) else {}
+    )
+    message_chat = message.get("chat") if isinstance(message.get("chat"), dict) else {}
+    details.update(
+        {
+            "ok": bool(evidence),
+            "nonce": nonce,
+            "expected_reply": ack,
+            "bot": {
+                "ok": bool(get_me.get("ok")),
+                "id": bot.get("id"),
+                "username": bot.get("username"),
+                "first_name": bot.get("first_name"),
+            },
+            "chat": {
+                "ok": bool(chat.get("ok")),
+                "id": chat_result.get("id"),
+                "type": chat_result.get("type"),
+                "username": chat_result.get("username"),
+                "first_name": chat_result.get("first_name"),
+                "last_name": chat_result.get("last_name"),
+            },
+            "send": {
+                "ok": bool(sent.get("ok")),
+                "message_id": message.get("message_id"),
+                "date": message.get("date"),
+                "chat_id": message_chat.get("id"),
+            },
+            "webhook": {
+                "ok": bool(webhook.get("ok")),
+                "url": webhook_result.get("url"),
+                "pending_update_count": webhook_result.get("pending_update_count"),
+                "last_error_date": webhook_result.get("last_error_date"),
+                "last_error_message": webhook_result.get("last_error_message"),
+            },
+            "evidence": evidence,
+            "wait_seconds": wait_seconds,
+            "duration_ms": round((time.time() - started) * 1000.0, 1),
+        }
+    )
+    return details
+
+
+def _canary_telegram_visible_delivery(options: CanaryOptions) -> CanaryResult:
+    if not options.telegram_visible_probe:
+        return _result(
+            "live.telegram_visible_delivery",
+            SKIP,
+            0,
+            20,
+            "Visible Telegram probe not enabled; pass --telegram-visible-probe to require a real DM ack",
+            {"enabled": False},
+        )
+
+    probe = _run_telegram_visible_probe(options)
+    if probe.get("ok"):
+        evidence = probe.get("evidence") if isinstance(probe.get("evidence"), dict) else {}
+        latency_ms = float(evidence.get("latency_ms") or 0)
+        return _result(
+            "live.telegram_visible_delivery",
+            PASS,
+            20,
+            20,
+            f"Visible Telegram delivery ack passed in {latency_ms:.0f}ms",
+            {"enabled": True, "probe": probe, "failure_class": ""},
+        )
+
+    send = probe.get("send") if isinstance(probe.get("send"), dict) else {}
+    send_ok = bool(send.get("ok"))
+    status = WARN if send_ok else FAIL if options.require_live else WARN
+    summary = (
+        "Telegram sendMessage returned OK, but no real visible ack was observed"
+        if send_ok
+        else f"Visible Telegram probe failed: {probe.get('error', 'unknown error')}"
+    )
+    return _result(
+        "live.telegram_visible_delivery",
+        status,
+        8 if send_ok else 0,
+        20,
+        summary,
+        {
+            "enabled": True,
+            "probe": probe,
+            "failure_class": "telegram_visible_ack_missing"
+            if send_ok
+            else "telegram_delivery_failure",
+        },
+    )
+
+
 def _canary_scorecard_trend(options: CanaryOptions) -> CanaryResult:
     reports_dir = options.output_dir or (options.hermes_home / "canary" / "reports")
     latest_json = reports_dir / "latest.json"
@@ -3149,6 +3369,7 @@ def run_canary_suite(options: CanaryOptions) -> CanaryReport:
         ("eval.hermes_reasoning", 30, lambda: _canary_hermes_reasoning_eval(options)),
         ("eval.frontier_wrapper", 20, lambda: _canary_frontier_wrapper(options)),
         ("live.telegram_e2e", 20, lambda: _canary_telegram_e2e(options)),
+        ("live.telegram_visible_delivery", 20, lambda: _canary_telegram_visible_delivery(options)),
         ("live.x_scrape", 10, lambda: _canary_live_x_scrape(options)),
         ("contract.scorecard_trend", 10, lambda: _canary_scorecard_trend(options)),
         ("contract.aac_workflows", 15, lambda: _canary_aac_workflow_goldens(options)),
@@ -3530,6 +3751,12 @@ def readiness_summary(report: CanaryReport) -> dict[str, Any]:
                 "status": result_status("eval.local_model_reasoning"),
                 "evidence": result_summary("eval.local_model_reasoning"),
                 "purpose": "Direct DeepSeek telemetry; reported separately from orchestration readiness.",
+            },
+            {
+                "name": "telegram_visible_delivery",
+                "status": result_status("live.telegram_visible_delivery"),
+                "evidence": result_summary("live.telegram_visible_delivery"),
+                "purpose": "Human-visible Telegram DM loop; separate from signed webhook simulation.",
             }
         ],
         "docs_basis": [
@@ -3816,6 +4043,18 @@ def build_arg_parser() -> argparse.ArgumentParser:
         help="Run a signed local Telegram webhook simulation and require matching E2E evidence",
     )
     parser.add_argument(
+        "--telegram-visible-probe",
+        action="store_true",
+        default=os.getenv("HERMES_CANARY_TELEGRAM_VISIBLE_PROBE", "").strip().lower() in {"1", "true", "yes", "on"},
+        help="Send a real Telegram DM and wait for a human-visible ack",
+    )
+    parser.add_argument(
+        "--telegram-visible-wait",
+        type=float,
+        default=float(os.getenv("HERMES_CANARY_TELEGRAM_VISIBLE_WAIT", "15") or 15),
+        help="Seconds to wait for --telegram-visible-probe ack",
+    )
+    parser.add_argument(
         "--rfq-dry-run",
         action="store_true",
         default=os.getenv("HERMES_CANARY_RFQ_DRY_RUN", "").strip().lower() in {"1", "true", "yes", "on"},
@@ -3866,6 +4105,8 @@ def options_from_args(args: argparse.Namespace) -> CanaryOptions:
         frontier_api_key=str(getattr(args, "frontier_api_key", "") or ""),
         frontier_base_url=str(getattr(args, "frontier_base_url", "") or "https://api.openai.com/v1"),
         telegram_webhook_sim=bool(getattr(args, "telegram_webhook_sim", False)),
+        telegram_visible_probe=bool(getattr(args, "telegram_visible_probe", False)),
+        telegram_visible_wait=float(getattr(args, "telegram_visible_wait", 15.0) or 15.0),
         rfq_dry_run=bool(getattr(args, "rfq_dry_run", False)),
         require_live=bool(args.require_live),
         timeout=float(args.timeout),

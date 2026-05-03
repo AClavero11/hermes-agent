@@ -49,6 +49,10 @@ def test_canary_suite_runs_without_live_gateway(tmp_path):
         for result in report.results
     )
     assert any(
+        result.name == "live.telegram_visible_delivery" and result.status == SKIP
+        for result in report.results
+    )
+    assert any(
         result.name == "eval.local_model_reasoning" and result.status == SKIP
         for result in report.results
     )

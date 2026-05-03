@@ -7183,6 +7183,18 @@ For more help on a command:
         help="Run a signed local Telegram webhook simulation and require matching E2E evidence",
     )
     canary_parser.add_argument(
+        "--telegram-visible-probe",
+        action="store_true",
+        default=os.getenv("HERMES_CANARY_TELEGRAM_VISIBLE_PROBE", "").strip().lower() in {"1", "true", "yes", "on"},
+        help="Send a real Telegram DM and wait for a human-visible ack",
+    )
+    canary_parser.add_argument(
+        "--telegram-visible-wait",
+        type=float,
+        default=float(os.getenv("HERMES_CANARY_TELEGRAM_VISIBLE_WAIT", "15") or 15),
+        help="Seconds to wait for --telegram-visible-probe ack",
+    )
+    canary_parser.add_argument(
         "--rfq-dry-run",
         action="store_true",
         default=os.getenv("HERMES_CANARY_RFQ_DRY_RUN", "").strip().lower() in {"1", "true", "yes", "on"},
