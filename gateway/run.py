@@ -832,7 +832,7 @@ def _build_hermes_direct_answer(message: str) -> str:
         routes = policy["routes"]
         frontier_state = "available" if policy["frontier_available"] else "not configured"
         if policy["frontier_available"] and not policy["frontier_verified"]:
-            frontier_state = "configured, unverified"
+            frontier_state = "configured; live proof is canary-scored separately"
         return (
             "Hermes online. AC Telegram DM is operator mode.\n"
             f"Planner: `{route_label(routes['planner'])}`.\n"
