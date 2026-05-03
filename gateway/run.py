@@ -932,7 +932,9 @@ def _build_operator_capability_prompt(message: str) -> str:
         "Answer the operator's capability question with the old Sonnet-era Hermes feel: "
         "concise, grounded, operational, no preamble, no apology, no character voice.\n"
         "Do not call tools. Do not mention terminal commands. Do not say 'I can help' "
-        "or 'let me know'. Give AC the highest-value current ways to use Hermes.\n"
+        "or 'let me know'. Do not start bullets with 'I can'. Do not invent meetings, "
+        "generic project management, or assistant roleplay. Give AC the highest-value "
+        "current ways to use Hermes.\n"
         "Return exactly six plain hyphen bullets with these labels: RFQ/quotes, V11 context, "
         "Follow-ups, Hermes runtime, Research links, Code/files. Then end with one approval sentence. "
         "State that customer sends, V11 writes, Atlas writes, and destructive actions require approval. "
@@ -970,6 +972,9 @@ def _operator_capability_answer_failure_reason(text: str) -> str:
         "cannot access files",
         "as an ai",
         "let me know",
+        "scheduling internal meetings",
+        "project management certification",
+        "roleplay",
     ]
     for marker in bad_markers:
         if marker in lowered:
@@ -1003,6 +1008,7 @@ def _finalize_operator_capability_answer(
     answer = (text or "").strip()
     if not answer:
         return ""
+    answer = re.sub(r"(?im)^(\s*-\s*[^:\n]+:\s*)I can\s+", r"\1", answer)
     if "approval" not in answer.lower():
         answer = (
             answer.rstrip()
@@ -1086,7 +1092,8 @@ def _build_operator_capability_model_answer_sync(message: str) -> str:
                 "contents": [{"role": "user", "parts": [{"text": prompt}]}],
                 "generationConfig": {
                     "temperature": 0.2,
-                    "maxOutputTokens": 320,
+                    "maxOutputTokens": 512,
+                    "thinkingConfig": {"thinkingBudget": 0},
                 },
             }
             try:

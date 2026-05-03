@@ -588,6 +588,25 @@ def test_operator_capability_guard_replaces_incomplete_model_output():
     assert "Research/code" in result
 
 
+def test_operator_capability_answer_removes_generic_i_can_prefix():
+    import gateway.run as gateway_run
+
+    answer = (
+        "- RFQ/quotes: I can draft quote packages from V11 stock and customer history.\n"
+        "- V11 context: Pull inventory, customer terms, and source evidence.\n"
+        "- Follow-ups: Prepare customer drafts and next-action notes.\n"
+        "- Hermes runtime: Inspect canaries, logs, and stuck sessions.\n"
+        "- Research links: Digest X links and vendor pages.\n"
+        "- Code/files: Patch repo issues and attach test proof.\n"
+        "Approval required before customer sends, V11/Atlas writes, or destructive actions."
+    )
+
+    result = gateway_run._finalize_operator_capability_answer(answer, provider_label="test")
+
+    assert "- RFQ/quotes: draft quote packages" in result
+    assert "I can" not in result
+
+
 def test_operator_capability_uses_openai_fast_path(monkeypatch):
     import gateway.run as gateway_run
 
