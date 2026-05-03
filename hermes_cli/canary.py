@@ -494,6 +494,15 @@ def _canary_behavior_goldens(options: CanaryOptions) -> CanaryResult:
             "Quality/performance prompts return the current measured metrics without a slow model call.",
         ),
         (
+            "telegram_operator_latency",
+            [
+                "Ack received. No task started.",
+                "_should_send_telegram_turn_receipt",
+                "HERMES_TELEGRAM_NOTIFY_FIRST_INTERVAL",
+            ],
+            "Telegram operator turns get deterministic ack handling and early progress receipts.",
+        ),
+        (
             "goal_idle_supervisor",
             [
                 "_schedule_goal_prompt",
