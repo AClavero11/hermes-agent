@@ -825,7 +825,7 @@ def _build_hermes_direct_answer(message: str) -> str:
     normalized = re.sub(r"[^a-z0-9]+", "", lowered)
     if normalized in {"ack", "acknowledged"}:
         return "Ack received. No task started."
-    if normalized in {"test", "ping"}:
+    if normalized in {"test", "testing", "ping"}:
         return (
             "Hermes online. V4 planner is active via `custom:office-deepseek-v4`; "
             "Alexandria/V11 grounding is enabled; AC Telegram DM is operator mode with file/terminal/code/delegation/web tools."
@@ -962,6 +962,7 @@ _FAST_RECEIPT_SKIP_NORMALIZED = {
     "ok",
     "okay",
     "ping",
+    "testing",
     "test",
     "thanks",
     "thankyou",
@@ -2095,6 +2096,18 @@ class GatewayRunner:
         adapter = self.adapters.get(event.source.platform)
         if not adapter:
             return False  # let default path handle it
+
+        if event.message_type == MessageType.TEXT and not event.get_command():
+            direct_answer = _build_hermes_direct_answer(event.text or "")
+            if direct_answer:
+                thread_meta = {"thread_id": event.source.thread_id} if event.source.thread_id else None
+                await adapter._send_with_retry(
+                    chat_id=event.source.chat_id,
+                    content=direct_answer,
+                    reply_to=event.message_id,
+                    metadata=thread_meta,
+                )
+                return True
 
         # Store the message so it's processed as the next turn after the
         # current run finishes (or is interrupted).
@@ -11678,7 +11691,11 @@ class GatewayRunner:
             while True:
                 await asyncio.sleep(_next_delay)
                 _next_delay = _NOTIFY_INTERVAL
-                _elapsed_mins = int((time.time() - _notify_start) // 60)
+                _elapsed_secs = int(time.time() - _notify_start)
+                if _elapsed_secs < 60:
+                    _elapsed_label = f"{_elapsed_secs}s elapsed"
+                else:
+                    _elapsed_label = f"{_elapsed_secs // 60} min elapsed"
                 # Include agent activity context if available.
                 _agent_ref = agent_holder[0]
                 _status_detail = ""
@@ -11696,7 +11713,7 @@ class GatewayRunner:
                 try:
                     await _notify_adapter.send(
                         source.chat_id,
-                        f"⏳ Still working... ({_elapsed_mins} min elapsed{_status_detail})",
+                        f"⏳ Still working... ({_elapsed_label}{_status_detail})",
                         metadata=_status_thread_metadata,
                     )
                 except Exception as _ne:

@@ -7,6 +7,8 @@ STUDIO_VERSIONED_TARGET="${HERMES_STUDIO_VERSIONED_TARGET:-/Users/anthonyclavero
 STUDIO_ACTIVE_TARGET="${HERMES_STUDIO_ACTIVE_TARGET:-/Users/anthonyclavero/.hermes/hermes-agent}"
 STUDIO_SERVICES_TARGET="${HERMES_STUDIO_SERVICES_TARGET:-/Users/anthonyclavero/.hermes/services}"
 STUDIO_DEEPSEEK_BIN_TARGET="${HERMES_STUDIO_DEEPSEEK_BIN_TARGET:-/Users/anthonyclavero/.hermes-deepseek/bin}"
+STUDIO_LAUNCHD_LABEL="${HERMES_STUDIO_LAUNCHD_LABEL:-ai.hermes.deepseek-gateway}"
+STUDIO_HEALTH_URL="${HERMES_STUDIO_HEALTH_URL:-http://127.0.0.1:8643/health}"
 SSH_PROXYCOMMAND="${HERMES_STUDIO_PROXYCOMMAND:-nc -x localhost:1055 %h %p}"
 RSYNC_RSH="${HERMES_STUDIO_RSYNC_RSH:-ssh -o ProxyCommand='nc -x localhost:1055 %h %p'}"
 
@@ -119,5 +121,21 @@ deploy_repo_target "${STUDIO_ACTIVE_TARGET}"
 rsync -a -e "${RSYNC_RSH}" "${SERVICE_FILES[@]}" "${STUDIO_HOST}:${STUDIO_SERVICES_TARGET}/"
 rsync -a -e "${RSYNC_RSH}" "${WRAPPER_FILE}" "${STUDIO_HOST}:${STUDIO_DEEPSEEK_BIN_TARGET}/hermes-env.sh"
 rsync -a -e "${RSYNC_RSH}" "${CANARY_DAILY_FILE}" "${STUDIO_HOST}:${STUDIO_DEEPSEEK_BIN_TARGET}/hermes-canary-daily"
+
+if [[ "${HERMES_STUDIO_RESTART_AFTER_DEPLOY:-1}" != "0" ]]; then
+  "${SSH_CMD[@]}" "${STUDIO_HOST}" "
+    set -e
+    launchctl kickstart -k gui/\$(id -u)/'${STUDIO_LAUNCHD_LABEL}'
+    for i in \$(seq 1 45); do
+      if curl -fsS --max-time 2 '${STUDIO_HEALTH_URL}' >/tmp/hermes-deploy-health.json; then
+        cat /tmp/hermes-deploy-health.json
+        exit 0
+      fi
+      sleep 1
+    done
+    echo 'gateway health check failed after deploy' >&2
+    exit 1
+  "
+fi
 
 echo "deployed Hermes control-plane patch stack to ${STUDIO_HOST}"

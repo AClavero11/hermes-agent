@@ -1210,6 +1210,13 @@ def _canary_live_behavior(options: CanaryOptions) -> CanaryResult:
             "latency_budget_ms": 1000,
         },
         {
+            "name": "testing_probe_direct",
+            "input": "testing",
+            "required": ["Hermes online", "operator mode"],
+            "forbidden": ["Still working", "waiting for provider", "cannot", "sorry"],
+            "latency_budget_ms": 1000,
+        },
+        {
             "name": "quality_score_direct",
             "input": "Score your quality score we measure your performance by",
             "required": [
