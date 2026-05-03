@@ -7201,6 +7201,12 @@ For more help on a command:
         help="Run a live read-only V11 RFQ quote-package dry run; no V11 writes or customer sends",
     )
     canary_parser.add_argument(
+        "--approved-rfq-draft",
+        action="store_true",
+        default=os.getenv("HERMES_CANARY_APPROVED_RFQ_DRAFT", "").strip().lower() in {"1", "true", "yes", "on"},
+        help="Build an approved-RFQ draft payload, QAMFORM preview, and Telegram approval-card artifact; writes/sends remain disabled",
+    )
+    canary_parser.add_argument(
         "--api-key",
         default=os.getenv("HERMES_CANARY_API_KEY", ""),
         help="API key for live /v1/responses canaries",

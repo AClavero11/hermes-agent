@@ -80,3 +80,5 @@ Every canary JSON/Markdown report now records a `runtime` object with the runtim
 For rsync-only Studio trees without `.git`, the deploy script writes `.hermes-runtime-version.json` so `hermes runtime status` and canary reports still record the source SHA.
 The daily canary runs `--telegram-webhook-sim` so the Telegram gate can be exercised through the signed webhook path without requiring a visible DM for every scheduled run.
 Manual visible-delivery probes use `--telegram-visible-probe`; a same-chat exact nonce ack is recorded as `ack_match=exact`, while a same-chat plain `ack` after the pending visible probe is recorded as `ack_match=loose`.
+The daily canary also runs `--approved-rfq-draft`, which builds a write-guarded V11/Atlas draft payload, renders a QAMFORM11 PDF preview, writes Workspace evidence, and prepares a Telegram approval-card artifact. It does not write V11/Atlas records or send customer-facing messages.
+The deployed `quote_approval_bot.py` approve path must generate internal Telegram draft/PDF previews only. It must not import `gmail_draft.send_email` or send customer email; customer sends belong to the explicit 10.0 audit/follow-up gate.

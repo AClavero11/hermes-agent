@@ -5,6 +5,7 @@ from __future__ import annotations
 import argparse
 import csv
 import importlib
+import importlib.util
 import json
 import os
 import shlex
@@ -45,6 +46,7 @@ class CanaryOptions:
     telegram_visible_probe: bool = False
     telegram_visible_wait: float = 15.0
     rfq_dry_run: bool = False
+    approved_rfq_draft: bool = False
     require_live: bool = False
     timeout: float = 8.0
     fail_under: float = 80.0
@@ -2457,6 +2459,25 @@ def _canary_quote_ops_runtime(options: CanaryOptions) -> CanaryResult:
         else:
             passed.append("approval_gate_terms")
 
+        approval_bot_text = files["quote_approval_bot"].read_text(
+            encoding="utf-8",
+            errors="replace",
+        )
+        forbidden_customer_send = [
+            "from gmail_draft import send_email",
+            "send_email(",
+            "Email delivered to",
+        ]
+        found_customer_send = [
+            term for term in forbidden_customer_send if term in approval_bot_text
+        ]
+        if found_customer_send:
+            failed["customer_send_blocked_on_approve"] = found_customer_send
+        elif "Customer email was not sent" not in approval_bot_text:
+            failed["customer_send_blocked_on_approve"] = "approve path lacks explicit no-send operator message"
+        else:
+            passed.append("customer_send_blocked_on_approve")
+
     env_sources = [
         Path.home() / ".hermes" / ".env",
         Path.home() / ".secrets" / "alexandria.env",
@@ -2490,7 +2511,7 @@ def _canary_quote_ops_runtime(options: CanaryOptions) -> CanaryResult:
     except Exception as exc:
         failed["quote_pdf_health"] = _http_exception_details(exc)
 
-    total_checks = 7
+    total_checks = 8
     score = round(20.0 * len(passed) / total_checks, 1)
     status = PASS if not failed else WARN if passed else FAIL
     return _result(
@@ -3221,6 +3242,448 @@ def _canary_rfq_dry_run_quote_package(options: CanaryOptions) -> CanaryResult:
     )
 
 
+def _parse_condition_from_lot(lot_name: str) -> str:
+    raw = str(lot_name or "")
+    if " - " in raw:
+        candidate = raw.rsplit(" - ", 1)[-1].strip().upper()
+        if candidate:
+            return candidate
+    return "SV"
+
+
+def _condition_label(condition: str) -> str:
+    return {
+        "NE": "New",
+        "NS": "New Surplus",
+        "FN": "Factory New",
+        "SV": "Serviceable",
+        "OH": "Overhauled",
+        "AR": "As Removed",
+        "RP": "Repairable",
+        "US": "Unserviceable",
+        "IN": "Inspected",
+    }.get(str(condition or "").upper(), str(condition or ""))
+
+
+def _build_approved_rfq_draft_package(options: CanaryOptions) -> dict[str, Any]:
+    rfq_package = _build_live_rfq_dry_run_package(options)
+    scenario = rfq_package.get("scenario") or {}
+    v11 = rfq_package.get("v11") or {}
+    pricing = rfq_package.get("pricing") or {}
+    product = v11.get("product") or {}
+    customer = v11.get("customer") or {}
+    stock = v11.get("stock") or {}
+    quants = stock.get("quants") if isinstance(stock.get("quants"), list) else []
+    first_quant = quants[0] if quants and isinstance(quants[0], dict) else {}
+    suggestion = pricing.get("suggestion") or {}
+    quantity = _float_or_zero(scenario.get("quantity")) or 1.0
+    unit_price = _float_or_zero(suggestion.get("candidate_unit_price"))
+    subtotal = round(quantity * unit_price, 2)
+    part_number = str(scenario.get("part_number") or product.get("name") or "")
+    condition = _parse_condition_from_lot(str(first_quant.get("lot") or ""))
+    rfq_id = str(scenario.get("rfq_id") or "HERMES-CANARY-RFQ")
+    draft_ref = f"HERMES-CANARY-DRAFT-{datetime.now(timezone.utc).strftime('%Y%m%d%H%M%S')}"
+    line_description = str(product.get("description") or product.get("display_name") or part_number)
+    partner_id = int(customer.get("id") or 0)
+    product_id = int(product.get("id") or 0)
+
+    draft_line = {
+        "product_id": product_id,
+        "part_number": part_number,
+        "description": line_description,
+        "quantity": quantity,
+        "unit_price": unit_price,
+        "condition": condition,
+        "lot": first_quant.get("lot", ""),
+        "price_basis": suggestion.get("basis", ""),
+        "manual_review_required": bool(suggestion.get("manual_review_required")),
+    }
+    v11_payload = {
+        "target": "v11.sale.order",
+        "method": "create",
+        "write_enabled": False,
+        "values": {
+            "partner_id": partner_id,
+            "client_order_ref": rfq_id,
+            "note": f"Internal Hermes approved-RFQ draft package: {draft_ref}",
+            "order_line": [
+                [
+                    0,
+                    0,
+                    {
+                        "product_id": product_id,
+                        "product_uom_qty": quantity,
+                        "price_unit": unit_price,
+                        "x_studio_field_cOZEb": condition,
+                    },
+                ]
+            ],
+        },
+    }
+    atlas_payload = {
+        "target": "atlas.admin.quotes",
+        "method": "POST",
+        "endpoint": "/api/admin/quotes",
+        "write_enabled": False,
+        "body": {
+            "origin": rfq_id,
+            "customerName": customer.get("name") or scenario.get("customer_name", ""),
+            "lines": [
+                {
+                    "partNumber": part_number,
+                    "description": line_description,
+                    "quantity": quantity,
+                    "unitPrice": unit_price,
+                    "condition": condition,
+                    "advancedIdOrLot": first_quant.get("lot", ""),
+                }
+            ],
+        },
+    }
+    card_text = (
+        f"Approved RFQ draft ready\n"
+        f"{draft_ref}\n"
+        f"Customer: {customer.get('name') or scenario.get('customer_name', '')}\n"
+        f"Part: {part_number} {condition}\n"
+        f"Qty: {quantity:g} | Unit: ${unit_price:,.2f} | Total: ${subtotal:,.2f}\n"
+        "Customer email is blocked. Review QAMFORM preview before any send."
+    )
+    telegram_card = {
+        "send_enabled": False,
+        "chat_id": _telegram_e2e_channel_id(options),
+        "parse_mode": "HTML",
+        "text_preview": card_text,
+        "reply_markup": {
+            "inline_keyboard": [
+                [
+                    {"text": "Approve Draft", "callback_data": f"canary_draft_approve:{draft_ref}"},
+                    {"text": "Reject", "callback_data": f"canary_draft_reject:{draft_ref}"},
+                ]
+            ]
+        },
+    }
+    return {
+        "schema_version": 1,
+        "created_at": datetime.now(timezone.utc).replace(microsecond=0).isoformat(),
+        "mode": "approved_rfq_draft_guarded",
+        "draft_reference": draft_ref,
+        "source_rfq_package": rfq_package,
+        "operator_approval": {
+            "status": "approved_for_internal_draft_package",
+            "mode": "canary_simulated_operator_approval",
+            "approved_actions": [
+                "prepare_v11_draft_payload",
+                "prepare_atlas_draft_payload",
+                "render_qamform_preview",
+                "prepare_telegram_approval_card",
+            ],
+            "blocked_actions": [
+                "write_v11_sale_order",
+                "write_atlas_quote",
+                "send_customer_email",
+                "send_customer_message",
+                "confirm_sale_order",
+            ],
+        },
+        "draft_line": draft_line,
+        "v11_draft": v11_payload,
+        "atlas_draft": atlas_payload,
+        "telegram_approval_card": telegram_card,
+        "qamform_preview": {},
+        "guardrails": {
+            "external_send": False,
+            "customer_facing_send": False,
+            "v11_create_or_write": False,
+            "atlas_create_or_write": False,
+            "telegram_send": False,
+            "approval_required_before_customer_send": True,
+            "write_methods_called": [],
+        },
+    }
+
+
+def _render_approved_rfq_qamform_preview(
+    package: dict[str, Any],
+    output_dir: Path,
+) -> dict[str, Any]:
+    service_dir = Path.home() / ".hermes" / "services"
+    quote_pdf_path = service_dir / "quote_pdf.py"
+    if not quote_pdf_path.is_file():
+        raise FileNotFoundError(str(quote_pdf_path))
+    previous_dyld_fallback = os.environ.get("DYLD_FALLBACK_LIBRARY_PATH", "")
+    homebrew_lib = "/opt/homebrew/lib"
+    if Path(homebrew_lib).is_dir():
+        paths = [path for path in previous_dyld_fallback.split(":") if path]
+        if homebrew_lib not in paths:
+            os.environ["DYLD_FALLBACK_LIBRARY_PATH"] = ":".join([homebrew_lib, *paths])
+    try:
+        spec = importlib.util.spec_from_file_location("hermes_canary_quote_pdf", quote_pdf_path)
+        if spec is None or spec.loader is None:
+            raise ImportError(f"cannot load quote_pdf module from {quote_pdf_path}")
+        quote_pdf = importlib.util.module_from_spec(spec)
+        spec.loader.exec_module(quote_pdf)
+
+        source = package.get("source_rfq_package") or {}
+        scenario = source.get("scenario") or {}
+        line = package.get("draft_line") or {}
+        customer_name = str(scenario.get("customer_name") or "Hermes Canary Customer")
+        quantity = _float_or_zero(line.get("quantity")) or 1.0
+        unit_price = _float_or_zero(line.get("unit_price"))
+        subtotal = round(quantity * unit_price, 2)
+        condition = str(line.get("condition") or "")
+        now = datetime.now(timezone.utc).replace(microsecond=0)
+        so_data = quote_pdf._Obj(
+            name=package.get("draft_reference", "HERMES-CANARY-DRAFT"),
+            state="draft",
+            date_order=now.strftime("%Y-%m-%d %H:%M:%S"),
+            validity_date="",
+            client_order_ref=scenario.get("rfq_id", ""),
+            amount_total=subtotal,
+            payment_term="Net 30",
+            partner=quote_pdf._Obj(
+                name=customer_name,
+                street="",
+                street2="",
+                city="",
+                state="",
+                zip="",
+                country="",
+                phone="",
+                email="",
+                mobile="",
+            ),
+            ship_to=quote_pdf._Obj(
+                name=customer_name,
+                street="",
+                street2="",
+                city="",
+                state="",
+                zip="",
+                country="",
+                phone="",
+                email="",
+                mobile="",
+            ),
+            lines=[
+                quote_pdf._Obj(
+                    part_number=line.get("part_number", ""),
+                    description=line.get("description", ""),
+                    condition=_condition_label(condition),
+                    condition_raw=condition,
+                    needs_fresh_tag=condition == "SV",
+                    needs_overhaul=condition in {"OH", "RP"},
+                    needs_work=condition in {"SV", "OH", "RP"},
+                    tag_info="",
+                    tag_number="",
+                    trace_to="",
+                    qty=quantity,
+                    unit_price=unit_price,
+                    subtotal=subtotal,
+                )
+            ],
+        )
+        pdf_bytes = quote_pdf.render_quote_pdf(
+            so_data,
+            access_url=f"https://advanced.aero/d/{package.get('draft_reference', 'hermes-canary')}",
+        )
+    finally:
+        if previous_dyld_fallback:
+            os.environ["DYLD_FALLBACK_LIBRARY_PATH"] = previous_dyld_fallback
+        else:
+            os.environ.pop("DYLD_FALLBACK_LIBRARY_PATH", None)
+    if not pdf_bytes:
+        raise RuntimeError("QAMFORM renderer returned empty PDF")
+    output_dir.mkdir(parents=True, exist_ok=True)
+    safe_ref = "".join(
+        ch if ch.isalnum() or ch in {"-", "_"} else "-"
+        for ch in str(package.get("draft_reference") or "hermes-canary")
+    )
+    pdf_path = output_dir / f"{safe_ref}-QAMFORM11-preview.pdf"
+    pdf_path.write_bytes(pdf_bytes)
+    return {
+        "status": "rendered",
+        "qamform_id": "QAMFORM11",
+        "state": "draft",
+        "pdf_path": str(pdf_path),
+        "pdf_bytes": len(pdf_bytes),
+    }
+
+
+def _render_approved_rfq_draft_markdown(package: dict[str, Any]) -> str:
+    source = package.get("source_rfq_package") or {}
+    scenario = source.get("scenario") or {}
+    line = package.get("draft_line") or {}
+    preview = package.get("qamform_preview") or {}
+    guardrails = package.get("guardrails") or {}
+    return "\n".join(
+        [
+            "# Hermes Approved RFQ Draft Package",
+            "",
+            f"- Draft reference: {package.get('draft_reference', '')}",
+            f"- Customer: {scenario.get('customer_name', '')}",
+            f"- Part: {line.get('part_number', '')}",
+            f"- Quantity: {_float_or_zero(line.get('quantity')):g}",
+            f"- Unit price: ${_float_or_zero(line.get('unit_price')):,.2f}",
+            f"- Condition: {line.get('condition', '')}",
+            f"- QAMFORM preview: {preview.get('pdf_path', '')}",
+            "",
+            "## Guardrails",
+            "",
+            f"- V11 write enabled: {bool((package.get('v11_draft') or {}).get('write_enabled'))}",
+            f"- Atlas write enabled: {bool((package.get('atlas_draft') or {}).get('write_enabled'))}",
+            f"- Telegram send enabled: {bool((package.get('telegram_approval_card') or {}).get('send_enabled'))}",
+            f"- Customer-facing send: {bool(guardrails.get('customer_facing_send'))}",
+            f"- Approval required before customer send: {bool(guardrails.get('approval_required_before_customer_send'))}",
+            "",
+        ]
+    )
+
+
+def _write_approved_rfq_draft_artifacts(options: CanaryOptions, package: dict[str, Any]) -> dict[str, str]:
+    output_dir = options.hermes_home / "canary" / "approved_rfq_drafts"
+    output_dir.mkdir(parents=True, exist_ok=True)
+    preview = _render_approved_rfq_qamform_preview(package, output_dir)
+    package["qamform_preview"] = preview
+    timestamp = datetime.now(timezone.utc).strftime("%Y%m%d-%H%M%S")
+    draft_ref = str(package.get("draft_reference") or "hermes-canary-draft").lower()
+    slug = "".join(ch if ch.isalnum() else "-" for ch in draft_ref).strip("-")[:80]
+    json_path = output_dir / f"{timestamp}-{slug}.json"
+    markdown_path = output_dir / f"{timestamp}-{slug}.md"
+    json_path.write_text(json.dumps(package, indent=2, sort_keys=True), encoding="utf-8")
+    markdown_path.write_text(_render_approved_rfq_draft_markdown(package), encoding="utf-8")
+    latest_json = output_dir / "latest.json"
+    latest_markdown = output_dir / "latest.md"
+    latest_json.write_text(json.dumps(package, indent=2, sort_keys=True), encoding="utf-8")
+    latest_markdown.write_text(_render_approved_rfq_draft_markdown(package), encoding="utf-8")
+    return {
+        "json_path": str(json_path),
+        "markdown_path": str(markdown_path),
+        "pdf_path": str(preview.get("pdf_path", "")),
+        "latest_json": str(latest_json),
+        "latest_markdown": str(latest_markdown),
+    }
+
+
+def _attach_approved_rfq_draft_to_workspace(
+    options: CanaryOptions,
+    package: dict[str, Any],
+    artifacts: dict[str, str],
+) -> dict[str, str]:
+    from hermes_cli.workspace import WorkspaceStore
+
+    scenario = (package.get("source_rfq_package") or {}).get("scenario") or {}
+    store = WorkspaceStore(options.hermes_home / "workspace" / "control_plane.json")
+    task = store.create_task(
+        f"Approved RFQ draft canary: {scenario.get('customer_name', '')} {scenario.get('part_number', '')}",
+        owner="hermes",
+        priority="normal",
+        project="hermes-canary",
+        source="canary",
+        status="in_progress",
+        note="Approved-RFQ draft payload, QAMFORM preview, and Telegram approval card generated with writes disabled.",
+    )
+    store.add_evidence(
+        task_id=task["id"],
+        kind="approved_rfq_draft",
+        title="Write-guarded draft quote approval package",
+        locator=artifacts["json_path"],
+        summary=f"Draft JSON: {artifacts['json_path']}; QAMFORM preview: {artifacts['pdf_path']}",
+        metadata={"markdown_path": artifacts["markdown_path"], "pdf_path": artifacts["pdf_path"]},
+    )
+    store.update_task(
+        task["id"],
+        status="done",
+        next_action="Enable live draft write only after a real RFQ/operator approval; customer send remains blocked.",
+    )
+    return {"task_id": task["id"], "store_path": str(store.path)}
+
+
+def _canary_approved_rfq_draft_quote(options: CanaryOptions) -> CanaryResult:
+    if not options.approved_rfq_draft:
+        return _result(
+            "live.approved_rfq_draft_quote",
+            SKIP,
+            0,
+            30,
+            "Approved-RFQ draft canary not enabled; pass --approved-rfq-draft for QAMFORM/approval-card proof",
+            {"enabled": False},
+        )
+
+    try:
+        package = _build_approved_rfq_draft_package(options)
+        artifacts = _write_approved_rfq_draft_artifacts(options, package)
+        workspace = _attach_approved_rfq_draft_to_workspace(options, package, artifacts)
+        package["workspace"] = workspace
+        artifacts = _write_approved_rfq_draft_artifacts(options, package)
+    except Exception as exc:
+        return _result(
+            "live.approved_rfq_draft_quote",
+            FAIL if options.require_live else WARN,
+            0,
+            30,
+            f"Approved-RFQ draft package failed: {type(exc).__name__}: {exc}",
+            {
+                "enabled": True,
+                "failure_class": "approved_rfq_draft_failure",
+                "error_type": type(exc).__name__,
+            },
+        )
+
+    service_dir = Path.home() / ".hermes" / "services"
+    approval_bot_path = service_dir / "quote_approval_bot.py"
+    try:
+        approval_bot_text = approval_bot_path.read_text(encoding="utf-8", errors="replace")
+    except OSError:
+        approval_bot_text = ""
+    source = package.get("source_rfq_package") or {}
+    guardrails = package.get("guardrails") or {}
+    preview = package.get("qamform_preview") or {}
+    checks = {
+        "source_rfq_package_loaded": bool((source.get("v11") or {}).get("authenticated")),
+        "operator_approval_recorded": (package.get("operator_approval") or {}).get("status")
+        == "approved_for_internal_draft_package",
+        "v11_draft_payload_ready": bool((package.get("v11_draft") or {}).get("values")),
+        "atlas_draft_payload_ready": bool((package.get("atlas_draft") or {}).get("body")),
+        "v11_write_guarded": (package.get("v11_draft") or {}).get("write_enabled") is False
+        and guardrails.get("v11_create_or_write") is False,
+        "atlas_write_guarded": (package.get("atlas_draft") or {}).get("write_enabled") is False
+        and guardrails.get("atlas_create_or_write") is False,
+        "customer_send_blocked": guardrails.get("customer_facing_send") is False
+        and guardrails.get("external_send") is False,
+        "telegram_card_ready": bool((package.get("telegram_approval_card") or {}).get("reply_markup")),
+        "telegram_send_guarded": (package.get("telegram_approval_card") or {}).get("send_enabled") is False,
+        "qamform_preview_written": Path(str(preview.get("pdf_path") or "")).is_file()
+        and int(preview.get("pdf_bytes") or 0) > 1000,
+        "artifacts_written": Path(artifacts["json_path"]).is_file()
+        and Path(artifacts["markdown_path"]).is_file()
+        and Path(artifacts["pdf_path"]).is_file(),
+        "workspace_task_created": bool((package.get("workspace") or {}).get("task_id")),
+        "approval_bot_does_not_send_customer_email": "from gmail_draft import send_email" not in approval_bot_text
+        and "send_email(" not in approval_bot_text
+        and "Customer email was not sent" in approval_bot_text,
+    }
+    failed = {name: value for name, value in checks.items() if not value}
+    score = round(30.0 * (len(checks) - len(failed)) / len(checks), 1)
+    status = PASS if not failed else WARN
+    return _result(
+        "live.approved_rfq_draft_quote",
+        status,
+        score,
+        30,
+        f"{len(checks) - len(failed)}/{len(checks)} approved-RFQ draft checks passed",
+        {
+            "enabled": True,
+            "checks": checks,
+            "failed": failed,
+            "artifact": artifacts,
+            "workspace": package.get("workspace", {}),
+            "draft_reference": package.get("draft_reference", ""),
+            "write_mode": "guarded_payload_only",
+            "failure_class": "missing_evidence" if failed else "",
+        },
+    )
+
+
 def _canary_planner_self_heal(options: CanaryOptions) -> CanaryResult:
     run_path = options.repo_root / "gateway" / "run.py"
     config_path = options.hermes_home / "config.yaml"
@@ -3376,6 +3839,7 @@ def run_canary_suite(options: CanaryOptions) -> CanaryReport:
         ("contract.aac_workflows", 15, lambda: _canary_aac_workflow_goldens(options)),
         ("contract.quote_ops_runtime", 20, lambda: _canary_quote_ops_runtime(options)),
         ("live.rfq_dry_run_quote_package", 25, lambda: _canary_rfq_dry_run_quote_package(options)),
+        ("live.approved_rfq_draft_quote", 30, lambda: _canary_approved_rfq_draft_quote(options)),
         ("contract.planner_self_heal", 20, lambda: _canary_planner_self_heal(options)),
     ]
     results = [_time_case(name, max_score, fn) for name, max_score, fn in cases]
@@ -3486,9 +3950,20 @@ def _quality_dimensions(report: CanaryReport) -> list[QualityDimension]:
 
     quote_ops_result = _result_by_name(report, "contract.quote_ops_runtime")
     rfq_dry_run_result = _result_by_name(report, "live.rfq_dry_run_quote_package")
+    approved_rfq_draft_result = _result_by_name(report, "live.approved_rfq_draft_quote")
     business_ops_score = 5.0
     business_ops_summary = "Quote automation runtime is not yet verified."
     if (
+        quote_ops_result
+        and quote_ops_result.status == PASS
+        and rfq_dry_run_result
+        and rfq_dry_run_result.status == PASS
+        and approved_rfq_draft_result
+        and approved_rfq_draft_result.status == PASS
+    ):
+        business_ops_score = 9.7
+        business_ops_summary = "Approved-RFQ draft payload, QAMFORM preview, and Telegram approval-card package pass with customer sends blocked."
+    elif (
         quote_ops_result
         and quote_ops_result.status == PASS
         and rfq_dry_run_result
@@ -3627,7 +4102,14 @@ def quality_summary(report: CanaryReport) -> dict[str, Any]:
         {
             "target": "9.7/10",
             "increment": "Approved RFQs create V11/Atlas draft quotes with QAMFORM preview and Telegram approval card",
-            "status": "open",
+            "status": "done" if (
+                _result_by_name(report, "contract.quote_ops_runtime")
+                and _result_by_name(report, "contract.quote_ops_runtime").status == PASS
+                and _result_by_name(report, "live.rfq_dry_run_quote_package")
+                and _result_by_name(report, "live.rfq_dry_run_quote_package").status == PASS
+                and _result_by_name(report, "live.approved_rfq_draft_quote")
+                and _result_by_name(report, "live.approved_rfq_draft_quote").status == PASS
+            ) else "open",
         },
         {
             "target": "10.0/10",
@@ -4062,6 +4544,12 @@ def build_arg_parser() -> argparse.ArgumentParser:
         help="Run a live read-only V11 RFQ quote-package dry run; no V11 writes or customer sends",
     )
     parser.add_argument(
+        "--approved-rfq-draft",
+        action="store_true",
+        default=os.getenv("HERMES_CANARY_APPROVED_RFQ_DRAFT", "").strip().lower() in {"1", "true", "yes", "on"},
+        help="Build an approved-RFQ draft payload, QAMFORM preview, and Telegram approval-card artifact; writes/sends remain disabled",
+    )
+    parser.add_argument(
         "--api-key",
         default=os.getenv("HERMES_CANARY_API_KEY", ""),
         help="API key for live /v1/responses canaries; defaults to HERMES_CANARY_API_KEY",
@@ -4109,6 +4597,7 @@ def options_from_args(args: argparse.Namespace) -> CanaryOptions:
         telegram_visible_probe=bool(getattr(args, "telegram_visible_probe", False)),
         telegram_visible_wait=float(getattr(args, "telegram_visible_wait", 15.0) or 15.0),
         rfq_dry_run=bool(getattr(args, "rfq_dry_run", False)),
+        approved_rfq_draft=bool(getattr(args, "approved_rfq_draft", False)),
         require_live=bool(args.require_live),
         timeout=float(args.timeout),
         fail_under=float(args.fail_under),
