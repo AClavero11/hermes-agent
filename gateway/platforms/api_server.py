@@ -301,6 +301,26 @@ def _gateway_direct_reply_text(content: Any) -> str:
         return ""
 
 
+async def _gateway_operator_capability_reply_text(content: Any) -> str:
+    """Return model-backed operator capability text without entering the agent loop."""
+    text = _normalize_chat_content(content).strip()
+    if not text:
+        return ""
+    try:
+        from gateway import run as gateway_run
+
+        is_capability = getattr(gateway_run, "_is_operator_capability_prompt", None)
+        build_answer = getattr(gateway_run, "_build_operator_capability_model_answer", None)
+        if not callable(is_capability) or not callable(build_answer):
+            return ""
+        if not bool(is_capability(text)):
+            return ""
+        return str(await build_answer(text) or "").strip()
+    except Exception as exc:
+        logger.debug("Gateway operator capability probe failed: %s", exc)
+        return ""
+
+
 def _deterministic_no_tool_reply_text(content: Any) -> str:
     """Answer narrow exact-output tasks without paying the agent/tool tax."""
     text = _normalize_chat_content(content).strip()
@@ -1033,7 +1053,8 @@ class APIServerAdapter(BasePlatformAdapter):
             }
             return web.json_response(response_data, headers={"X-Hermes-Session-Id": session_id})
 
-        direct_reply = _gateway_direct_reply_text(user_message)
+        operator_shortcuts_allowed = not history
+        direct_reply = _gateway_direct_reply_text(user_message) if operator_shortcuts_allowed else ""
         if direct_reply:
             response_data = {
                 "id": completion_id,
@@ -1906,7 +1927,8 @@ class APIServerAdapter(BasePlatformAdapter):
                     self._response_store.set_conversation(conversation, response_id)
             return web.json_response(response_data)
 
-        direct_reply = _gateway_direct_reply_text(user_message)
+        operator_shortcuts_allowed = not conversation_history
+        direct_reply = _gateway_direct_reply_text(user_message) if operator_shortcuts_allowed else ""
         if direct_reply:
             response_id = f"resp_{uuid.uuid4().hex[:28]}"
             created_at = int(time.time())
@@ -1935,6 +1957,48 @@ class APIServerAdapter(BasePlatformAdapter):
                 full_history = list(conversation_history)
                 full_history.append({"role": "user", "content": user_message})
                 full_history.append({"role": "assistant", "content": direct_reply})
+                self._response_store.put(response_id, {
+                    "response": response_data,
+                    "conversation_history": full_history,
+                    "instructions": instructions,
+                    "session_id": session_id,
+                })
+                if conversation:
+                    self._response_store.set_conversation(conversation, response_id)
+            return web.json_response(response_data)
+        capability_reply = (
+            await _gateway_operator_capability_reply_text(user_message)
+            if operator_shortcuts_allowed
+            else ""
+        )
+        if capability_reply:
+            response_id = f"resp_{uuid.uuid4().hex[:28]}"
+            created_at = int(time.time())
+            response_data = {
+                "id": response_id,
+                "object": "response",
+                "status": "completed",
+                "created_at": created_at,
+                "model": body.get("model", self._model_name),
+                "output": [
+                    {
+                        "type": "message",
+                        "role": "assistant",
+                        "content": [
+                            {"type": "output_text", "text": capability_reply}
+                        ],
+                    }
+                ],
+                "usage": {
+                    "input_tokens": 0,
+                    "output_tokens": 0,
+                    "total_tokens": 0,
+                },
+            }
+            if store:
+                full_history = list(conversation_history)
+                full_history.append({"role": "user", "content": user_message})
+                full_history.append({"role": "assistant", "content": capability_reply})
                 self._response_store.put(response_id, {
                     "response": response_data,
                     "conversation_history": full_history,

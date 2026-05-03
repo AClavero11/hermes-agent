@@ -1111,6 +1111,42 @@ class TestResponsesEndpoint:
         mock_run.assert_not_called()
 
     @pytest.mark.asyncio
+    async def test_responses_operator_capability_bypasses_agent_with_model_fast_path(self, adapter):
+        capability_text = (
+            "- RFQ/quotes: generate quote packages from V11 stock and customer history.\n"
+            "- V11 context: retrieve inventory, customer terms, and source evidence.\n"
+            "- Follow-ups: draft customer follow-ups for approval.\n"
+            "- Hermes runtime: inspect canaries, logs, and stuck sessions.\n"
+            "- Research links: digest X links and vendor pages.\n"
+            "- Code/files: patch repo issues and attach test proof.\n"
+            "Approval required before customer sends, V11/Atlas writes, or destructive actions."
+        )
+
+        app = _create_app(adapter)
+        async with TestClient(TestServer(app)) as cli:
+            with patch("gateway.platforms.api_server._gateway_direct_reply_text", return_value=""):
+                with patch(
+                    "gateway.platforms.api_server._gateway_operator_capability_reply_text",
+                    new_callable=AsyncMock,
+                ) as capability_reply:
+                    capability_reply.return_value = capability_text
+                    with patch.object(adapter, "_run_agent", new_callable=AsyncMock) as mock_run:
+                        resp = await cli.post(
+                            "/v1/responses",
+                            json={
+                                "model": "hermes-agent",
+                                "input": "how can you help me right now",
+                                "store": False,
+                            },
+                        )
+                        assert resp.status == 200
+                        data = await resp.json()
+
+        assert data["output"][0]["content"][0]["text"] == capability_text
+        capability_reply.assert_awaited_once()
+        mock_run.assert_not_called()
+
+    @pytest.mark.asyncio
     async def test_successful_response_with_array_input(self, adapter):
         """Array input with role/content objects."""
         mock_result = {"final_response": "Done", "messages": [], "api_calls": 1}
