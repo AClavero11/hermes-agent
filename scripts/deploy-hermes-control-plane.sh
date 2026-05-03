@@ -41,6 +41,7 @@ REPO_FILES=(
   docs/AAC_LOCAL_DEEPSEEK.md
   docs/AAC_MIGRATION_v2026.4.23.md
   docs/HERMES_SELF_HEAL_PLAYBOOKS.md
+  docs/inspections/hermes-condition-inspection-2026-05-02.md
   docs/patch-manifests/hermes-control-plane-2026-05-02.md
   scripts/hermes-canary-daily
   scripts/deploy-hermes-control-plane.sh

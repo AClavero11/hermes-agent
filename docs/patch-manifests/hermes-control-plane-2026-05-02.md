@@ -34,6 +34,7 @@ These files define the reproducible Hermes control-plane patch stack:
 | `docs/AAC_LOCAL_DEEPSEEK.md` | Local DeepSeek operating notes |
 | `docs/AAC_MIGRATION_v2026.4.23.md` | Migration notes |
 | `docs/HERMES_SELF_HEAL_PLAYBOOKS.md` | Bounded self-heal policy |
+| `docs/inspections/hermes-condition-inspection-2026-05-02.md` | Full-stack Hermes condition inspection and overhaul scorecard |
 | `docs/patch-manifests/hermes-control-plane-2026-05-02.md` | This manifest |
 | `scripts/deploy-hermes-control-plane.sh` | Exact-file deploy script for local-to-Studio sync and runtime SHA metadata |
 | `scripts/hermes-canary-daily` | Daily canary wrapper with signed Telegram webhook simulation |
