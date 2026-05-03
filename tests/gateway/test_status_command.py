@@ -575,6 +575,19 @@ def test_operator_capability_guard_replaces_bad_model_output():
     assert "Approval required" in result
 
 
+def test_operator_capability_guard_replaces_incomplete_model_output():
+    import gateway.run as gateway_run
+
+    result = gateway_run._finalize_operator_capability_answer(
+        "* RFQ/Quote Drafting: Generate and",
+        provider_label="test",
+    )
+
+    assert result.startswith("Hermes operator planner did not return")
+    assert "too short" in result
+    assert "Research/code" in result
+
+
 def test_classify_malformed_hermes_response_blocks_repeated_quote_refusal():
     import gateway.run as gateway_run
 

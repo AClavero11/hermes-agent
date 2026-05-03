@@ -702,6 +702,9 @@ def test_telegram_operator_expected_substrings_follow_prompt_choice():
     assert canary_module._telegram_operator_expected_substrings("what can we do") == [
         "RFQ",
         "V11",
+        "follow",
+        "Hermes",
+        "code",
         "approval",
     ]
     assert canary_module._telegram_operator_expected_substrings("ack") == [

@@ -911,10 +911,10 @@ def _build_operator_capability_prompt(message: str) -> str:
         "concise, grounded, operational, no preamble, no apology, no character voice.\n"
         "Do not call tools. Do not mention terminal commands. Do not say 'I can help' "
         "or 'let me know'. Give AC the highest-value current ways to use Hermes.\n"
-        "Include these concrete lanes: RFQ/quote drafting, V11 inventory/customer context, "
-        "follow-ups, Hermes/runtime repair, link/research digestion, and code/file work. "
-        "State that customer sends, V11 writes, Atlas writes, and destructive actions require approval.\n"
-        "Use bullets. Keep under 150 words.\n\n"
+        "Return exactly six plain hyphen bullets with these labels: RFQ/quotes, V11 context, "
+        "Follow-ups, Hermes runtime, Research links, Code/files. Then end with one approval sentence. "
+        "State that customer sends, V11 writes, Atlas writes, and destructive actions require approval. "
+        "Keep under 150 words.\n\n"
         f"Current routes: planner={_friendly_model_route_label(routes['planner'])}; "
         f"executor={_friendly_model_route_label(routes['executor'])}; "
         f"judge={_friendly_model_route_label(routes['verifier'])}; "
@@ -931,11 +931,12 @@ def _operator_capability_fallback(error: str) -> str:
         "- Inventory: inspect V11 on-hand IDG/CSD parts and quote targets.\n"
         "- Follow-ups: prepare customer drafts only.\n"
         "- Hermes: inspect runtime, canaries, logs, and patch failures.\n"
+        "- Research/code: digest links, inspect files, patch code, and attach evidence.\n"
         "Approval required before customer sends, V11/Atlas writes, or destructive actions."
     )
 
 
-def _operator_capability_answer_is_bad(text: str) -> bool:
+def _operator_capability_answer_failure_reason(text: str) -> str:
     lowered = (text or "").lower()
     bad_markers = [
         "terminal:",
@@ -947,20 +948,51 @@ def _operator_capability_answer_is_bad(text: str) -> bool:
         "as an ai",
         "let me know",
     ]
-    return any(marker in lowered for marker in bad_markers)
+    for marker in bad_markers:
+        if marker in lowered:
+            return f"bad marker: {marker}"
+    if len(re.findall(r"\w+", text or "")) < 25:
+        return "too short"
+    required_groups = {
+        "rfq": ("rfq", "quote"),
+        "v11": ("v11", "inventory", "stock"),
+        "followups": ("follow",),
+        "hermes": ("hermes", "runtime", "canary"),
+        "code": ("code", "file", "patch"),
+        "approval": ("approval",),
+    }
+    missing = [
+        group
+        for group, terms in required_groups.items()
+        if not any(term in lowered for term in terms)
+    ]
+    if missing:
+        return "missing lanes: " + ", ".join(missing)
+    return ""
 
 
-def _finalize_operator_capability_answer(text: str, *, provider_label: str) -> str:
+def _finalize_operator_capability_answer(
+    text: str,
+    *,
+    provider_label: str,
+    fallback_on_failure: bool = True,
+) -> str:
     answer = (text or "").strip()
     if not answer:
         return ""
-    if _operator_capability_answer_is_bad(answer):
-        return _operator_capability_fallback(f"{provider_label} output failed operator guard")
     if "approval" not in answer.lower():
         answer = (
             answer.rstrip()
             + "\nApproval required before customer sends, V11/Atlas writes, or destructive actions."
         )
+    failure_reason = _operator_capability_answer_failure_reason(answer)
+    if failure_reason:
+        logger.info("Operator capability %s output rejected: %s", provider_label, failure_reason)
+        if fallback_on_failure:
+            return _operator_capability_fallback(
+                f"{provider_label} output failed operator guard: {failure_reason}"
+            )
+        return ""
     return answer
 
 
@@ -991,7 +1023,13 @@ def _build_operator_capability_model_answer_sync(message: str) -> str:
             try:
                 text = _extract_gemini_text(_post_json(url, payload, timeout=timeout))
                 if text:
-                    return _finalize_operator_capability_answer(text, provider_label="Gemini")
+                    answer = _finalize_operator_capability_answer(
+                        text,
+                        provider_label="Gemini",
+                        fallback_on_failure=False,
+                    )
+                    if answer:
+                        return answer
             except Exception as exc:
                 logger.info("Operator capability Gemini route failed: %s", exc)
 
@@ -1019,7 +1057,12 @@ def _build_operator_capability_model_answer_sync(message: str) -> str:
                 message_payload = choices[0].get("message") if isinstance(choices[0], dict) else {}
                 text = str(message_payload.get("content") or "").strip()
                 if text:
-                    return _finalize_operator_capability_answer(text, provider_label="local executor")
+                    answer = _finalize_operator_capability_answer(
+                        text,
+                        provider_label="local executor",
+                    )
+                    if answer:
+                        return answer
         except Exception as exc:
             logger.info("Operator capability local route failed: %s", exc)
             return _operator_capability_fallback(f"{type(exc).__name__}: {exc}")

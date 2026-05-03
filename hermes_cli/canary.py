@@ -837,7 +837,9 @@ def _canary_behavior_goldens(options: CanaryOptions) -> CanaryResult:
                 "_is_operator_capability_prompt",
                 "_build_operator_capability_model_answer",
                 "operator_capability_prompt",
-                "RFQ/quote drafting",
+                "RFQ/quotes",
+                "V11 context",
+                "Code/files",
                 "customer sends, V11 writes, Atlas writes",
                 "RFQ mode",
                 "Inventory mode",
@@ -1583,7 +1585,7 @@ def _canary_live_behavior(options: CanaryOptions) -> CanaryResult:
         {
             "name": "operator_capability_model_route",
             "input": "how can you help me right now",
-            "required": ["RFQ", "V11", "approval"],
+            "required": ["RFQ", "V11", "follow", "Hermes", "code", "approval"],
             "forbidden": [
                 "terminal:",
                 "notification_rules.md",
@@ -2696,7 +2698,7 @@ def _telegram_operator_expected_substrings(prompt: str) -> list[str]:
         return ["Follow-up mode", "drafts only", "approval"]
     if normalized == "hermes":
         return ["Hermes mode", "runtime path", "canary"]
-    return ["RFQ", "V11", "approval"]
+    return ["RFQ", "V11", "follow", "Hermes", "code", "approval"]
 
 
 def _run_telegram_operator_response_probe(options: CanaryOptions) -> dict[str, Any]:
