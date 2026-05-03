@@ -46,6 +46,7 @@ REPO_FILES=(
   tests/tools/test_x_scraper_tool.py
   docs/AAC_LOCAL_DEEPSEEK.md
   docs/AAC_MIGRATION_v2026.4.23.md
+  docs/HERMES_10_OVERHAUL.md
   docs/HERMES_SELF_HEAL_PLAYBOOKS.md
   docs/inspections/hermes-condition-inspection-2026-05-02.md
   docs/patch-manifests/hermes-control-plane-2026-05-02.md
