@@ -71,6 +71,12 @@ def _route(
 
 def _frontier_model(env: Mapping[str, Any], provider: str) -> str:
     if provider == "gemini":
+        if not (_flag(env, "HERMES_FRONTIER_AVAILABLE") or _flag(env, "HERMES_GEMINI_FRONTIER_AVAILABLE")):
+            return _first_value(
+                env,
+                ("HERMES_GEMINI_FRONTIER_FALLBACK_MODEL", "GEMINI_FRONTIER_FALLBACK_MODEL"),
+                "gemini-2.5-flash",
+            )
         return _first_value(
             env,
             ("HERMES_FRONTIER_MODEL", "HERMES_GEMINI_FRONTIER_MODEL", "GEMINI_FRONTIER_MODEL"),

@@ -65,4 +65,4 @@ def test_routes_accept_redacted_key_presence_for_gemini():
 
     assert policy["frontier_available"] is True
     assert policy["frontier_verified"] is False
-    assert "hard_task_planner=gemini:gemini-2.5-pro" in route_summary(policy)
+    assert "hard_task_planner=gemini:gemini-2.5-flash" in route_summary(policy)
