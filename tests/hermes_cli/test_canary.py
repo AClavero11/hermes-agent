@@ -598,6 +598,15 @@ def test_telegram_operator_expected_substrings_follow_prompt_choice():
         "`followups`",
         "`hermes`",
     ]
+    assert canary_module._telegram_operator_expected_substrings("ack") == [
+        "Ack received",
+        "No task started",
+    ]
+    assert canary_module._telegram_operator_expected_substrings("testing") == [
+        "Hermes online",
+        "V4 planner",
+        "Alexandria/V11",
+    ]
     assert canary_module._telegram_operator_expected_substrings("rfq") == [
         "RFQ mode",
         "draft package",

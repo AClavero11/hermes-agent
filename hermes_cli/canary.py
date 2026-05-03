@@ -2368,6 +2368,10 @@ def _telegram_operator_response_paths(options: CanaryOptions) -> tuple[Path, Pat
 
 def _telegram_operator_expected_substrings(prompt: str) -> list[str]:
     normalized = re.sub(r"[^a-z0-9]+", "", (prompt or "").lower())
+    if normalized in {"ack", "acknowledged"}:
+        return ["Ack received", "No task started"]
+    if normalized in {"test", "testing", "ping"}:
+        return ["Hermes online", "V4 planner", "Alexandria/V11"]
     if normalized in {"rfq", "quote", "quotes"}:
         return ["RFQ mode", "draft package", "No customer sends"]
     if normalized in {"inventory", "stock", "parts"}:
