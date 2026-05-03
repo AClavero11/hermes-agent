@@ -25,6 +25,7 @@ import subprocess
 import tempfile
 import threading
 import time
+import urllib.request
 from collections import OrderedDict
 from contextvars import copy_context
 from pathlib import Path
@@ -837,6 +838,199 @@ def _friendly_model_route_label(route: dict[str, Any]) -> str:
     return label if label != "missing:missing" else "unresolved"
 
 
+_OPERATOR_CAPABILITY_EXACT = {
+    "help",
+    "menu",
+    "whatcanwedo",
+    "whatshouldwedo",
+    "whatnow",
+    "whatnext",
+    "whatcanyoudo",
+    "whatcanyoudorightnow",
+    "howcanyouhelp",
+    "howcanyouhelpme",
+    "howcanyouhelpmerightnow",
+    "helpmerightnow",
+}
+
+
+def _is_operator_capability_prompt(message: str) -> bool:
+    text = (message or "").strip()
+    if not text or text.startswith("/"):
+        return False
+    lowered = text.lower()
+    normalized = re.sub(r"[^a-z0-9]+", "", lowered)
+    if normalized in _OPERATOR_CAPABILITY_EXACT:
+        return True
+    if re.fullmatch(r"how\s+can\s+you\s+help(?:\s+me)?(?:\s+right\s+now)?\??", lowered):
+        return True
+    if re.fullmatch(r"what\s+can\s+(?:you|we)\s+do(?:\s+right\s+now)?\??", lowered):
+        return True
+    return False
+
+
+def _extract_gemini_text(payload: dict[str, Any]) -> str:
+    candidates = payload.get("candidates") if isinstance(payload, dict) else None
+    if not isinstance(candidates, list) or not candidates:
+        return ""
+    content = candidates[0].get("content") if isinstance(candidates[0], dict) else {}
+    parts = content.get("parts") if isinstance(content, dict) else []
+    if not isinstance(parts, list):
+        return ""
+    return "\n".join(
+        str(part.get("text") or "").strip()
+        for part in parts
+        if isinstance(part, dict) and str(part.get("text") or "").strip()
+    ).strip()
+
+
+def _post_json(url: str, payload: dict[str, Any], *, headers: dict[str, str] | None = None, timeout: float = 8.0) -> dict[str, Any]:
+    data = json.dumps(payload).encode("utf-8")
+    req = urllib.request.Request(
+        url,
+        data=data,
+        headers={
+            "Content-Type": "application/json",
+            "Accept": "application/json",
+            **(headers or {}),
+        },
+        method="POST",
+    )
+    with urllib.request.urlopen(req, timeout=max(timeout, 1.0)) as resp:
+        raw = resp.read(1024 * 1024).decode("utf-8", errors="replace")
+    parsed = json.loads(raw)
+    return parsed if isinstance(parsed, dict) else {}
+
+
+def _build_operator_capability_prompt(message: str) -> str:
+    policy = resolve_model_routes()
+    routes = policy["routes"]
+    return (
+        "You are Hermes in AC Telegram operator mode. This is not a generic chatbot turn.\n"
+        "Answer the operator's capability question with the old Sonnet-era Hermes feel: "
+        "concise, grounded, operational, no preamble, no apology, no character voice.\n"
+        "Do not call tools. Do not mention terminal commands. Do not say 'I can help' "
+        "or 'let me know'. Give AC the highest-value current ways to use Hermes.\n"
+        "Include these concrete lanes: RFQ/quote drafting, V11 inventory/customer context, "
+        "follow-ups, Hermes/runtime repair, link/research digestion, and code/file work. "
+        "State that customer sends, V11 writes, Atlas writes, and destructive actions require approval.\n"
+        "Use bullets. Keep under 150 words.\n\n"
+        f"Current routes: planner={_friendly_model_route_label(routes['planner'])}; "
+        f"executor={_friendly_model_route_label(routes['executor'])}; "
+        f"judge={_friendly_model_route_label(routes['verifier'])}; "
+        f"synthesizer={_friendly_model_route_label(routes['synthesizer'])}.\n"
+        f"Operator message: {message.strip()}"
+    )
+
+
+def _operator_capability_fallback(error: str) -> str:
+    return (
+        "Hermes operator planner did not return inside the fast path.\n"
+        f"Failure: {error[:160]}.\n"
+        "- RFQ: draft quote packages from V11 stock, customer history, and pricing rules.\n"
+        "- Inventory: inspect V11 on-hand IDG/CSD parts and quote targets.\n"
+        "- Follow-ups: prepare customer drafts only.\n"
+        "- Hermes: inspect runtime, canaries, logs, and patch failures.\n"
+        "Approval required before customer sends, V11/Atlas writes, or destructive actions."
+    )
+
+
+def _operator_capability_answer_is_bad(text: str) -> bool:
+    lowered = (text or "").lower()
+    bad_markers = [
+        "terminal:",
+        "notification_rules.md",
+        "i'm sorry",
+        "i am sorry",
+        "cannot execute",
+        "cannot access files",
+        "as an ai",
+        "let me know",
+    ]
+    return any(marker in lowered for marker in bad_markers)
+
+
+def _finalize_operator_capability_answer(text: str, *, provider_label: str) -> str:
+    answer = (text or "").strip()
+    if not answer:
+        return ""
+    if _operator_capability_answer_is_bad(answer):
+        return _operator_capability_fallback(f"{provider_label} output failed operator guard")
+    if "approval" not in answer.lower():
+        answer = (
+            answer.rstrip()
+            + "\nApproval required before customer sends, V11/Atlas writes, or destructive actions."
+        )
+    return answer
+
+
+def _build_operator_capability_model_answer_sync(message: str) -> str:
+    policy = resolve_model_routes()
+    routes = policy.get("routes") if isinstance(policy, dict) else {}
+    synthesizer = routes.get("synthesizer") if isinstance(routes, dict) else {}
+    executor = routes.get("executor") if isinstance(routes, dict) else {}
+    prompt = _build_operator_capability_prompt(message)
+    timeout = float(os.getenv("HERMES_OPERATOR_CAPABILITY_TIMEOUT", "8") or "8")
+
+    provider = str((synthesizer or {}).get("provider") or "").lower()
+    model = str((synthesizer or {}).get("model") or "").strip()
+    if provider == "gemini" and model:
+        api_key = os.getenv("GEMINI_API_KEY", "").strip() or os.getenv("GOOGLE_API_KEY", "").strip()
+        if api_key:
+            url = (
+                "https://generativelanguage.googleapis.com/v1beta/models/"
+                f"{model}:generateContent?key={api_key}"
+            )
+            payload = {
+                "contents": [{"role": "user", "parts": [{"text": prompt}]}],
+                "generationConfig": {
+                    "temperature": 0.2,
+                    "maxOutputTokens": 320,
+                },
+            }
+            try:
+                text = _extract_gemini_text(_post_json(url, payload, timeout=timeout))
+                if text:
+                    return _finalize_operator_capability_answer(text, provider_label="Gemini")
+            except Exception as exc:
+                logger.info("Operator capability Gemini route failed: %s", exc)
+
+    local_provider = str((executor or {}).get("provider") or "").lower()
+    local_model = str((executor or {}).get("model") or "").strip()
+    local_base = os.getenv("DEEPSEEK_V4_BASE_URL", "").strip() or os.getenv("DEEPSEEK_LOCAL_BASE_URL", "").strip()
+    if ("deepseek" in local_provider or "office-deepseek" in local_provider) and local_model and local_base:
+        payload = {
+            "model": local_model,
+            "messages": [
+                {
+                    "role": "system",
+                    "content": "You are Hermes for AC. Concise operational answer only. No tools.",
+                },
+                {"role": "user", "content": prompt},
+            ],
+            "temperature": 0.2,
+            "max_tokens": 320,
+            "stream": False,
+        }
+        try:
+            data = _post_json(f"{local_base.rstrip('/')}/chat/completions", payload, timeout=timeout)
+            choices = data.get("choices") if isinstance(data, dict) else []
+            if isinstance(choices, list) and choices:
+                message_payload = choices[0].get("message") if isinstance(choices[0], dict) else {}
+                text = str(message_payload.get("content") or "").strip()
+                if text:
+                    return _finalize_operator_capability_answer(text, provider_label="local executor")
+        except Exception as exc:
+            logger.info("Operator capability local route failed: %s", exc)
+            return _operator_capability_fallback(f"{type(exc).__name__}: {exc}")
+
+    return _operator_capability_fallback("no usable synthesizer or local executor route")
+
+
+async def _build_operator_capability_model_answer(message: str) -> str:
+    return await asyncio.to_thread(_build_operator_capability_model_answer_sync, message)
+
+
 def _build_hermes_direct_answer(message: str) -> str:
     """Answer narrow Hermes/Alexandria capability checks without an LLM call."""
     text = (message or "").strip()
@@ -859,15 +1053,6 @@ def _build_hermes_direct_answer(message: str) -> str:
             "Grounding: Alexandria/V11. Tools: file, terminal, code, delegation, web. "
             "Sends, writes, and destructive actions stay approval-gated. "
             "Full route IDs live in `hermes runtime status`."
-        )
-    if normalized in {"whatcanwedo", "whatshouldwedo", "whatnow", "whatnext", "help", "menu"}:
-        return (
-            "Immediate AAC moves:\n"
-            "1. `rfq` - pull live RFQs/stale quotes, draft the next quote packages.\n"
-            "2. `inventory` - scan V11 on-hand IDG parts for quote targets.\n"
-            "3. `followups` - prepare customer follow-up drafts only, no sends without approval.\n"
-            "4. `hermes` - inspect runtime/logs/canaries and patch failures.\n\n"
-            "Reply with one word: `rfq`, `inventory`, `followups`, or `hermes`."
         )
     if normalized in {"rfq", "quotes", "quote"}:
         return (
@@ -2261,6 +2446,24 @@ class GatewayRunner:
             return False  # let default path handle it
 
         if event.message_type == MessageType.TEXT and not event.get_command():
+            if _is_operator_capability_prompt(event.text or ""):
+                await self._interrupt_and_clear_session(
+                    session_key,
+                    event.source,
+                    interrupt_reason=_INTERRUPT_REASON_RESET,
+                    invalidation_reason="operator_capability_prompt",
+                )
+                self._reset_session_for_operator_lane(event.source, "operator_capability")
+                capability_answer = await _build_operator_capability_model_answer(event.text or "")
+                thread_meta = {"thread_id": event.source.thread_id} if event.source.thread_id else None
+                await adapter._send_with_retry(
+                    chat_id=event.source.chat_id,
+                    content=capability_answer,
+                    reply_to=event.message_id,
+                    metadata=thread_meta,
+                )
+                return True
+
             direct_answer = _build_hermes_direct_answer(event.text or "")
             if direct_answer:
                 thread_meta = {"thread_id": event.source.thread_id} if event.source.thread_id else None
@@ -4577,6 +4780,16 @@ class GatewayRunner:
                 self._release_running_agent_state(_quick_key)
 
         if _quick_key in self._running_agents:
+            if not event.get_command() and _is_operator_capability_prompt(event.text or ""):
+                await self._interrupt_and_clear_session(
+                    _quick_key,
+                    source,
+                    interrupt_reason=_INTERRUPT_REASON_RESET,
+                    invalidation_reason="operator_capability_prompt",
+                )
+                self._reset_session_for_operator_lane(source, "operator_capability")
+                return await _build_operator_capability_model_answer(event.text or "")
+
             plain_control = "" if event.get_command() else _classify_plain_operator_control(event.text or "")
             if plain_control == "status" or event.get_command() == "status":
                 return await self._handle_status_command(event)
@@ -5216,6 +5429,9 @@ class GatewayRunner:
         # No bare text matching — "yes" in normal conversation must not trigger
         # execution of a dangerous command.
         if not command:
+            if _is_operator_capability_prompt(event.text or ""):
+                return await _build_operator_capability_model_answer(event.text or "")
+
             direct_answer = _build_hermes_direct_answer(event.text or "")
             if direct_answer:
                 return direct_answer

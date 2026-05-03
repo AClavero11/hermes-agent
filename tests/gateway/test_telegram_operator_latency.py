@@ -1,5 +1,5 @@
 from types import SimpleNamespace
-from unittest.mock import AsyncMock
+from unittest.mock import AsyncMock, MagicMock
 
 import pytest
 
@@ -71,23 +71,30 @@ async def test_busy_testing_probe_returns_direct_answer_without_interrupt():
 
 
 @pytest.mark.asyncio
-async def test_busy_operator_menu_returns_direct_answer_without_interrupt():
+async def test_busy_operator_capability_returns_model_answer_with_interrupt(monkeypatch):
+    import gateway.run as gateway_run
     from gateway.run import GatewayRunner
 
     adapter = SimpleNamespace(_send_with_retry=AsyncMock())
     runner = object.__new__(GatewayRunner)
     runner._draining = False
     runner.adapters = {Platform.TELEGRAM: adapter}
+    runner._interrupt_and_clear_session = AsyncMock()
+    runner._reset_session_for_operator_lane = MagicMock(return_value=True)
+    model_answer = AsyncMock(return_value="MODEL CAPABILITY ANSWER")
+    monkeypatch.setattr(gateway_run, "_build_operator_capability_model_answer", model_answer)
 
-    event = _telegram_event("what can we do")
+    event = _telegram_event("how can you help me right now")
 
     handled = await runner._handle_active_session_busy_message(event, "telegram:496461229")
 
     assert handled is True
     adapter._send_with_retry.assert_awaited_once()
     content = adapter._send_with_retry.await_args.kwargs["content"]
-    assert content.startswith("Immediate AAC moves:")
-    assert "Reply with one word" in content
+    assert content == "MODEL CAPABILITY ANSWER"
+    runner._interrupt_and_clear_session.assert_awaited_once()
+    runner._reset_session_for_operator_lane.assert_called_once()
+    model_answer.assert_awaited_once_with("how can you help me right now")
 
 
 def test_telegram_notify_interval_defaults_to_early_first_update(monkeypatch):

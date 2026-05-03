@@ -481,16 +481,16 @@ def test_build_hermes_direct_answer_for_testing_probe(monkeypatch):
     assert "Telegram operator path is healthy" in result
 
 
-def test_build_hermes_direct_answer_for_operator_menu():
+def test_operator_capability_prompt_routes_out_of_direct_menu():
     import gateway.run as gateway_run
+
+    assert gateway_run._is_operator_capability_prompt("how can you help me right now")
+    assert gateway_run._is_operator_capability_prompt("what can we do")
+    assert not gateway_run._is_operator_capability_prompt("help me quote 762367B")
 
     result = gateway_run._build_hermes_direct_answer("what can we do")
 
-    assert result.startswith("Immediate AAC moves:")
-    assert "`rfq`" in result
-    assert "`inventory`" in result
-    assert "Reply with one word" in result
-    assert "roleplay" not in result.lower()
+    assert result == ""
 
 
 def test_build_hermes_direct_answer_for_operator_menu_choices():
@@ -507,6 +507,72 @@ def test_build_hermes_direct_answer_for_operator_menu_choices():
         for term in expected_terms:
             assert term in result
         assert "sorry" not in result.lower()
+
+
+@pytest.mark.asyncio
+async def test_operator_capability_prompt_uses_model_backed_fast_lane(monkeypatch):
+    import gateway.run as gateway_run
+
+    session_entry = SessionEntry(
+        session_key=build_session_key(_make_source()),
+        session_id="sess-capability",
+        created_at=datetime.now(),
+        updated_at=datetime.now(),
+        platform=Platform.TELEGRAM,
+        chat_type="dm",
+    )
+    runner = _make_runner(session_entry)
+    runner._reset_session_for_operator_lane = MagicMock(return_value=True)
+    model_answer = AsyncMock(return_value="MODEL CAPABILITY ANSWER")
+    monkeypatch.setattr(gateway_run, "_build_operator_capability_model_answer", model_answer)
+
+    result = await runner._handle_message(_make_event("how can you help me right now"))
+
+    assert result == "MODEL CAPABILITY ANSWER"
+    model_answer.assert_awaited_once_with("how can you help me right now")
+    runner._reset_session_for_operator_lane.assert_not_called()
+
+
+@pytest.mark.asyncio
+async def test_busy_operator_capability_prompt_interrupts_and_uses_model_lane(monkeypatch):
+    import gateway.run as gateway_run
+
+    session_entry = SessionEntry(
+        session_key=build_session_key(_make_source()),
+        session_id="sess-busy-capability",
+        created_at=datetime.now(),
+        updated_at=datetime.now(),
+        platform=Platform.TELEGRAM,
+        chat_type="dm",
+    )
+    runner = _make_runner(session_entry)
+    session_key = build_session_key(_make_source())
+    runner._running_agents[session_key] = MagicMock()
+    runner._interrupt_and_clear_session = AsyncMock()
+    runner._reset_session_for_operator_lane = MagicMock(return_value=True)
+    model_answer = AsyncMock(return_value="MODEL CAPABILITY ANSWER")
+    monkeypatch.setattr(gateway_run, "_build_operator_capability_model_answer", model_answer)
+
+    result = await runner._handle_message(_make_event("how can you help me right now"))
+
+    assert result == "MODEL CAPABILITY ANSWER"
+    runner._interrupt_and_clear_session.assert_awaited_once()
+    runner._reset_session_for_operator_lane.assert_called_once()
+    model_answer.assert_awaited_once_with("how can you help me right now")
+    assert runner._pending_messages == {}
+
+
+def test_operator_capability_guard_replaces_bad_model_output():
+    import gateway.run as gateway_run
+
+    result = gateway_run._finalize_operator_capability_answer(
+        'terminal: "notification_rules.md"',
+        provider_label="test",
+    )
+
+    assert result.startswith("Hermes operator planner did not return")
+    assert "notification_rules.md" not in result
+    assert "Approval required" in result
 
 
 def test_classify_malformed_hermes_response_blocks_repeated_quote_refusal():

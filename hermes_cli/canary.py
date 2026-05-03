@@ -832,17 +832,19 @@ def _canary_behavior_goldens(options: CanaryOptions) -> CanaryResult:
             "Telegram operator turns get deterministic ack handling and early progress receipts.",
         ),
         (
-            "operator_menu_direct",
+            "operator_capability_model_route",
             [
-                "whatcanwedo",
-                "Immediate AAC moves",
-                "Reply with one word",
+                "_is_operator_capability_prompt",
+                "_build_operator_capability_model_answer",
+                "operator_capability_prompt",
+                "RFQ/quote drafting",
+                "customer sends, V11 writes, Atlas writes",
                 "RFQ mode",
                 "Inventory mode",
                 "Follow-up mode",
                 "Hermes mode",
             ],
-            "Short operator-menu prompts and menu choices bypass generic chatbot mode.",
+            "Broad operator capability prompts use a no-tool model route while exact lane choices stay deterministic.",
         ),
         (
             "goal_idle_supervisor",
@@ -1420,8 +1422,16 @@ def _score_text_case(
         ok_text = text.strip().upper() == expected_exact.upper()
         missing = [] if ok_text else [expected_exact]
     else:
-        missing = [term for term in case.get("required", []) if term not in text]
-    forbidden = [term for term in case.get("forbidden", []) if term in lowered]
+        missing = [
+            term
+            for term in case.get("required", [])
+            if str(term).lower() not in lowered
+        ]
+    forbidden = [
+        term
+        for term in case.get("forbidden", [])
+        if str(term).lower() in lowered
+    ]
     latency_budget_ms = float(case.get("latency_budget_ms") or 0)
     latency_ok = not latency_budget_ms or elapsed_ms <= latency_budget_ms
     ok = status == 200 and not missing and not forbidden and latency_ok
@@ -1571,10 +1581,12 @@ def _canary_live_behavior(options: CanaryOptions) -> CanaryResult:
             "latency_budget_ms": 1000,
         },
         {
-            "name": "operator_menu_direct",
-            "input": "what can we do",
-            "required": ["Immediate AAC moves", "RFQ", "V11", "Reply with one word"],
+            "name": "operator_capability_model_route",
+            "input": "how can you help me right now",
+            "required": ["RFQ", "V11", "approval"],
             "forbidden": [
+                "terminal:",
+                "notification_rules.md",
                 "roleplay",
                 "song",
                 "poetry",
@@ -1582,8 +1594,10 @@ def _canary_live_behavior(options: CanaryOptions) -> CanaryResult:
                 "I'm glad",
                 "cannot",
                 "sorry",
+                "let me know",
+                "waiting for provider",
             ],
-            "latency_budget_ms": 1000,
+            "latency_budget_ms": 8000,
         },
         {
             "name": "operator_menu_rfq_choice_direct",
@@ -2682,13 +2696,7 @@ def _telegram_operator_expected_substrings(prompt: str) -> list[str]:
         return ["Follow-up mode", "drafts only", "approval"]
     if normalized == "hermes":
         return ["Hermes mode", "runtime path", "canary"]
-    return [
-        "Immediate AAC moves",
-        "`rfq`",
-        "`inventory`",
-        "`followups`",
-        "`hermes`",
-    ]
+    return ["RFQ", "V11", "approval"]
 
 
 def _run_telegram_operator_response_probe(options: CanaryOptions) -> dict[str, Any]:

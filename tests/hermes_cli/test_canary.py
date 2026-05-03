@@ -349,6 +349,24 @@ def test_score_text_case_accepts_final_numeric_answer():
     assert result["final_number"] == "69"
 
 
+def test_score_text_case_matches_terms_case_insensitively():
+    result = canary_module._score_text_case(
+        status=200,
+        text="RFQ lane. V11 grounded. Approval required before sends.",
+        raw="",
+        elapsed_ms=100.0,
+        case={
+            "required": ["rfq", "v11", "approval"],
+            "forbidden": ["I'M SORRY", "CANNOT"],
+            "latency_budget_ms": 1000,
+        },
+    )
+
+    assert result["ok"] is True
+    assert result["missing"] == []
+    assert result["forbidden"] == []
+
+
 def test_local_reasoning_cases_use_structured_arithmetic():
     cases = canary_module._reasoning_eval_cases(
         latency_budget_ms=45_000,
@@ -682,11 +700,9 @@ def test_quality_score_caps_without_telegram_operator_response():
 
 def test_telegram_operator_expected_substrings_follow_prompt_choice():
     assert canary_module._telegram_operator_expected_substrings("what can we do") == [
-        "Immediate AAC moves",
-        "`rfq`",
-        "`inventory`",
-        "`followups`",
-        "`hermes`",
+        "RFQ",
+        "V11",
+        "approval",
     ]
     assert canary_module._telegram_operator_expected_substrings("ack") == [
         "Ack received",
