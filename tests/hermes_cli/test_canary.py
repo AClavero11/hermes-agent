@@ -75,6 +75,40 @@ def test_canary_suite_runs_without_live_gateway(tmp_path):
     assert report.effective_max_score > 0
 
 
+def test_options_from_args_infers_home_from_env_wrapper(tmp_path):
+    wrapper_home = tmp_path / ".hermes-deepseek"
+    wrapper = wrapper_home / "bin" / "hermes-env.sh"
+    wrapper.parent.mkdir(parents=True)
+    wrapper.write_text("# test wrapper\n", encoding="utf-8")
+
+    parser = canary_module.build_arg_parser()
+    args = parser.parse_args(["--env-wrapper", str(wrapper)])
+    options = canary_module.options_from_args(args)
+
+    assert options.hermes_home == wrapper_home
+    assert options.env_wrapper == wrapper
+
+
+def test_options_from_args_respects_explicit_hermes_home(tmp_path):
+    explicit_home = tmp_path / "explicit-home"
+    wrapper_home = tmp_path / ".hermes-deepseek"
+    wrapper = wrapper_home / "bin" / "hermes-env.sh"
+    wrapper.parent.mkdir(parents=True)
+    wrapper.write_text("# test wrapper\n", encoding="utf-8")
+
+    parser = canary_module.build_arg_parser()
+    args = parser.parse_args([
+        "--hermes-home",
+        str(explicit_home),
+        "--env-wrapper",
+        str(wrapper),
+    ])
+    options = canary_module.options_from_args(args)
+
+    assert options.hermes_home == explicit_home
+    assert options.env_wrapper == wrapper
+
+
 def test_live_behavior_allows_loopback_without_api_key(monkeypatch, tmp_path):
     options = CanaryOptions(
         repo_root=Path(__file__).resolve().parents[2],

@@ -116,13 +116,45 @@ def _repo_root() -> Path:
     return Path(__file__).resolve().parents[1]
 
 
+def _explicit_hermes_home_from_env() -> Path | None:
+    for name in ("HERMES_HOME", "AAC_HERMES_DEEPSEEK_HOME"):
+        value = os.getenv(name, "").strip()
+        if value:
+            return Path(value).expanduser()
+    return None
+
+
+def _deepseek_profile_home() -> Path | None:
+    home = Path.home() / ".hermes-deepseek"
+    if (home / "bin" / "hermes-env.sh").is_file():
+        return home
+    return None
+
+
 def _default_hermes_home() -> Path:
+    explicit_home = _explicit_hermes_home_from_env()
+    if explicit_home:
+        return explicit_home
     try:
         from hermes_cli.config import get_hermes_home
 
-        return get_hermes_home()
+        configured_home = get_hermes_home()
     except Exception:
-        return Path(os.getenv("HERMES_HOME", Path.home() / ".hermes")).expanduser()
+        configured_home = Path.home() / ".hermes"
+    configured_home = Path(configured_home).expanduser()
+    deepseek_home = _deepseek_profile_home()
+    if deepseek_home and configured_home == (Path.home() / ".hermes"):
+        return deepseek_home
+    return configured_home
+
+
+def _home_from_env_wrapper_path(path: Path | None) -> Path | None:
+    if not path:
+        return None
+    expanded = Path(path).expanduser()
+    if expanded.name == "hermes-env.sh" and expanded.parent.name == "bin":
+        return expanded.parent.parent
+    return None
 
 
 def _default_env_wrapper(hermes_home: Path) -> Path | None:
@@ -219,6 +251,8 @@ def _probe_env_wrapper(path: Path, timeout: float) -> dict[str, Any]:
     keys = [
         "AAC_HERMES_DEEPSEEK_REPO",
         "AAC_HERMES_DEEPSEEK_PYTHON",
+        "AAC_HERMES_DEEPSEEK_HOME",
+        "HERMES_HOME",
         "HERMES_PLANNER_PROVIDER",
         "HERMES_PLANNER_MODEL",
         "HERMES_INFERENCE_PROVIDER",
@@ -4587,7 +4621,7 @@ def build_arg_parser() -> argparse.ArgumentParser:
         help="Path to hermes-env.sh for runtime model selection checks",
     )
     parser.add_argument("--repo-root", type=Path, default=_repo_root())
-    parser.add_argument("--hermes-home", type=Path, default=_default_hermes_home())
+    parser.add_argument("--hermes-home", type=Path, default=None)
     parser.add_argument(
         "--output-dir",
         type=Path,
@@ -4687,10 +4721,15 @@ def build_arg_parser() -> argparse.ArgumentParser:
 
 
 def options_from_args(args: argparse.Namespace) -> CanaryOptions:
-    hermes_home = Path(args.hermes_home).expanduser()
+    explicit_hermes_home = args.hermes_home is not None
+    hermes_home = Path(args.hermes_home).expanduser() if explicit_hermes_home else _default_hermes_home()
     env_wrapper = args.env_wrapper
     if env_wrapper is None:
         env_wrapper = _default_env_wrapper(hermes_home)
+    if not explicit_hermes_home:
+        wrapper_home = _home_from_env_wrapper_path(env_wrapper)
+        if wrapper_home:
+            hermes_home = wrapper_home
     return CanaryOptions(
         repo_root=Path(args.repo_root).expanduser(),
         hermes_home=hermes_home,

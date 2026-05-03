@@ -21,6 +21,8 @@ PROJECT_ROOT = Path(__file__).resolve().parents[1]
 ENV_SNAPSHOT_KEYS = [
     "AAC_HERMES_DEEPSEEK_REPO",
     "AAC_HERMES_DEEPSEEK_PYTHON",
+    "AAC_HERMES_DEEPSEEK_HOME",
+    "HERMES_HOME",
     "HERMES_PLANNER_PROVIDER",
     "HERMES_PLANNER_MODEL",
     "HERMES_EXECUTOR_PROVIDER",
@@ -81,12 +83,21 @@ def _run(
 
 
 def _default_hermes_home() -> Path:
+    for name in ("HERMES_HOME", "AAC_HERMES_DEEPSEEK_HOME"):
+        value = os.getenv(name, "").strip()
+        if value:
+            return Path(value).expanduser()
     try:
         from hermes_cli.config import get_hermes_home
 
-        return get_hermes_home()
+        configured_home = get_hermes_home()
     except Exception:
-        return Path(os.getenv("HERMES_HOME", str(Path.home() / ".hermes"))).expanduser()
+        configured_home = Path.home() / ".hermes"
+    configured_home = Path(configured_home).expanduser()
+    deepseek_home = Path.home() / ".hermes-deepseek"
+    if configured_home == (Path.home() / ".hermes") and (deepseek_home / "bin" / "hermes-env.sh").is_file():
+        return deepseek_home
+    return configured_home
 
 
 def _dedupe_paths(paths: list[Path]) -> list[Path]:
@@ -439,6 +450,7 @@ def collect_runtime_status(
     hermes_home: Path | None = None,
     timeout: float = 4.0,
 ) -> dict[str, Any]:
+    explicit_hermes_home = hermes_home is not None
     hermes_home = (hermes_home or _default_hermes_home()).expanduser()
     repo_root = (repo_root or PROJECT_ROOT).expanduser()
     env, candidates, wrapper_path = _env_snapshot(
@@ -446,6 +458,9 @@ def collect_runtime_status(
         hermes_home=hermes_home,
         timeout=timeout,
     )
+    runtime_home = env.get("HERMES_HOME") or env.get("AAC_HERMES_DEEPSEEK_HOME")
+    if runtime_home and not explicit_hermes_home:
+        hermes_home = Path(str(runtime_home)).expanduser()
     selected_repo = (
         env.get("AAC_HERMES_DEEPSEEK_REPO")
         or os.getenv("AAC_HERMES_DEEPSEEK_REPO", "")
