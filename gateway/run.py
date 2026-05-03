@@ -823,6 +823,8 @@ def _build_hermes_direct_answer(message: str) -> str:
 
     lowered = text.lower()
     normalized = re.sub(r"[^a-z0-9]+", "", lowered)
+    if normalized in {"ack", "acknowledged"}:
+        return "Ack received. No task started."
     if normalized in {"test", "ping"}:
         return (
             "Hermes online. V4 planner is active via `custom:office-deepseek-v4`; "
@@ -951,6 +953,99 @@ def _build_hermes_direct_answer(message: str) -> str:
         )
 
     return ""
+
+
+_FAST_RECEIPT_SKIP_NORMALIZED = {
+    "ack",
+    "acknowledged",
+    "k",
+    "ok",
+    "okay",
+    "ping",
+    "test",
+    "thanks",
+    "thankyou",
+}
+
+
+def _telegram_receipts_enabled() -> bool:
+    return is_truthy_value(os.getenv("HERMES_TELEGRAM_FAST_RECEIPT", "1"), default=True)
+
+
+def _should_send_telegram_turn_receipt(event: MessageEvent) -> bool:
+    """Return True when a Telegram user turn should get an immediate receipt."""
+    source = getattr(event, "source", None)
+    if not source or source.platform != Platform.TELEGRAM:
+        return False
+    if not _telegram_receipts_enabled():
+        return False
+    if getattr(event, "internal", False):
+        return False
+    if event.message_type not in {
+        MessageType.TEXT,
+        MessageType.LOCATION,
+        MessageType.PHOTO,
+        MessageType.VIDEO,
+        MessageType.AUDIO,
+        MessageType.VOICE,
+        MessageType.DOCUMENT,
+    }:
+        return False
+
+    text = (event.text or "").strip()
+    if text.startswith("/"):
+        return False
+    normalized = re.sub(r"[^a-z0-9]+", "", text.lower())
+    if normalized in _FAST_RECEIPT_SKIP_NORMALIZED:
+        return False
+
+    min_chars = int(os.getenv("HERMES_TELEGRAM_FAST_RECEIPT_MIN_CHARS", "24"))
+    return event.message_type != MessageType.TEXT or len(text) >= min_chars
+
+
+async def _send_telegram_turn_receipt(adapter: BasePlatformAdapter, event: MessageEvent) -> None:
+    """Send a non-blocking Telegram receipt without affecting the agent result."""
+    source = event.source
+    metadata = {"thread_id": source.thread_id} if source.thread_id else None
+    try:
+        await adapter.send(
+            source.chat_id,
+            os.getenv("HERMES_TELEGRAM_FAST_RECEIPT_TEXT", "Received. Working on it."),
+            reply_to=event.message_id,
+            metadata=metadata,
+        )
+    except Exception as exc:
+        logger.debug("Telegram fast receipt failed: %s", exc)
+
+
+def _resolve_agent_notify_interval(source: SessionSource) -> tuple[Optional[float], Optional[float]]:
+    """Resolve first and recurring long-running status intervals for a platform."""
+    platform_name = source.platform.value if source and source.platform else ""
+    platform_env = f"HERMES_AGENT_NOTIFY_INTERVAL_{platform_name.upper()}" if platform_name else ""
+    first_platform_env = (
+        f"HERMES_AGENT_NOTIFY_FIRST_INTERVAL_{platform_name.upper()}" if platform_name else ""
+    )
+
+    if first_platform_env and os.getenv(first_platform_env):
+        first_raw = float(os.getenv(first_platform_env, "0"))
+    elif source.platform == Platform.TELEGRAM:
+        first_raw = float(os.getenv("HERMES_TELEGRAM_NOTIFY_FIRST_INTERVAL", "20"))
+    else:
+        first_raw = None
+
+    if platform_env and os.getenv(platform_env):
+        interval_raw = float(os.getenv(platform_env, "0"))
+    elif source.platform == Platform.TELEGRAM:
+        interval_raw = float(os.getenv("HERMES_TELEGRAM_NOTIFY_INTERVAL", "60"))
+    else:
+        interval_raw = float(os.getenv("HERMES_AGENT_NOTIFY_INTERVAL", 180))
+
+    interval = interval_raw if interval_raw > 0 else None
+    if first_raw is None:
+        first = interval
+    else:
+        first = first_raw if first_raw > 0 else None
+    return first, interval
 
 
 def _build_alexandria_context_prompt(message: str) -> str:
@@ -4901,6 +4996,13 @@ class GatewayRunner:
             direct_answer = _build_hermes_direct_answer(event.text or "")
             if direct_answer:
                 return direct_answer
+
+        if _should_send_telegram_turn_receipt(event):
+            adapter = self.adapters.get(source.platform)
+            if adapter:
+                receipt_task = asyncio.create_task(_send_telegram_turn_receipt(adapter, event))
+                self._background_tasks.add(receipt_task)
+                receipt_task.add_done_callback(self._background_tasks.discard)
 
         # ── Claim this session before any await ───────────────────────
         # Between here and _run_agent registering the real AIAgent, there
@@ -11560,12 +11662,10 @@ class GatewayRunner:
         interrupt_monitor = asyncio.create_task(monitor_for_interrupt())
 
         # Periodic "still working" notifications for long-running tasks.
-        # Fires every N seconds so the user knows the agent hasn't died.
-        # Config: agent.gateway_notify_interval in config.yaml, or
-        # HERMES_AGENT_NOTIFY_INTERVAL env var.  Default 180s (3 min).
-        # 0 = disable notifications.
-        _NOTIFY_INTERVAL_RAW = float(os.getenv("HERMES_AGENT_NOTIFY_INTERVAL", 180))
-        _NOTIFY_INTERVAL = _NOTIFY_INTERVAL_RAW if _NOTIFY_INTERVAL_RAW > 0 else None
+        # Telegram is the primary operator interface, so it gets an earlier
+        # first receipt by default; other platforms preserve the historical
+        # 180s cadence unless configured.
+        _FIRST_NOTIFY_INTERVAL, _NOTIFY_INTERVAL = _resolve_agent_notify_interval(source)
         _notify_start = time.time()
 
         async def _notify_long_running():
@@ -11574,8 +11674,10 @@ class GatewayRunner:
             _notify_adapter = self.adapters.get(source.platform)
             if not _notify_adapter:
                 return
+            _next_delay = _FIRST_NOTIFY_INTERVAL or _NOTIFY_INTERVAL
             while True:
-                await asyncio.sleep(_NOTIFY_INTERVAL)
+                await asyncio.sleep(_next_delay)
+                _next_delay = _NOTIFY_INTERVAL
                 _elapsed_mins = int((time.time() - _notify_start) // 60)
                 # Include agent activity context if available.
                 _agent_ref = agent_holder[0]

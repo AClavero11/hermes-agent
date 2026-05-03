@@ -330,6 +330,14 @@ def test_build_hermes_direct_answer_for_test_probe():
     assert "operator mode" in result
 
 
+def test_build_hermes_direct_answer_for_ack_probe():
+    import gateway.run as gateway_run
+
+    result = gateway_run._build_hermes_direct_answer("ack")
+
+    assert result == "Ack received. No task started."
+
+
 def test_build_hermes_direct_answer_for_finish_it_probe():
     import gateway.run as gateway_run
 
