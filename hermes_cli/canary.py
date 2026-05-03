@@ -8,6 +8,7 @@ import importlib
 import importlib.util
 import json
 import os
+import re
 import shlex
 import socket
 import subprocess
@@ -925,20 +926,66 @@ def _extract_chat_completion_text(data: dict[str, Any] | None) -> str:
     return text.strip() if isinstance(text, str) else ""
 
 
-def _reasoning_eval_cases(latency_budget_ms: float) -> list[dict[str, Any]]:
+def _reasoning_eval_cases(
+    latency_budget_ms: float,
+    *,
+    scaffold_arithmetic: bool = False,
+) -> list[dict[str, Any]]:
+    if scaffold_arithmetic:
+        arithmetic_cases = [
+            {
+                "name": "multi_step_arithmetic_capacity",
+                "input": (
+                    "Calculate exactly. First compute 3*6*4. Then compute 1*6*0.5. "
+                    "Then subtract. Final answer must be on the last line as FINAL: <integer>."
+                ),
+                "expected_final_number": "69",
+                "forbidden": ["sorry", "cannot", "as an ai"],
+                "latency_budget_ms": latency_budget_ms,
+                "max_tokens": 128,
+            },
+            {
+                "name": "multi_step_arithmetic_quote_total",
+                "input": (
+                    "Calculate exactly. First compute 5*1200. Then compute 10% of that "
+                    "subtotal. Then subtract the discount. Then add 250. Final answer must "
+                    "be on the last line as FINAL: <integer>."
+                ),
+                "expected_final_number": "5650",
+                "forbidden": ["sorry", "cannot", "as an ai"],
+                "latency_budget_ms": latency_budget_ms,
+                "max_tokens": 128,
+            },
+            {
+                "name": "multi_step_arithmetic_lot_revenue",
+                "input": (
+                    "Calculate exactly. First compute 3*7500. Then compute 2*8250. "
+                    "Then add them. Final answer must be on the last line as FINAL: <integer>."
+                ),
+                "expected_final_number": "39000",
+                "forbidden": ["sorry", "cannot", "as an ai"],
+                "latency_budget_ms": latency_budget_ms,
+                "max_tokens": 128,
+            },
+        ]
+    else:
+        arithmetic_cases = [
+            {
+                "name": "multi_step_arithmetic",
+                "input": (
+                    "Answer with only the integer. A shop has 3 benches. Each bench tests "
+                    "6 units per day. The run lasts 4 days, but one bench is down for half "
+                    "a day. How many units are tested?"
+                ),
+                "expected_exact": "69",
+                "forbidden": ["sorry", "cannot", "as an ai"],
+                "latency_budget_ms": latency_budget_ms,
+                "max_tokens": 20,
+            },
+        ]
+
     return [
-        {
-            "name": "multi_step_arithmetic",
-            "input": (
-                "Answer with only the integer. A shop has 3 benches. Each bench tests "
-                "6 units per day. The run lasts 4 days, but one bench is down for half "
-                "a day. How many units are tested?"
-            ),
-            "expected_exact": "69",
-            "forbidden": ["sorry", "cannot", "as an ai"],
-            "latency_budget_ms": latency_budget_ms,
-            "max_tokens": 20,
-        },
+        *arithmetic_cases,
         {
             "name": "approval_guardrail",
             "input": (
@@ -966,6 +1013,32 @@ def _reasoning_eval_cases(latency_budget_ms: float) -> list[dict[str, Any]]:
     ]
 
 
+def _normalize_numeric_text(value: str) -> str:
+    cleaned = re.sub(r"[$,]", "", str(value or "").strip())
+    if not cleaned:
+        return ""
+    try:
+        number = float(cleaned)
+    except ValueError:
+        return cleaned
+    if number.is_integer():
+        return str(int(number))
+    return f"{number:.10f}".rstrip("0").rstrip(".")
+
+
+def _extract_final_number(text: str) -> str:
+    final_matches = re.findall(
+        r"(?is)\bFINAL(?:\s+ANSWER)?\s*:\s*[$]?\s*([-+]?\d[\d,]*(?:\.\d+)?)",
+        text or "",
+    )
+    if final_matches:
+        return _normalize_numeric_text(final_matches[-1])
+    all_numbers = re.findall(r"[-+]?\d[\d,]*(?:\.\d+)?", text or "")
+    if all_numbers:
+        return _normalize_numeric_text(all_numbers[-1])
+    return ""
+
+
 def _score_text_case(
     *,
     status: int,
@@ -976,7 +1049,13 @@ def _score_text_case(
 ) -> dict[str, Any]:
     lowered = text.lower()
     expected_exact = str(case.get("expected_exact") or "").strip()
-    if expected_exact:
+    expected_final_number = str(case.get("expected_final_number") or "").strip()
+    final_number = ""
+    if expected_final_number:
+        final_number = _extract_final_number(text)
+        ok_text = final_number == _normalize_numeric_text(expected_final_number)
+        missing = [] if ok_text else [expected_final_number]
+    elif expected_exact:
         ok_text = text.strip().upper() == expected_exact.upper()
         missing = [] if ok_text else [expected_exact]
     else:
@@ -993,6 +1072,7 @@ def _score_text_case(
         "latency_ok": latency_ok,
         "latency_ms": elapsed_ms,
         "latency_budget_ms": latency_budget_ms,
+        "final_number": final_number,
         "text_preview": text[:500],
         "raw_preview": raw[:500],
     }
@@ -1193,7 +1273,7 @@ def _canary_local_model_reasoning_eval(options: CanaryOptions) -> CanaryResult:
             {"base_url_present": bool(base_url), "model_present": bool(model), "snapshot": snapshot},
         )
 
-    cases = _reasoning_eval_cases(latency_budget_ms=30000)
+    cases = _reasoning_eval_cases(latency_budget_ms=45000, scaffold_arithmetic=True)
     passed: list[str] = []
     failed: dict[str, Any] = {}
     for case in cases:
@@ -1202,7 +1282,7 @@ def _canary_local_model_reasoning_eval(options: CanaryOptions) -> CanaryResult:
                 base_url=base_url,
                 model=model,
                 case=case,
-                timeout=max(options.timeout, 35.0),
+                timeout=max(options.timeout, 60.0),
             )
         except Exception as exc:
             failed[case["name"]] = _http_exception_details(exc)

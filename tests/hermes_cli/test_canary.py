@@ -129,6 +129,43 @@ def test_report_markdown_contains_metrics_tables(tmp_path):
     assert any(result.status == PASS for result in report.results)
 
 
+def test_score_text_case_accepts_final_numeric_answer():
+    result = canary_module._score_text_case(
+        status=200,
+        text=(
+            "First, compute 3 * 6 * 4 = 72.\n"
+            "Then compute 1 * 6 * 0.5 = 3.\n"
+            "FINAL: 69"
+        ),
+        raw="",
+        elapsed_ms=100.0,
+        case={
+            "expected_final_number": "69",
+            "forbidden": ["sorry", "cannot", "as an ai"],
+            "latency_budget_ms": 1000,
+        },
+    )
+
+    assert result["ok"] is True
+    assert result["final_number"] == "69"
+
+
+def test_local_reasoning_cases_use_scaffolded_arithmetic():
+    cases = canary_module._reasoning_eval_cases(
+        latency_budget_ms=45_000,
+        scaffold_arithmetic=True,
+    )
+    arithmetic_cases = [case for case in cases if case["name"].startswith("multi_step_arithmetic")]
+
+    assert len(arithmetic_cases) == 3
+    assert {case["expected_final_number"] for case in arithmetic_cases} == {
+        "69",
+        "5650",
+        "39000",
+    }
+    assert all(case["max_tokens"] >= 128 for case in arithmetic_cases)
+
+
 def test_quality_score_floor_tracks_completed_increment():
     now = 1_700_000_000.0
     report = CanaryReport(
