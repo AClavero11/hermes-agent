@@ -282,6 +282,26 @@ def test_local_reasoning_cases_use_structured_arithmetic():
     assert "subtract lost capacity from total capacity" in capacity_case["input"]
 
 
+def _quality_foundation_results() -> list[CanaryResult]:
+    return [
+        CanaryResult("contract.behavior_goldens", PASS, 20, 20, "behavior goldens passed"),
+        CanaryResult("live.behavior_golden", PASS, 20, 20, "live behavior passed"),
+        CanaryResult("contract.scorecard_trend", PASS, 10, 10, "trend installed"),
+        CanaryResult("contract.aac_workflows", PASS, 15, 15, "AAC workflows passed"),
+        CanaryResult("contract.planner_self_heal", PASS, 20, 20, "planner self-heal passed"),
+        CanaryResult(
+            "runtime.model_route",
+            PASS,
+            15,
+            15,
+            "custom:office-deepseek-v4 -> mlx-community/deepseek-ai-DeepSeek-V4-Flash-4bit",
+        ),
+        CanaryResult("eval.hermes_reasoning", PASS, 30, 30, "full Hermes reasoning passed"),
+        CanaryResult("eval.frontier_wrapper", PASS, 20, 20, "frontier wrapper passed"),
+        CanaryResult("live.telegram_e2e", PASS, 20, 20, "Telegram E2E passed"),
+    ]
+
+
 def test_quality_score_floor_tracks_completed_increment():
     now = 1_700_000_000.0
     report = CanaryReport(
@@ -289,75 +309,13 @@ def test_quality_score_floor_tracks_completed_increment():
         finished_at=now + 1,
         fail_under=80.0,
         results=[
-            CanaryResult(
-                "contract.behavior_goldens",
-                PASS,
-                20,
-                20,
-                "behavior goldens passed",
-            ),
-            CanaryResult(
-                "live.behavior_golden",
-                PASS,
-                20,
-                20,
-                "live behavior passed",
-            ),
-            CanaryResult(
-                "contract.scorecard_trend",
-                PASS,
-                10,
-                10,
-                "trend installed",
-            ),
-            CanaryResult(
-                "contract.aac_workflows",
-                PASS,
-                15,
-                15,
-                "AAC workflows passed",
-            ),
-            CanaryResult(
-                "contract.planner_self_heal",
-                PASS,
-                20,
-                20,
-                "planner self-heal passed",
-            ),
-            CanaryResult(
-                "runtime.model_route",
-                PASS,
-                15,
-                15,
-                "custom:office-deepseek-v4 -> mlx-community/deepseek-ai-DeepSeek-V4-Flash-4bit",
-            ),
+            *_quality_foundation_results(),
             CanaryResult(
                 "eval.local_model_reasoning",
                 PASS,
                 30,
                 30,
                 "direct DeepSeek reasoning passed",
-            ),
-            CanaryResult(
-                "eval.hermes_reasoning",
-                PASS,
-                30,
-                30,
-                "full Hermes reasoning passed",
-            ),
-            CanaryResult(
-                "eval.frontier_wrapper",
-                PASS,
-                20,
-                20,
-                "frontier wrapper passed",
-            ),
-            CanaryResult(
-                "live.telegram_e2e",
-                PASS,
-                20,
-                20,
-                "Telegram E2E passed",
             ),
         ],
     )
@@ -449,6 +407,7 @@ def test_quality_score_9_5_requires_live_rfq_dry_run():
         finished_at=now + 1,
         fail_under=80.0,
         results=[
+            *_quality_foundation_results(),
             CanaryResult("contract.quote_ops_runtime", PASS, 20, 20, "quote ops runtime passed"),
             CanaryResult(
                 "live.rfq_dry_run_quote_package",
@@ -476,6 +435,7 @@ def test_quality_score_9_7_requires_approved_rfq_draft():
         finished_at=now + 1,
         fail_under=80.0,
         results=[
+            *_quality_foundation_results(),
             CanaryResult("contract.quote_ops_runtime", PASS, 20, 20, "quote ops runtime passed"),
             CanaryResult(
                 "live.rfq_dry_run_quote_package",
@@ -501,6 +461,38 @@ def test_quality_score_9_7_requires_approved_rfq_draft():
     assert summary["score"] >= 9.7
     business_ops = next(item for item in summary["dimensions"] if item["name"] == "business_ops")
     assert business_ops["score"] == 9.7
+
+
+def test_quality_score_does_not_skip_foundation_for_business_gates():
+    now = 1_700_000_000.0
+    report = CanaryReport(
+        started_at=now,
+        finished_at=now + 1,
+        fail_under=80.0,
+        results=[
+            CanaryResult("contract.quote_ops_runtime", PASS, 20, 20, "quote ops runtime passed"),
+            CanaryResult(
+                "live.rfq_dry_run_quote_package",
+                PASS,
+                25,
+                25,
+                "live RFQ dry-run package passed",
+            ),
+            CanaryResult(
+                "live.approved_rfq_draft_quote",
+                PASS,
+                30,
+                30,
+                "approved RFQ draft package passed",
+            ),
+        ],
+    )
+
+    summary = quality_summary(report)
+
+    assert next(item for item in summary["increments"] if item["target"] == "9.0/10")["status"] == "open"
+    assert next(item for item in summary["increments"] if item["target"] == "9.7/10")["status"] == "open"
+    assert summary["score"] < 9.0
 
 
 def test_frontier_wrapper_falls_back_to_gemini(monkeypatch, tmp_path):

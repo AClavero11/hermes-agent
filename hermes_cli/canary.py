@@ -4202,84 +4202,71 @@ def _quality_dimensions(report: CanaryReport) -> list[QualityDimension]:
 
 def quality_summary(report: CanaryReport) -> dict[str, Any]:
     dimensions = _quality_dimensions(report)
+    def passed(name: str) -> bool:
+        result = _result_by_name(report, name)
+        return bool(result and result.status == PASS)
+
+    model_result = _result_by_name(report, "runtime.model_route")
+    local_deepseek_done = bool(
+        model_result
+        and model_result.status == PASS
+        and "deepseek" in model_result.summary.lower()
+    )
+    golden_done = passed("contract.behavior_goldens")
+    live_behavior_done = golden_done and passed("live.behavior_golden")
+    trend_done = live_behavior_done and passed("contract.scorecard_trend")
+    workflows_done = trend_done and passed("contract.aac_workflows")
+    foundation_done = (
+        workflows_done
+        and passed("contract.planner_self_heal")
+        and local_deepseek_done
+        and passed("eval.hermes_reasoning")
+        and passed("eval.frontier_wrapper")
+        and passed("live.telegram_e2e")
+    )
+    quote_ops_done = foundation_done and passed("contract.quote_ops_runtime")
+    rfq_dry_run_done = quote_ops_done and passed("live.rfq_dry_run_quote_package")
+    approved_rfq_draft_done = rfq_dry_run_done and passed("live.approved_rfq_draft_quote")
     increments = [
         {
             "target": "7.0/10",
             "increment": "Golden behavior layer and honest metrics",
-            "status": "done" if _result_by_name(report, "contract.behavior_goldens") and _result_by_name(report, "contract.behavior_goldens").status == PASS else "open",
+            "status": "done" if golden_done else "open",
         },
         {
             "target": "7.5/10",
             "increment": "Live API behavior goldens with latency budgets",
-            "status": "done" if _result_by_name(report, "live.behavior_golden") and _result_by_name(report, "live.behavior_golden").status == PASS else "open",
+            "status": "done" if live_behavior_done else "open",
         },
         {
             "target": "8.0/10",
             "increment": "Daily scheduled metrics trend and regression alerting",
-            "status": "done" if _result_by_name(report, "contract.scorecard_trend") and _result_by_name(report, "contract.scorecard_trend").status == PASS else "open",
+            "status": "done" if trend_done else "open",
         },
         {
             "target": "8.5/10",
             "increment": "AAC workflow goldens: RFQ, V11 lookup, quote prep, Workspace report",
-            "status": "done" if (
-                _result_by_name(report, "contract.scorecard_trend")
-                and _result_by_name(report, "contract.scorecard_trend").status == PASS
-                and _result_by_name(report, "contract.aac_workflows")
-                and _result_by_name(report, "contract.aac_workflows").status == PASS
-            ) else "open",
+            "status": "done" if workflows_done else "open",
         },
         {
             "target": "9.0/10",
             "increment": "Local DeepSeek route, full Hermes reasoning, frontier wrapper, and live Telegram E2E gates",
-            "status": "done" if (
-                _result_by_name(report, "contract.scorecard_trend")
-                and _result_by_name(report, "contract.scorecard_trend").status == PASS
-                and _result_by_name(report, "contract.aac_workflows")
-                and _result_by_name(report, "contract.aac_workflows").status == PASS
-                and _result_by_name(report, "contract.planner_self_heal")
-                and _result_by_name(report, "contract.planner_self_heal").status == PASS
-                and _result_by_name(report, "runtime.model_route")
-                and _result_by_name(report, "runtime.model_route").status == PASS
-                and "deepseek" in _result_by_name(report, "runtime.model_route").summary.lower()
-                and _result_by_name(report, "eval.hermes_reasoning")
-                and _result_by_name(report, "eval.hermes_reasoning").status == PASS
-                and _result_by_name(report, "eval.frontier_wrapper")
-                and _result_by_name(report, "eval.frontier_wrapper").status == PASS
-                and _result_by_name(report, "live.telegram_e2e")
-                and _result_by_name(report, "live.telegram_e2e").status == PASS
-            ) else "open",
+            "status": "done" if foundation_done else "open",
         },
         {
             "target": "9.2/10",
             "increment": "Quote automation runtime is env-driven, approval-gated, and PDF generation is live",
-            "status": "done" if (
-                _result_by_name(report, "live.telegram_e2e")
-                and _result_by_name(report, "live.telegram_e2e").status == PASS
-                and _result_by_name(report, "contract.quote_ops_runtime")
-                and _result_by_name(report, "contract.quote_ops_runtime").status == PASS
-            ) else "open",
+            "status": "done" if quote_ops_done else "open",
         },
         {
             "target": "9.5/10",
             "increment": "Live RFQ dry-run creates a sourced quote package from V11 stock, customer history, and pricing rules",
-            "status": "done" if (
-                _result_by_name(report, "contract.quote_ops_runtime")
-                and _result_by_name(report, "contract.quote_ops_runtime").status == PASS
-                and _result_by_name(report, "live.rfq_dry_run_quote_package")
-                and _result_by_name(report, "live.rfq_dry_run_quote_package").status == PASS
-            ) else "open",
+            "status": "done" if rfq_dry_run_done else "open",
         },
         {
             "target": "9.7/10",
             "increment": "Approved RFQs create V11/Atlas draft quotes with QAMFORM preview and Telegram approval card",
-            "status": "done" if (
-                _result_by_name(report, "contract.quote_ops_runtime")
-                and _result_by_name(report, "contract.quote_ops_runtime").status == PASS
-                and _result_by_name(report, "live.rfq_dry_run_quote_package")
-                and _result_by_name(report, "live.rfq_dry_run_quote_package").status == PASS
-                and _result_by_name(report, "live.approved_rfq_draft_quote")
-                and _result_by_name(report, "live.approved_rfq_draft_quote").status == PASS
-            ) else "open",
+            "status": "done" if approved_rfq_draft_done else "open",
         },
         {
             "target": "10.0/10",
