@@ -1349,7 +1349,7 @@ def _canary_hermes_reasoning_eval(options: CanaryOptions) -> CanaryResult:
             "No gateway URL configured",
         )
     api_key, api_key_source = _resolve_api_key(options)
-    if not api_key:
+    if not api_key and not _gateway_url_is_loopback(base):
         return _result(
             "eval.hermes_reasoning",
             FAIL if options.require_live else SKIP,
@@ -1358,6 +1358,8 @@ def _canary_hermes_reasoning_eval(options: CanaryOptions) -> CanaryResult:
             "No API key available for /v1/responses",
             {"api_key_present": False},
         )
+    if not api_key:
+        api_key_source = "loopback_unauthenticated"
 
     cases = _reasoning_eval_cases(latency_budget_ms=45000)
     for case in cases:
@@ -1390,8 +1392,9 @@ def _canary_hermes_reasoning_eval(options: CanaryOptions) -> CanaryResult:
         30,
         f"{len(passed)}/{len(cases)} Hermes no-tool reasoning/guardrail evals passed",
         {
-            "api_key_present": True,
+            "api_key_present": bool(api_key),
             "api_key_source": api_key_source,
+            "loopback_unauthenticated": api_key_source == "loopback_unauthenticated",
             "passed": passed,
             "failed": failed,
             "url": url,

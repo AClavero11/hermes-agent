@@ -114,6 +114,45 @@ def test_live_behavior_still_requires_api_key_for_remote_gateway(monkeypatch, tm
     assert result.summary == "No API key available for /v1/responses"
 
 
+def test_hermes_reasoning_allows_loopback_without_api_key(monkeypatch, tmp_path):
+    options = CanaryOptions(
+        repo_root=Path(__file__).resolve().parents[2],
+        hermes_home=tmp_path,
+        gateway_url="http://localhost:8643",
+        reasoning_eval=True,
+        timeout=0.2,
+    )
+
+    def fake_run_responses_case(*, url, api_key, case, timeout):
+        return {"ok": True, "text": "ok", "elapsed_ms": 1.0}
+
+    monkeypatch.setattr(canary_module, "_run_responses_case", fake_run_responses_case)
+    monkeypatch.setattr(canary_module, "_resolve_api_key", lambda options: ("", ""))
+
+    result = canary_module._canary_hermes_reasoning_eval(options)
+
+    assert result.status == PASS
+    assert result.details["api_key_present"] is False
+    assert result.details["api_key_source"] == "loopback_unauthenticated"
+    assert result.details["loopback_unauthenticated"] is True
+
+
+def test_hermes_reasoning_still_requires_api_key_for_remote_gateway(monkeypatch, tmp_path):
+    options = CanaryOptions(
+        repo_root=Path(__file__).resolve().parents[2],
+        hermes_home=tmp_path,
+        gateway_url="https://hermes.advanced.aero",
+        reasoning_eval=True,
+        timeout=0.2,
+    )
+    monkeypatch.setattr(canary_module, "_resolve_api_key", lambda options: ("", ""))
+
+    result = canary_module._canary_hermes_reasoning_eval(options)
+
+    assert result.status == SKIP
+    assert result.summary == "No API key available for /v1/responses"
+
+
 def test_canary_writes_markdown_and_json(tmp_path):
     options = CanaryOptions(
         repo_root=Path(__file__).resolve().parents[2],
