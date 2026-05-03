@@ -642,6 +642,17 @@ def test_telegram_operator_expected_substrings_follow_prompt_choice():
         "V4 planner",
         "Alexandria/V11",
     ]
+    assert canary_module._telegram_operator_expected_substrings("status") == [
+        "Hermes Gateway Status",
+        "Agent Running",
+    ]
+    assert canary_module._telegram_operator_expected_substrings("new") == [
+        "Session",
+        "fresh",
+    ]
+    assert canary_module._telegram_operator_expected_substrings("stop") == [
+        "active task",
+    ]
     assert canary_module._telegram_operator_expected_substrings("rfq") == [
         "RFQ mode",
         "draft package",

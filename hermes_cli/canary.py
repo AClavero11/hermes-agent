@@ -2530,6 +2530,12 @@ def _telegram_operator_expected_substrings(prompt: str) -> list[str]:
         return ["Ack received", "No task started"]
     if normalized in {"test", "testing", "ping"}:
         return ["Hermes online", "V4 planner", "Alexandria/V11"]
+    if normalized in {"status", "hermesstatus"}:
+        return ["Hermes Gateway Status", "Agent Running"]
+    if normalized in {"new", "reset", "newsession", "freshsession"}:
+        return ["Session", "fresh"]
+    if normalized in {"stop", "cancel", "abort"}:
+        return ["active task"]
     if normalized in {"rfq", "quote", "quotes"}:
         return ["RFQ mode", "draft package", "No customer sends"]
     if normalized in {"inventory", "stock", "parts"}:
