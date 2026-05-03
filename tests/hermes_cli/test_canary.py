@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import json
+import time
 from pathlib import Path
 
 import hermes_cli.canary as canary_module
@@ -79,6 +80,31 @@ def test_canary_suite_runs_without_live_gateway(tmp_path):
     assert report.effective_max_score > 0
 
 
+def test_release_profile_converts_skipped_live_checks_to_failures(tmp_path):
+    options = CanaryOptions(
+        repo_root=Path(__file__).resolve().parents[2],
+        hermes_home=tmp_path,
+        gateway_url="http://127.0.0.1:1",
+        env_wrapper=None,
+        release_profile=True,
+        timeout=0.2,
+    )
+
+    report = run_canary_suite(options)
+    quality = quality_summary(report)
+
+    assert report.runtime["canary_profile"] == "release"
+    assert any(
+        result.name == "live.behavior_golden" and result.status == canary_module.FAIL
+        for result in report.results
+    )
+    assert any(
+        result.name == "live.telegram_visible_delivery" and result.status == canary_module.FAIL
+        for result in report.results
+    )
+    assert quality["score"] <= 8.9
+
+
 def test_options_from_args_infers_home_from_env_wrapper(tmp_path):
     wrapper_home = tmp_path / ".hermes-deepseek"
     wrapper = wrapper_home / "bin" / "hermes-env.sh"
@@ -111,6 +137,15 @@ def test_options_from_args_respects_explicit_hermes_home(tmp_path):
 
     assert options.hermes_home == explicit_home
     assert options.env_wrapper == wrapper
+
+
+def test_options_from_args_release_profile_requires_live(tmp_path):
+    parser = canary_module.build_arg_parser()
+    args = parser.parse_args(["--release-profile", "--hermes-home", str(tmp_path)])
+    options = canary_module.options_from_args(args)
+
+    assert options.release_profile is True
+    assert options.require_live is True
 
 
 def test_live_behavior_allows_loopback_without_api_key(monkeypatch, tmp_path):
@@ -630,6 +665,7 @@ def test_telegram_operator_expected_substrings_follow_prompt_choice():
 
 
 def test_telegram_operator_response_probe_accepts_expected_menu(monkeypatch, tmp_path):
+    current_sha = "abcdef1234567890"
     options = CanaryOptions(
         repo_root=Path(__file__).resolve().parents[2],
         hermes_home=tmp_path,
@@ -645,6 +681,8 @@ def test_telegram_operator_response_probe_accepts_expected_menu(monkeypatch, tmp
         "_run_telegram_operator_response_probe",
         lambda options: {
             "ok": True,
+            "nonce": "op-test",
+            "prompt": "what can we do",
             "evidence": {
                 "status": "pass",
                 "mode": "signed_operator_response_probe",
@@ -653,9 +691,13 @@ def test_telegram_operator_response_probe_accepts_expected_menu(monkeypatch, tmp
                 "content_match": True,
                 "telegram_send_ok": True,
                 "nonce": "op-test",
+                "prompt": "what can we do",
+                "repo_sha": current_sha,
+                "created_at": time.time(),
             },
         },
     )
+    monkeypatch.setattr(canary_module, "_current_repo_sha", lambda _repo_root: current_sha)
 
     result = canary_module._canary_telegram_operator_response(options)
 
@@ -685,6 +727,110 @@ def test_telegram_operator_response_probe_flags_timeout(monkeypatch, tmp_path):
 
     assert result.status == WARN
     assert result.details["failure_class"] == "telegram_operator_response_missing"
+
+
+def test_telegram_visible_delivery_rejects_stale_evidence(monkeypatch, tmp_path):
+    current_sha = "abcdef1234567890"
+    options = CanaryOptions(
+        repo_root=Path(__file__).resolve().parents[2],
+        hermes_home=tmp_path,
+        gateway_url="",
+        env_wrapper=None,
+        telegram_visible_probe=True,
+        require_live=False,
+        timeout=0.2,
+    )
+
+    monkeypatch.setattr(canary_module, "_current_repo_sha", lambda _repo_root: current_sha)
+    monkeypatch.setattr(
+        canary_module,
+        "_run_telegram_visible_probe",
+        lambda options: {
+            "ok": True,
+            "nonce": "real-test",
+            "evidence": {
+                "status": "pass",
+                "mode": "real_visible_delivery_probe",
+                "latency_ms": 500,
+                "latency_budget_ms": 60_000,
+                "ack_match": "exact",
+                "nonce": "real-test",
+                "repo_sha": current_sha,
+                "created_at": time.time() - 3600,
+            },
+        },
+    )
+
+    result = canary_module._canary_telegram_visible_delivery(options)
+    now = 1_700_000_000.0
+    report = CanaryReport(
+        started_at=now,
+        finished_at=now + 1,
+        fail_under=80.0,
+        results=[
+            *[
+                item
+                for item in _quality_foundation_results()
+                if item.name != "live.telegram_visible_delivery"
+            ],
+            result,
+            CanaryResult("contract.quote_ops_runtime", PASS, 20, 20, "quote ops runtime passed"),
+            CanaryResult(
+                "live.rfq_dry_run_quote_package",
+                PASS,
+                25,
+                25,
+                "live RFQ dry-run package passed",
+            ),
+        ],
+    )
+    quality = quality_summary(report)
+
+    assert result.status == WARN
+    assert result.details["failure_class"] == "telegram_visible_stale_or_unbound_evidence"
+    assert "fresh" in result.details["evidence_validation"]["failed"]
+    assert quality["score"] <= 8.9
+
+
+def test_telegram_operator_prompt_specific_fresh_evidence_passes(monkeypatch, tmp_path):
+    current_sha = "abcdef1234567890"
+    options = CanaryOptions(
+        repo_root=Path(__file__).resolve().parents[2],
+        hermes_home=tmp_path,
+        gateway_url="",
+        env_wrapper=None,
+        telegram_operator_probe=True,
+        require_live=True,
+        timeout=0.2,
+    )
+    monkeypatch.setattr(canary_module, "_current_repo_sha", lambda _repo_root: current_sha)
+    monkeypatch.setattr(
+        canary_module,
+        "_run_telegram_operator_response_probe",
+        lambda options: {
+            "ok": True,
+            "nonce": "op-rfq",
+            "prompt": "rfq",
+            "evidence": {
+                "status": "pass",
+                "mode": "signed_operator_response_probe",
+                "latency_ms": 500,
+                "latency_budget_ms": 10_000,
+                "content_match": True,
+                "telegram_send_ok": True,
+                "nonce": "op-rfq",
+                "prompt": "rfq",
+                "repo_sha": current_sha[:12],
+                "created_at": time.time(),
+            },
+        },
+    )
+
+    result = canary_module._canary_telegram_operator_response(options)
+
+    assert result.status == PASS
+    assert result.details["evidence_validation"]["checks"]["prompt_match"] is True
+    assert result.details["evidence_validation"]["checks"]["runtime_sha_current"] is True
 
 
 def test_frontier_wrapper_falls_back_to_gemini(monkeypatch, tmp_path):

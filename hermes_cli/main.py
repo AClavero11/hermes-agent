@@ -7147,6 +7147,19 @@ For more help on a command:
         help="Fail if live HTTP/network canaries are unavailable",
     )
     canary_parser.add_argument(
+        "--release-profile",
+        action="store_true",
+        default=(
+            os.getenv("HERMES_CANARY_RELEASE", "").strip().lower()
+            in {"1", "true", "yes", "on"}
+            or os.getenv("HERMES_CANARY_PROFILE", "").strip().lower() == "release"
+        ),
+        help=(
+            "Run strict release scoring: skipped release-critical live checks fail "
+            "and Telegram proof must be fresh/current-SHA bound"
+        ),
+    )
+    canary_parser.add_argument(
         "--live-behavior",
         action="store_true",
         help="Run live /v1/responses behavior goldens using the API key",

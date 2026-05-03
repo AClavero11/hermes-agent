@@ -51,6 +51,7 @@ def _make_runner(session_entry: SessionEntry):
     runner.session_store.rewrite_transcript = MagicMock()
     runner.session_store.update_session = MagicMock()
     runner._running_agents = {}
+    runner._running_agents_ts = {}
     runner._session_run_generation = {}
     runner._pending_messages = {}
     runner._pending_approvals = {}
@@ -67,6 +68,26 @@ def _make_runner(session_entry: SessionEntry):
     runner._capture_gateway_honcho_if_configured = lambda *args, **kwargs: None
     runner._emit_gateway_run_progress = AsyncMock()
     return runner
+
+
+def test_plain_operator_control_classifier():
+    import gateway.run as gateway_run
+
+    assert gateway_run._classify_plain_operator_control("status") == "status"
+    assert gateway_run._classify_plain_operator_control("new session") == "new"
+    assert gateway_run._classify_plain_operator_control("stop") == "stop"
+    assert gateway_run._classify_plain_operator_control("status report") == ""
+
+
+def test_operator_lane_choice_classifier():
+    import gateway.run as gateway_run
+
+    assert gateway_run._classify_operator_lane_choice("rfq") == "rfq"
+    assert gateway_run._classify_operator_lane_choice("quote") == "rfq"
+    assert gateway_run._classify_operator_lane_choice("inventory") == "inventory"
+    assert gateway_run._classify_operator_lane_choice("follow ups") == "followups"
+    assert gateway_run._classify_operator_lane_choice("hermes") == "hermes"
+    assert gateway_run._classify_operator_lane_choice("rfq dry-run") == ""
 
 
 @pytest.mark.asyncio
@@ -91,6 +112,118 @@ async def test_status_command_reports_running_agent_without_interrupt(monkeypatc
     assert "**Agent Running:** Yes ⚡" in result
     assert "**Title:**" not in result
     running_agent.interrupt.assert_not_called()
+    assert runner._pending_messages == {}
+
+
+@pytest.mark.asyncio
+async def test_plain_status_reports_running_agent_without_interrupt():
+    session_entry = SessionEntry(
+        session_key=build_session_key(_make_source()),
+        session_id="sess-plain-status",
+        created_at=datetime.now(),
+        updated_at=datetime.now(),
+        platform=Platform.TELEGRAM,
+        chat_type="dm",
+        total_tokens=123,
+    )
+    runner = _make_runner(session_entry)
+    running_agent = MagicMock()
+    runner._running_agents[build_session_key(_make_source())] = running_agent
+
+    result = await runner._handle_message(_make_event("status"))
+
+    assert "**Session ID:** `sess-plain-status`" in result
+    assert "**Agent Running:** Yes ⚡" in result
+    running_agent.interrupt.assert_not_called()
+    assert runner._pending_messages == {}
+
+
+@pytest.mark.asyncio
+async def test_plain_stop_interrupts_without_llm_queue():
+    session_entry = SessionEntry(
+        session_key=build_session_key(_make_source()),
+        session_id="sess-stop",
+        created_at=datetime.now(),
+        updated_at=datetime.now(),
+        platform=Platform.TELEGRAM,
+        chat_type="dm",
+    )
+    runner = _make_runner(session_entry)
+    session_key = build_session_key(_make_source())
+    runner._running_agents[session_key] = MagicMock()
+    runner._interrupt_and_clear_session = AsyncMock()
+
+    result = await runner._handle_message(_make_event("stop"))
+
+    assert result.startswith("⚡ Stopped.")
+    runner._interrupt_and_clear_session.assert_awaited_once()
+    assert runner._pending_messages == {}
+
+
+@pytest.mark.asyncio
+async def test_plain_new_resets_running_session_without_llm_queue():
+    session_entry = SessionEntry(
+        session_key=build_session_key(_make_source()),
+        session_id="sess-new",
+        created_at=datetime.now(),
+        updated_at=datetime.now(),
+        platform=Platform.TELEGRAM,
+        chat_type="dm",
+    )
+    runner = _make_runner(session_entry)
+    session_key = build_session_key(_make_source())
+    runner._running_agents[session_key] = MagicMock()
+    runner._interrupt_and_clear_session = AsyncMock()
+    runner._handle_reset_command = AsyncMock(return_value="Session reset from plain new.")
+
+    result = await runner._handle_message(_make_event("new"))
+
+    assert result == "Session reset from plain new."
+    runner._interrupt_and_clear_session.assert_awaited_once()
+    runner._handle_reset_command.assert_awaited_once()
+    assert runner._pending_messages == {}
+
+
+@pytest.mark.asyncio
+async def test_plain_lane_choice_resets_context_and_returns_direct_answer():
+    session_entry = SessionEntry(
+        session_key=build_session_key(_make_source()),
+        session_id="sess-lane",
+        created_at=datetime.now(),
+        updated_at=datetime.now(),
+        platform=Platform.TELEGRAM,
+        chat_type="dm",
+    )
+    runner = _make_runner(session_entry)
+    runner._reset_session_for_operator_lane = MagicMock(return_value=True)
+
+    result = await runner._handle_message(_make_event("rfq"))
+
+    assert result.startswith("RFQ mode.")
+    runner._reset_session_for_operator_lane.assert_called_once()
+
+
+@pytest.mark.asyncio
+async def test_busy_lane_choice_interrupts_resets_and_returns_direct_answer():
+    session_entry = SessionEntry(
+        session_key=build_session_key(_make_source()),
+        session_id="sess-busy-lane",
+        created_at=datetime.now(),
+        updated_at=datetime.now(),
+        platform=Platform.TELEGRAM,
+        chat_type="dm",
+    )
+    runner = _make_runner(session_entry)
+    session_key = build_session_key(_make_source())
+    runner._running_agents[session_key] = MagicMock()
+    runner._interrupt_and_clear_session = AsyncMock()
+    runner._reset_session_for_operator_lane = MagicMock(return_value=True)
+
+    result = await runner._handle_message(_make_event("inventory"))
+
+    assert result.startswith("Inventory mode.")
+    runner._interrupt_and_clear_session.assert_awaited_once()
+    runner._reset_session_for_operator_lane.assert_called_once()
     assert runner._pending_messages == {}
 
 

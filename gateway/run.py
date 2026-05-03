@@ -1042,6 +1042,32 @@ def _build_malformed_hermes_recovery(reason: str) -> str:
     )
 
 
+def _classify_plain_operator_control(message: str) -> str:
+    """Map exact plain operator controls to their slash-command equivalent."""
+    normalized = re.sub(r"[^a-z0-9]+", "", (message or "").lower())
+    if normalized in {"new", "reset", "newsession", "freshsession"}:
+        return "new"
+    if normalized in {"stop", "cancel", "abort"}:
+        return "stop"
+    if normalized in {"status", "hermesstatus"}:
+        return "status"
+    return ""
+
+
+def _classify_operator_lane_choice(message: str) -> str:
+    """Map exact operator menu choices to lane names."""
+    normalized = re.sub(r"[^a-z0-9]+", "", (message or "").lower())
+    if normalized in {"rfq", "quote", "quotes"}:
+        return "rfq"
+    if normalized in {"inventory", "stock", "parts"}:
+        return "inventory"
+    if normalized in {"followups", "followup", "followupsdraft", "followupdraft"}:
+        return "followups"
+    if normalized == "hermes":
+        return "hermes"
+    return ""
+
+
 _FAST_RECEIPT_SKIP_NORMALIZED = {
     "ack",
     "acknowledged",
@@ -2156,6 +2182,26 @@ class GatewayRunner:
         if not adapter:
             return
         merge_pending_message_event(adapter._pending_messages, session_key, event)
+
+    def _reset_session_for_operator_lane(self, source: SessionSource, lane: str) -> bool:
+        """Start exact operator lane choices from a clean session boundary."""
+        session_key = self._session_key_for_source(source)
+        try:
+            self.session_store.get_or_create_session(source)
+            new_entry = self.session_store.reset_session(session_key)
+        except Exception as exc:
+            logger.debug("Failed resetting operator lane session %s: %s", session_key[:20], exc)
+            return False
+        self._evict_cached_agent(session_key)
+        self._session_model_overrides.pop(session_key, None)
+        self._clear_session_boundary_security_state(session_key)
+        logger.info(
+            "Operator lane %s reset session %s -> %s",
+            lane,
+            session_key[:20],
+            getattr(new_entry, "session_id", None) or "missing",
+        )
+        return bool(new_entry)
 
     async def _handle_active_session_busy_message(self, event: MessageEvent, session_key: str) -> bool:
         # --- Draining case (gateway restarting/stopping) ---
@@ -4501,8 +4547,40 @@ class GatewayRunner:
                 self._release_running_agent_state(_quick_key)
 
         if _quick_key in self._running_agents:
-            if event.get_command() == "status":
+            plain_control = "" if event.get_command() else _classify_plain_operator_control(event.text or "")
+            if plain_control == "status" or event.get_command() == "status":
                 return await self._handle_status_command(event)
+
+            if plain_control == "stop":
+                await self._interrupt_and_clear_session(
+                    _quick_key,
+                    source,
+                    interrupt_reason=_INTERRUPT_REASON_STOP,
+                    invalidation_reason="plain_stop",
+                )
+                logger.info("Plain STOP for session %s — agent interrupted", _quick_key[:20])
+                return "⚡ Stopped. You can continue this session."
+
+            if plain_control == "new":
+                await self._interrupt_and_clear_session(
+                    _quick_key,
+                    source,
+                    interrupt_reason=_INTERRUPT_REASON_RESET,
+                    invalidation_reason="plain_new",
+                )
+                return await self._handle_reset_command(event)
+
+            lane_choice = "" if event.get_command() else _classify_operator_lane_choice(event.text or "")
+            if lane_choice:
+                await self._interrupt_and_clear_session(
+                    _quick_key,
+                    source,
+                    interrupt_reason=_INTERRUPT_REASON_RESET,
+                    invalidation_reason=f"operator_lane_{lane_choice}",
+                )
+                self._reset_session_for_operator_lane(source, lane_choice)
+                direct_answer = _build_hermes_direct_answer(event.text or "")
+                return direct_answer or "Operator lane started from a clean session."
 
             # Resolve the command once for all early-intercept checks below.
             from hermes_cli.commands import (
@@ -4765,6 +4843,21 @@ class GatewayRunner:
         # don't depend on the exact alias the user typed.
         _cmd_def = _resolve_cmd(command) if command else None
         canonical = _cmd_def.name if _cmd_def else command
+
+        if not command:
+            plain_control = _classify_plain_operator_control(event.text or "")
+            if plain_control == "new":
+                return await self._handle_reset_command(event)
+            if plain_control == "stop":
+                return await self._handle_stop_command(event)
+            if plain_control == "status":
+                return await self._handle_status_command(event)
+
+            lane_choice = _classify_operator_lane_choice(event.text or "")
+            if lane_choice:
+                self._reset_session_for_operator_lane(source, lane_choice)
+                direct_answer = _build_hermes_direct_answer(event.text or "")
+                return direct_answer or "Operator lane started from a clean session."
 
         # Fire the ``command:<canonical>`` hook for any recognized slash
         # command — built-in OR plugin-registered. Handlers can return a

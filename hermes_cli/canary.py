@@ -51,6 +51,7 @@ class CanaryOptions:
     rfq_dry_run: bool = False
     approved_rfq_draft: bool = False
     require_live: bool = False
+    release_profile: bool = False
     timeout: float = 8.0
     fail_under: float = 80.0
     output_dir: Path | None = None
@@ -176,6 +177,9 @@ def _default_env_wrapper(hermes_home: Path) -> Path | None:
 
 def default_options() -> CanaryOptions:
     hermes_home = _default_hermes_home()
+    release_profile = _env_flag("HERMES_CANARY_RELEASE") or (
+        os.getenv("HERMES_CANARY_PROFILE", "").strip().lower() == "release"
+    )
     return CanaryOptions(
         repo_root=_repo_root(),
         hermes_home=hermes_home,
@@ -185,7 +189,13 @@ def default_options() -> CanaryOptions:
         frontier_model=os.getenv("OPENAI_FRONTIER_MODEL", os.getenv("HERMES_FRONTIER_MODEL", "gpt-5.5")),
         frontier_api_key=os.getenv("HERMES_FRONTIER_API_KEY", os.getenv("OPENAI_API_KEY", "")),
         frontier_base_url=os.getenv("HERMES_FRONTIER_BASE_URL", "https://api.openai.com/v1"),
+        require_live=release_profile,
+        release_profile=release_profile,
     )
+
+
+def _env_flag(name: str) -> bool:
+    return os.getenv(name, "").strip().lower() in {"1", "true", "yes", "on"}
 
 
 def _result(
@@ -419,6 +429,151 @@ def _http_exception_details(exc: Exception) -> dict[str, Any]:
         "error_type": type(exc).__name__,
         "error": str(exc),
     }
+
+
+_RELEASE_REQUIRED_CHECKS = {
+    "live.gateway_health",
+    "live.behavior_golden",
+    "eval.local_model_reasoning",
+    "eval.hermes_reasoning",
+    "eval.frontier_wrapper",
+    "live.telegram_e2e",
+    "live.telegram_operator_response",
+    "live.telegram_visible_delivery",
+    "live.rfq_dry_run_quote_package",
+    "live.approved_rfq_draft_quote",
+}
+
+
+def _current_repo_sha(repo_root: Path) -> str:
+    try:
+        proc = subprocess.run(
+            ["git", "rev-parse", "HEAD"],
+            cwd=str(repo_root),
+            capture_output=True,
+            text=True,
+            timeout=3.0,
+            check=False,
+        )
+    except Exception:
+        return ""
+    if proc.returncode != 0:
+        return ""
+    return (proc.stdout or "").strip()
+
+
+def _evidence_sha(evidence: dict[str, Any]) -> str:
+    for key in (
+        "runtime_sha",
+        "runtime_git_sha",
+        "repo_sha",
+        "git_sha",
+        "commit_sha",
+        "hermes_sha",
+    ):
+        value = str(evidence.get(key) or "").strip()
+        if value:
+            return value
+    runtime = evidence.get("runtime")
+    if isinstance(runtime, dict):
+        for key in ("runtime_sha", "repo_sha", "git_sha", "commit_sha"):
+            value = str(runtime.get(key) or "").strip()
+            if value:
+                return value
+    return ""
+
+
+def _evidence_timestamp(evidence: dict[str, Any]) -> float:
+    for key in (
+        "completed_at",
+        "observed_at",
+        "created_at",
+        "sent_at",
+        "finished_at",
+        "timestamp",
+        "time",
+    ):
+        value = evidence.get(key)
+        if isinstance(value, (int, float)):
+            return float(value)
+        if isinstance(value, str) and value.strip():
+            try:
+                return datetime.fromisoformat(
+                    value.strip().replace("Z", "+00:00")
+                ).timestamp()
+            except ValueError:
+                continue
+    return 0.0
+
+
+def _validate_current_telegram_evidence(
+    *,
+    options: CanaryOptions,
+    evidence: dict[str, Any],
+    expected_nonce: str = "",
+    expected_prompt: str = "",
+    max_age_seconds: float = 900.0,
+) -> dict[str, Any]:
+    current_sha = _current_repo_sha(options.repo_root)
+    evidence_sha = _evidence_sha(evidence)
+    evidence_time = _evidence_timestamp(evidence)
+    age_seconds = max(0.0, time.time() - evidence_time) if evidence_time else None
+    nonce_match = not expected_nonce or evidence.get("nonce") == expected_nonce
+    prompt_match = not expected_prompt or evidence.get("prompt") == expected_prompt
+    sha_match = bool(
+        current_sha
+        and evidence_sha
+        and (current_sha.startswith(evidence_sha) or evidence_sha.startswith(current_sha))
+    )
+    freshness_ok = bool(age_seconds is not None and age_seconds <= max_age_seconds)
+    checks = {
+        "nonce_match": nonce_match,
+        "prompt_match": prompt_match,
+        "runtime_sha_present": bool(evidence_sha),
+        "runtime_sha_current": sha_match,
+        "timestamp_present": evidence_time > 0,
+        "fresh": freshness_ok,
+    }
+    failed = [name for name, ok in checks.items() if not ok]
+    reasons: list[str] = []
+    if not evidence_sha:
+        reasons.append("Telegram evidence lacks runtime SHA binding")
+    elif current_sha and not sha_match:
+        reasons.append("Telegram evidence runtime SHA does not match current repo SHA")
+    elif not current_sha:
+        reasons.append("Current repo SHA could not be resolved")
+    if not evidence_time:
+        reasons.append("Telegram evidence lacks a freshness timestamp")
+    elif not freshness_ok:
+        reasons.append("Telegram evidence is stale")
+    if expected_nonce and not nonce_match:
+        reasons.append("Telegram evidence nonce does not match the current probe")
+    if expected_prompt and not prompt_match:
+        reasons.append("Telegram operator evidence prompt does not match the current probe")
+    return {
+        "ok": not failed,
+        "checks": checks,
+        "failed": failed,
+        "reasons": reasons,
+        "current_sha": current_sha,
+        "evidence_sha": evidence_sha,
+        "evidence_timestamp": evidence_time,
+        "age_seconds": age_seconds,
+        "max_age_seconds": max_age_seconds,
+    }
+
+
+def _release_profile_skip_fail(result: CanaryResult) -> CanaryResult:
+    if result.name not in _RELEASE_REQUIRED_CHECKS or result.status != SKIP:
+        return result
+    return _result(
+        result.name,
+        FAIL,
+        0,
+        result.max_score,
+        f"Release profile requires {result.name}; skipped live checks fail release",
+        {**result.details, "release_profile": True, "original_status": SKIP},
+    )
 
 
 def _canary_gateway_health(options: CanaryOptions) -> CanaryResult:
@@ -2272,6 +2427,7 @@ def _run_telegram_visible_probe(options: CanaryOptions) -> dict[str, Any]:
         return details
 
     message = sent.get("result") if isinstance(sent.get("result"), dict) else {}
+    repo_sha = _current_repo_sha(options.repo_root)
     pending = {
         "status": "sent",
         "mode": "real_visible_delivery_probe",
@@ -2282,6 +2438,8 @@ def _run_telegram_visible_probe(options: CanaryOptions) -> dict[str, Any]:
         "nonce": nonce,
         "text": text,
         "message_id": message.get("message_id"),
+        "repo_sha": repo_sha,
+        "runtime_sha": repo_sha,
     }
     pending_path.parent.mkdir(parents=True, exist_ok=True)
     pending_path.write_text(
@@ -2437,6 +2595,7 @@ def _run_telegram_operator_response_probe(options: CanaryOptions) -> dict[str, A
     nonce = f"op-{int(started * 1000)}"
     update_id = int(started * 1000) % 2_000_000_000
     inbound_message_id = update_id % 1_000_000
+    repo_sha = _current_repo_sha(options.repo_root)
     pending = {
         "status": "pending",
         "mode": "signed_operator_response_probe",
@@ -2447,6 +2606,8 @@ def _run_telegram_operator_response_probe(options: CanaryOptions) -> dict[str, A
         "prompt": prompt,
         "expected_substrings": expected_substrings,
         "inbound_message_id": inbound_message_id,
+        "repo_sha": repo_sha,
+        "runtime_sha": repo_sha,
     }
     pending_path.parent.mkdir(parents=True, exist_ok=True)
     pending_path.write_text(
@@ -2545,11 +2706,18 @@ def _canary_telegram_operator_response(options: CanaryOptions) -> CanaryResult:
 
     probe = _run_telegram_operator_response_probe(options)
     evidence = probe.get("evidence") if isinstance(probe.get("evidence"), dict) else {}
+    evidence_validation = _validate_current_telegram_evidence(
+        options=options,
+        evidence=evidence,
+        expected_nonce=str(probe.get("nonce") or ""),
+        expected_prompt=str(probe.get("prompt") or ""),
+    ) if evidence else {"ok": False, "checks": {}, "failed": [], "reasons": []}
     latency_ms = float(evidence.get("latency_ms") or 0)
     latency_budget_ms = float(evidence.get("latency_budget_ms") or 10_000)
     content_match = bool(evidence.get("content_match"))
     checks = {
         "evidence_observed": bool(evidence),
+        "current_evidence": bool(evidence_validation.get("ok")),
         "content_match": content_match,
         "latency_budget": latency_ms > 0 and latency_ms <= latency_budget_ms,
         "telegram_send_ok": bool(evidence.get("telegram_send_ok")),
@@ -2562,25 +2730,42 @@ def _canary_telegram_operator_response(options: CanaryOptions) -> CanaryResult:
             20,
             20,
             f"Telegram operator prompt returned expected response in {latency_ms:.0f}ms",
-            {"enabled": True, "probe": probe, "checks": checks, "failure_class": ""},
+            {
+                "enabled": True,
+                "probe": probe,
+                "checks": checks,
+                "evidence_validation": evidence_validation,
+                "failure_class": "",
+            },
         )
 
     send_ok = bool(evidence.get("telegram_send_ok"))
     status = FAIL if options.require_live and not send_ok else WARN
+    if evidence and not evidence_validation.get("ok"):
+        status = FAIL if options.require_live or options.release_profile else WARN
+    failure_class = (
+        "telegram_operator_stale_or_unbound_evidence"
+        if evidence and not evidence_validation.get("ok")
+        else "telegram_operator_bad_response"
+        if evidence
+        else "telegram_operator_response_missing"
+    )
+    summary = "Telegram operator prompt did not produce current SHA-bound evidence"
+    if not evidence or evidence_validation.get("ok"):
+        summary = "Telegram operator prompt did not produce the expected response within budget"
     return _result(
         "live.telegram_operator_response",
         status,
         0,
         20,
-        "Telegram operator prompt did not produce the expected response within budget",
+        summary,
         {
             "enabled": True,
             "probe": probe,
             "checks": checks,
             "failed": failed,
-            "failure_class": "telegram_operator_bad_response"
-            if evidence
-            else "telegram_operator_response_missing",
+            "evidence_validation": evidence_validation,
+            "failure_class": failure_class,
         },
     )
 
@@ -2599,6 +2784,25 @@ def _canary_telegram_visible_delivery(options: CanaryOptions) -> CanaryResult:
     probe = _run_telegram_visible_probe(options)
     if probe.get("ok"):
         evidence = probe.get("evidence") if isinstance(probe.get("evidence"), dict) else {}
+        evidence_validation = _validate_current_telegram_evidence(
+            options=options,
+            evidence=evidence,
+            expected_nonce=str(probe.get("nonce") or ""),
+        )
+        if not evidence_validation.get("ok"):
+            return _result(
+                "live.telegram_visible_delivery",
+                FAIL if options.require_live or options.release_profile else WARN,
+                0,
+                20,
+                "Visible Telegram delivery evidence is stale or lacks current runtime SHA binding",
+                {
+                    "enabled": True,
+                    "probe": probe,
+                    "evidence_validation": evidence_validation,
+                    "failure_class": "telegram_visible_stale_or_unbound_evidence",
+                },
+            )
         latency_ms = float(evidence.get("latency_ms") or 0)
         ack_match = str(evidence.get("ack_match") or "exact")
         return _result(
@@ -2607,7 +2811,12 @@ def _canary_telegram_visible_delivery(options: CanaryOptions) -> CanaryResult:
             20,
             20,
             f"Visible Telegram delivery {ack_match} ack passed in {latency_ms:.0f}ms",
-            {"enabled": True, "probe": probe, "failure_class": ""},
+            {
+                "enabled": True,
+                "probe": probe,
+                "evidence_validation": evidence_validation,
+                "failure_class": "",
+            },
         )
 
     send = probe.get("send") if isinstance(probe.get("send"), dict) else {}
@@ -4293,6 +4502,8 @@ def run_canary_suite(options: CanaryOptions) -> CanaryReport:
         ("contract.planner_self_heal", 20, lambda: _canary_planner_self_heal(options)),
     ]
     results = [_time_case(name, max_score, fn) for name, max_score, fn in cases]
+    if options.release_profile:
+        results = [_release_profile_skip_fail(result) for result in results]
     try:
         from hermes_cli.runtime_status import collect_runtime_status
 
@@ -4305,6 +4516,9 @@ def run_canary_suite(options: CanaryOptions) -> CanaryReport:
         )
     except Exception as exc:
         runtime = {"error": f"{type(exc).__name__}: {exc}"}
+    if not isinstance(runtime, dict):
+        runtime = {}
+    runtime["canary_profile"] = "release" if options.release_profile else "daily"
     return CanaryReport(
         started_at=started,
         finished_at=time.time(),
@@ -4501,6 +4715,17 @@ def quality_summary(report: CanaryReport) -> dict[str, Any]:
         result = _result_by_name(report, name)
         return result.summary if result else "missing result"
 
+    canary_profile = ""
+    if isinstance(report.runtime, dict):
+        canary_profile = str(report.runtime.get("canary_profile") or "")
+    release_skipped = []
+    if canary_profile == "release":
+        release_skipped = [
+            name
+            for name in sorted(_RELEASE_REQUIRED_CHECKS)
+            if result_status(name) == SKIP
+        ]
+
     model_result = _result_by_name(report, "runtime.model_route")
     local_deepseek_done = bool(
         model_result
@@ -4602,6 +4827,14 @@ def quality_summary(report: CanaryReport) -> dict[str, Any]:
                 "cap": 8.9,
                 "reason": "frontier readiness has open gates",
                 "evidence": readiness.get("open_gates", []),
+            }
+        )
+    if release_skipped:
+        score_caps.append(
+            {
+                "cap": 8.9,
+                "reason": "release profile has skipped live checks",
+                "evidence": release_skipped,
             }
         )
     if score_caps:
@@ -4991,6 +5224,16 @@ def build_arg_parser() -> argparse.ArgumentParser:
         help="Fail if live HTTP/network canaries are unavailable",
     )
     parser.add_argument(
+        "--release-profile",
+        action="store_true",
+        default=_env_flag("HERMES_CANARY_RELEASE")
+        or os.getenv("HERMES_CANARY_PROFILE", "").strip().lower() == "release",
+        help=(
+            "Run strict release scoring: skipped release-critical live checks fail "
+            "and Telegram proof must be fresh/current-SHA bound"
+        ),
+    )
+    parser.add_argument(
         "--live-behavior",
         action="store_true",
         help="Run live /v1/responses behavior goldens using the API key",
@@ -5126,7 +5369,8 @@ def options_from_args(args: argparse.Namespace) -> CanaryOptions:
         ),
         rfq_dry_run=bool(getattr(args, "rfq_dry_run", False)),
         approved_rfq_draft=bool(getattr(args, "approved_rfq_draft", False)),
-        require_live=bool(args.require_live),
+        require_live=bool(args.require_live) or bool(getattr(args, "release_profile", False)),
+        release_profile=bool(getattr(args, "release_profile", False)),
         timeout=float(args.timeout),
         fail_under=float(args.fail_under),
         output_dir=Path(args.output_dir).expanduser() if args.output_dir else None,
