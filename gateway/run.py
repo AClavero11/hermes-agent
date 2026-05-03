@@ -839,6 +839,43 @@ def _build_hermes_direct_answer(message: str) -> str:
             "4. `hermes` - inspect runtime/logs/canaries and patch failures.\n\n"
             "Reply with one word: `rfq`, `inventory`, `followups`, or `hermes`."
         )
+    if normalized in {"rfq", "quotes", "quote"}:
+        return (
+            "RFQ mode.\n"
+            "Fast paths:\n"
+            "1. `rfq dry-run` - build the next sourced quote package from live V11 stock, customer history, and pricing rules.\n"
+            "2. `rfq stale` - list stale open RFQs/quotes that need action.\n"
+            "3. `rfq <part> <customer> qty <n>` - prepare a draft package for that exact target.\n\n"
+            "Guardrail: draft only. No customer sends, V11 writes, or Atlas writes without explicit approval."
+        )
+    if normalized in {"inventory", "stock", "parts"}:
+        return (
+            "Inventory mode.\n"
+            "Fast paths:\n"
+            "1. `inventory hot` - scan V11 on-hand IDG/CSD stock for quote targets.\n"
+            "2. `inventory <part>` - pull V11 quantity, condition, trace, and recent sales support.\n"
+            "3. `inventory aging` - find parts that need sales action.\n\n"
+            "Guardrail: read-only V11 lookup until AC approves a quote/write action."
+        )
+    if normalized in {"followups", "followup", "followupsdraft", "followupdraft"}:
+        return (
+            "Follow-up mode.\n"
+            "Fast paths:\n"
+            "1. `followups stale` - draft customer follow-ups for stale quotes.\n"
+            "2. `followups customer <name>` - prepare a sourced follow-up draft for that account.\n"
+            "3. `followups today` - build today's approval queue.\n\n"
+            "Guardrail: drafts only. No external message sends without explicit approval."
+        )
+    if normalized == "hermes":
+        return (
+            "Hermes mode.\n"
+            "Fast paths:\n"
+            "1. `hermes status` - show runtime path, model route, health, active tasks, and latest scorecard.\n"
+            "2. `hermes canary` - run the measured readiness harness.\n"
+            "3. `hermes logs` - inspect recent gateway/model/Telegram failures.\n"
+            "4. `hermes fix` - create a bounded repair task from current evidence.\n\n"
+            "Guardrail: no unbounded loops; repairs need evidence and verification."
+        )
     if normalized in {"finishit", "continueit", "doit"}:
         return (
             "Hermes will not run an unbounded `finish it` loop without a target.\n\n"

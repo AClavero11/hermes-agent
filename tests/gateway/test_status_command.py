@@ -351,6 +351,22 @@ def test_build_hermes_direct_answer_for_operator_menu():
     assert "roleplay" not in result.lower()
 
 
+def test_build_hermes_direct_answer_for_operator_menu_choices():
+    import gateway.run as gateway_run
+
+    cases = {
+        "rfq": ["RFQ mode", "No customer sends"],
+        "inventory": ["Inventory mode", "read-only"],
+        "followups": ["Follow-up mode", "drafts only"],
+        "hermes": ["Hermes mode", "runtime path"],
+    }
+    for prompt, expected_terms in cases.items():
+        result = gateway_run._build_hermes_direct_answer(prompt)
+        for term in expected_terms:
+            assert term in result
+        assert "sorry" not in result.lower()
+
+
 def test_build_hermes_direct_answer_for_ack_probe():
     import gateway.run as gateway_run
 
