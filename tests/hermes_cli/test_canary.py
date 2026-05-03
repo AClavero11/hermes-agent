@@ -277,6 +277,9 @@ def test_local_reasoning_cases_use_structured_arithmetic():
     }
     assert all('Return JSON only: {"answer": integer}' in case["input"] for case in arithmetic_cases)
     assert all(case["max_tokens"] == 32 for case in arithmetic_cases)
+    capacity_case = next(case for case in arithmetic_cases if case["name"] == "multi_step_arithmetic_capacity")
+    assert "lost capacity" in capacity_case["input"]
+    assert "subtract lost capacity from total capacity" in capacity_case["input"]
 
 
 def test_quality_score_floor_tracks_completed_increment():

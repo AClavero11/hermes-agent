@@ -997,7 +997,8 @@ def _reasoning_eval_cases(
                 "name": "multi_step_arithmetic_capacity",
                 "input": (
                     'Return JSON only: {"answer": integer}. '
-                    "Compute (3*6*4) - (1*6*0.5)."
+                    "Compute total capacity 3*6*4, compute lost capacity 1*6*0.5, "
+                    "then subtract lost capacity from total capacity."
                 ),
                 "expected_final_number": "69",
                 "forbidden": ["sorry", "cannot", "as an ai"],
@@ -1008,7 +1009,8 @@ def _reasoning_eval_cases(
                 "name": "multi_step_arithmetic_quote_total",
                 "input": (
                     'Return JSON only: {"answer": integer}. '
-                    "Compute (5*1200) - (10% of (5*1200)) + 250."
+                    "Compute subtotal 5*1200, compute discount 10% of subtotal, "
+                    "subtract discount from subtotal, then add 250."
                 ),
                 "expected_final_number": "5650",
                 "forbidden": ["sorry", "cannot", "as an ai"],
@@ -1019,7 +1021,8 @@ def _reasoning_eval_cases(
                 "name": "multi_step_arithmetic_lot_revenue",
                 "input": (
                     'Return JSON only: {"answer": integer}. '
-                    "Compute (3*7500) + (2*8250)."
+                    "Compute first lot revenue 3*7500, compute second lot revenue 2*8250, "
+                    "then add both lot revenue values."
                 ),
                 "expected_final_number": "39000",
                 "forbidden": ["sorry", "cannot", "as an ai"],
