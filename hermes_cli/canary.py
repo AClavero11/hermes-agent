@@ -446,6 +446,17 @@ _RELEASE_REQUIRED_CHECKS = {
 
 
 def _current_repo_sha(repo_root: Path) -> str:
+    runtime_version_path = repo_root / ".hermes-runtime-version.json"
+    try:
+        payload = json.loads(runtime_version_path.read_text(encoding="utf-8"))
+    except (OSError, json.JSONDecodeError):
+        payload = {}
+    if isinstance(payload, dict):
+        for key in ("sha", "short_sha"):
+            value = str(payload.get(key) or "").strip()
+            if value:
+                return value
+
     try:
         proc = subprocess.run(
             ["git", "rev-parse", "HEAD"],

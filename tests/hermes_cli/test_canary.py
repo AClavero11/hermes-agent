@@ -148,6 +148,15 @@ def test_options_from_args_release_profile_requires_live(tmp_path):
     assert options.require_live is True
 
 
+def test_current_repo_sha_reads_deploy_runtime_version(tmp_path):
+    (tmp_path / ".hermes-runtime-version.json").write_text(
+        json.dumps({"sha": "runtime-sha-123"}) + "\n",
+        encoding="utf-8",
+    )
+
+    assert canary_module._current_repo_sha(tmp_path) == "runtime-sha-123"
+
+
 def test_live_behavior_allows_loopback_without_api_key(monkeypatch, tmp_path):
     options = CanaryOptions(
         repo_root=Path(__file__).resolve().parents[2],
