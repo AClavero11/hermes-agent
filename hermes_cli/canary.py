@@ -3,17 +3,21 @@
 from __future__ import annotations
 
 import argparse
+import csv
 import importlib
 import json
 import os
 import shlex
+import socket
 import subprocess
 import tempfile
 import time
 import urllib.error
 import urllib.parse
 import urllib.request
+import xmlrpc.client
 from dataclasses import asdict, dataclass, field
+from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any, Callable
 
@@ -38,6 +42,7 @@ class CanaryOptions:
     frontier_api_key: str = ""
     frontier_base_url: str = "https://api.openai.com/v1"
     telegram_webhook_sim: bool = False
+    rfq_dry_run: bool = False
     require_live: bool = False
     timeout: float = 8.0
     fail_under: float = 80.0
@@ -2283,6 +2288,718 @@ def _canary_quote_ops_runtime(options: CanaryOptions) -> CanaryResult:
     )
 
 
+def _load_canary_env_files() -> dict[str, Any]:
+    """Load operator env files without exposing values in canary reports."""
+    loaded_keys: set[str] = set()
+    present_files: list[str] = []
+    for path in (Path.home() / ".hermes" / ".env", Path.home() / ".secrets" / "alexandria.env"):
+        try:
+            lines = path.read_text(encoding="utf-8").splitlines()
+        except OSError:
+            continue
+        present_files.append(str(path))
+        for raw_line in lines:
+            line = raw_line.strip()
+            if not line or line.startswith("#") or "=" not in line:
+                continue
+            key, _, value = line.partition("=")
+            key = key.strip()
+            value = value.strip().strip("'\"")
+            if not key or not value or key in os.environ:
+                continue
+            os.environ[key] = value
+            loaded_keys.add(key)
+    return {"files": present_files, "loaded_keys": sorted(loaded_keys)}
+
+
+def _env_value(name: str, *aliases: str) -> str:
+    for key in (name, *aliases):
+        value = os.getenv(key, "").strip()
+        if value:
+            return value
+    return ""
+
+
+class _V11ReadOnlyClient:
+    """Narrow XML-RPC client restricted to read-only V11 methods."""
+
+    _ALLOWED_METHODS = {"search", "search_read", "read", "fields_get"}
+
+    def __init__(self) -> None:
+        self.url = os.getenv("ODOO_URL", "https://v11.advanced.aero").rstrip("/")
+        self.db = os.getenv("ODOO_DB", "advancedaero")
+        self.username = os.getenv("ODOO_USER", "ac@advanced.aero")
+        self.password = _env_value("ODOO_PASSWORD", "V11_WEB_PASS")
+        if not self.password:
+            raise RuntimeError("missing V11 credentials: ODOO_PASSWORD or V11_WEB_PASS")
+        self.uid: int | bool = False
+        self._common = xmlrpc.client.ServerProxy(f"{self.url}/xmlrpc/2/common", allow_none=True)
+        self._models = xmlrpc.client.ServerProxy(f"{self.url}/xmlrpc/2/object", allow_none=True)
+
+    def authenticate(self) -> bool:
+        self.uid = self._common.authenticate(self.db, self.username, self.password, {})
+        return bool(self.uid)
+
+    def execute(self, model: str, method: str, *args: Any, **kwargs: Any) -> Any:
+        if method not in self._ALLOWED_METHODS:
+            raise ValueError(f"refusing non-read-only V11 method: {model}.{method}")
+        if not self.uid and not self.authenticate():
+            raise ConnectionError("V11 authentication failed")
+        return self._models.execute_kw(
+            self.db,
+            self.uid,
+            self.password,
+            model,
+            method,
+            list(args),
+            kwargs,
+        )
+
+    def search_read(
+        self,
+        model: str,
+        domain: list[Any],
+        fields: list[str],
+        *,
+        limit: int = 20,
+        order: str | None = None,
+    ) -> list[dict[str, Any]]:
+        kwargs: dict[str, Any] = {"fields": fields, "limit": limit}
+        if order:
+            kwargs["order"] = order
+        result = self.execute(model, "search_read", domain, **kwargs)
+        return result if isinstance(result, list) else []
+
+    def read(self, model: str, ids: list[int], fields: list[str]) -> list[dict[str, Any]]:
+        result = self.execute(model, "read", ids, fields=fields)
+        return result if isinstance(result, list) else []
+
+
+def _float_or_zero(value: Any) -> float:
+    try:
+        return float(value or 0.0)
+    except (TypeError, ValueError):
+        return 0.0
+
+
+def _m2o_id(value: Any) -> int | None:
+    if isinstance(value, list) and value:
+        try:
+            return int(value[0])
+        except (TypeError, ValueError):
+            return None
+    try:
+        return int(value)
+    except (TypeError, ValueError):
+        return None
+
+
+def _m2o_name(value: Any) -> str:
+    if isinstance(value, list) and len(value) > 1:
+        return str(value[1])
+    return str(value or "")
+
+
+def _read_csv_match(path: Path, key: str, value: str) -> dict[str, str] | None:
+    try:
+        with path.open("r", encoding="utf-8-sig", newline="") as handle:
+            for row in csv.DictReader(handle):
+                candidate = str(row.get(key, "")).strip().strip('"')
+                if candidate.lower() == value.lower():
+                    return {str(k): str(v) for k, v in row.items()}
+    except OSError:
+        return None
+    return None
+
+
+def _read_customer_pricing_summary(customer_name: str) -> dict[str, Any]:
+    path = Path.home() / "alexandria" / "advanced" / "pricing" / "data" / "v11_customer_pricing.csv"
+    row = _read_csv_match(path, "customer_name", customer_name)
+    if not row:
+        return {"source": str(path), "found": False}
+    total_revenue = _float_or_zero(row.get("total_revenue"))
+    if total_revenue >= 500_000:
+        tier = "PLATINUM"
+    elif total_revenue >= 250_000:
+        tier = "GOLD"
+    elif total_revenue >= 50_000:
+        tier = "SILVER"
+    else:
+        tier = "BRONZE"
+    return {
+        "source": str(path),
+        "found": True,
+        "customer_name": row.get("customer_name", customer_name),
+        "total_orders": int(_float_or_zero(row.get("total_orders"))),
+        "completed_orders": int(_float_or_zero(row.get("completed_orders"))),
+        "total_revenue": total_revenue,
+        "avg_order_value": _float_or_zero(row.get("avg_order_value")),
+        "pending_quotes": int(_float_or_zero(row.get("pending_quotes"))),
+        "first_order": row.get("first_order", ""),
+        "last_order": row.get("last_order", ""),
+        "tier": tier,
+        "tier_rule_source": "advanced/pricing/CONTEXT.md; advanced/pricing/HARDENED_FACTS.md",
+    }
+
+
+def _read_master_part_pricing(part_number: str) -> dict[str, Any]:
+    path = Path.home() / "alexandria" / "advanced" / "pricing" / "data" / "v11_master_part_pricing.csv"
+    row = _read_csv_match(path, "part_number", part_number)
+    if not row:
+        return {"source": str(path), "found": False}
+    return {
+        "source": str(path),
+        "found": True,
+        "times_sold": int(_float_or_zero(row.get("times_sold"))),
+        "times_quoted": int(_float_or_zero(row.get("times_quoted"))),
+        "total_qty_sold": _float_or_zero(row.get("total_qty_sold")),
+        "total_revenue": _float_or_zero(row.get("total_revenue")),
+        "min_sale_price": _float_or_zero(row.get("min_sale_price")),
+        "max_sale_price": _float_or_zero(row.get("max_sale_price")),
+        "avg_sale_price": _float_or_zero(row.get("avg_sale_price")),
+        "avg_quote_price": _float_or_zero(row.get("avg_quote_price")),
+        "first_activity": row.get("first_activity", ""),
+        "last_activity": row.get("last_activity", ""),
+    }
+
+
+def _read_oem_pricing(part_number: str) -> dict[str, Any]:
+    path = Path.home() / "alexandria" / "advanced" / "pricing" / "oem_master_2026.csv"
+    row = _read_csv_match(path, "PN", part_number)
+    if not row:
+        return {"source": str(path), "found": False}
+    oem_price = _float_or_zero(row.get("MFG PV"))
+    return {
+        "source": str(path),
+        "found": True,
+        "part_number": row.get("PN", part_number),
+        "description": row.get("DESCRIPTION", ""),
+        "oem_price": oem_price,
+        "model": row.get("MODEL?", ""),
+        "sv_price": _float_or_zero(row.get("SV PRICE")),
+        "price_ratio": _float_or_zero(row.get("PRICE RATIO")),
+        "hot_idg_target_range": [round(oem_price * 0.55, 2), round(oem_price * 0.65, 2)]
+        if oem_price
+        else [],
+    }
+
+
+def _pricing_rule_evidence() -> dict[str, Any]:
+    files = [
+        Path.home() / "alexandria" / "advanced" / "pricing" / "START_HERE.md",
+        Path.home() / "alexandria" / "advanced" / "pricing" / "HARDENED_FACTS.md",
+        Path.home() / "alexandria" / "advanced" / "pricing" / "CORRECTION_2026-02-03_turkish_quotes.md",
+    ]
+    loaded: list[str] = []
+    missing: list[str] = []
+    required_evidence = {
+        "customer_history_first": ["customer history", "last paid"],
+        "list_price_not_primary": ["list_price"],
+        "last_sale_anchor": ["last sale price", "last paid", "actual payment history"],
+        "tier_discounts_not_automatic": ["tier discounts", "platinum discount"],
+    }
+    combined = ""
+    for path in files:
+        try:
+            text = path.read_text(encoding="utf-8")
+        except OSError:
+            missing.append(str(path))
+            continue
+        loaded.append(str(path))
+        combined += "\n" + text[:20_000]
+    combined_lower = combined.lower()
+    missing_evidence = [
+        name
+        for name, alternatives in required_evidence.items()
+        if not any(alternative in combined_lower for alternative in alternatives)
+    ]
+    return {
+        "loaded": loaded,
+        "missing": missing,
+        "required_phrases_present": not missing_evidence and len(loaded) >= 2,
+        "missing_phrases": missing_evidence,
+        "rules": [
+            "Check this customer's same-part history first.",
+            "If no same-part history exists, use general part history/OEM as support, not as an automatic send.",
+            "Do not use V11 list_price directly as the quote price.",
+            "Do not auto-apply tier discounts to lower an existing customer's historical price.",
+            "External/customer-facing sends require explicit approval.",
+        ],
+    }
+
+
+def _summarize_sale_lines(lines: list[dict[str, Any]]) -> list[dict[str, Any]]:
+    summarized: list[dict[str, Any]] = []
+    for line in lines:
+        summarized.append(
+            {
+                "line_id": line.get("id"),
+                "order": _m2o_name(line.get("order_id")),
+                "order_id": _m2o_id(line.get("order_id")),
+                "customer": _m2o_name(line.get("order_partner_id")),
+                "product": _m2o_name(line.get("product_id")),
+                "quantity": _float_or_zero(line.get("product_uom_qty")),
+                "unit_price": _float_or_zero(line.get("price_unit")),
+                "create_date": str(line.get("create_date") or ""),
+            }
+        )
+    return summarized
+
+
+def _suggest_rfq_pricing(
+    *,
+    same_customer_history: list[dict[str, Any]],
+    general_part_history: list[dict[str, Any]],
+    master_pricing: dict[str, Any],
+    oem_pricing: dict[str, Any],
+    requested_quantity: float,
+    available_quantity: float,
+) -> dict[str, Any]:
+    red_flags: list[str] = []
+    basis = "manual_review_required"
+    candidate = 0.0
+    same_history = _summarize_sale_lines(same_customer_history)
+    general_history = _summarize_sale_lines(general_part_history)
+
+    if same_history:
+        candidate = same_history[0]["unit_price"]
+        basis = "customer_last_paid"
+    elif general_history:
+        candidate = general_history[0]["unit_price"]
+        basis = "general_last_sale_support"
+        red_flags.append("no_same_customer_part_history")
+    else:
+        avg_sale = _float_or_zero(master_pricing.get("avg_sale_price"))
+        oem_range = oem_pricing.get("hot_idg_target_range") or []
+        candidate = avg_sale or (float(oem_range[0]) if oem_range else 0.0)
+        basis = "master_history_or_oem_support"
+        red_flags.append("no_live_sale_history")
+
+    if available_quantity <= requested_quantity:
+        red_flags.append("low_or_exact_stock")
+    if not same_history:
+        red_flags.append("customer_specific_approval_required")
+
+    avg_sale = _float_or_zero(master_pricing.get("avg_sale_price"))
+    max_sale = _float_or_zero(master_pricing.get("max_sale_price"))
+    if candidate and avg_sale:
+        candidate = max(candidate, avg_sale)
+    if candidate and max_sale and "low_or_exact_stock" in red_flags:
+        candidate = max(candidate, max_sale)
+
+    return {
+        "basis": basis,
+        "candidate_unit_price": round(candidate, 2) if candidate else 0.0,
+        "currency": "USD",
+        "manual_review_required": bool(red_flags),
+        "red_flags": red_flags,
+        "support": {
+            "same_customer_history": same_history[:5],
+            "general_part_history": general_history[:8],
+            "master_avg_sale_price": _float_or_zero(master_pricing.get("avg_sale_price")),
+            "master_max_sale_price": _float_or_zero(master_pricing.get("max_sale_price")),
+            "oem_hot_idg_target_range": oem_pricing.get("hot_idg_target_range", []),
+        },
+    }
+
+
+def _build_live_rfq_dry_run_package(options: CanaryOptions) -> dict[str, Any]:
+    env_info = _load_canary_env_files()
+    old_timeout = socket.getdefaulttimeout()
+    socket.setdefaulttimeout(max(1.0, min(options.timeout, 30.0)))
+    try:
+        client = _V11ReadOnlyClient()
+        authenticated = client.authenticate()
+        if not authenticated:
+            raise ConnectionError("V11 authentication failed")
+
+        part_number = "762367B"
+        customer_query = "TURKISH TECHNIC"
+        requested_quantity = 1.0
+
+        products = client.search_read(
+            "product.product",
+            [["name", "=", part_number]],
+            ["id", "name", "display_name", "qty_available", "product_tmpl_id", "lst_price"],
+            limit=5,
+        )
+        if not products:
+            products = client.search_read(
+                "product.product",
+                [["name", "ilike", part_number]],
+                ["id", "name", "display_name", "qty_available", "product_tmpl_id", "lst_price"],
+                limit=5,
+            )
+        product = products[0] if products else {}
+        product_id = int(product.get("id") or 0)
+        template_id = _m2o_id(product.get("product_tmpl_id")) or product_id
+        template = (
+            client.read(
+                "product.template",
+                [template_id],
+                ["name", "description_sale", "description", "list_price"],
+            )[0]
+            if template_id
+            else {}
+        )
+
+        internal_quants = (
+            client.search_read(
+                "stock.quant",
+                [
+                    ["product_id", "=", product_id],
+                    ["quantity", ">", 0],
+                    ["location_id.usage", "=", "internal"],
+                ],
+                ["id", "product_id", "lot_id", "quantity", "reserved_quantity", "location_id"],
+                limit=20,
+            )
+            if product_id
+            else []
+        )
+        available_quantity = sum(
+            max(0.0, _float_or_zero(row.get("quantity")) - _float_or_zero(row.get("reserved_quantity")))
+            for row in internal_quants
+        )
+
+        partners = client.search_read(
+            "res.partner",
+            [["name", "ilike", customer_query], ["customer", "=", True]],
+            ["id", "name", "customer"],
+            limit=5,
+        )
+        partner = partners[0] if partners else {}
+        partner_id = int(partner.get("id") or 0)
+        partner_name = str(partner.get("name") or customer_query)
+
+        same_customer_history = (
+            client.search_read(
+                "sale.order.line",
+                [
+                    ["product_id.name", "=", part_number],
+                    ["order_id.partner_id", "=", partner_id],
+                    ["order_id.state", "in", ["sale", "done"]],
+                    ["price_unit", ">", 0],
+                ],
+                ["id", "price_unit", "product_uom_qty", "order_id", "order_partner_id", "product_id", "create_date"],
+                limit=8,
+                order="create_date desc",
+            )
+            if partner_id
+            else []
+        )
+        customer_recent_history = (
+            client.search_read(
+                "sale.order.line",
+                [
+                    ["order_id.partner_id", "=", partner_id],
+                    ["order_id.state", "in", ["sale", "done"]],
+                    ["price_unit", ">", 0],
+                ],
+                ["id", "price_unit", "product_uom_qty", "order_id", "order_partner_id", "product_id", "create_date"],
+                limit=8,
+                order="create_date desc",
+            )
+            if partner_id
+            else []
+        )
+        general_part_history = client.search_read(
+            "sale.order.line",
+            [
+                ["product_id.name", "=", part_number],
+                ["order_id.state", "in", ["sale", "done"]],
+                ["price_unit", ">", 0],
+            ],
+            ["id", "price_unit", "product_uom_qty", "order_id", "order_partner_id", "product_id", "create_date"],
+            limit=10,
+            order="create_date desc",
+        )
+    finally:
+        socket.setdefaulttimeout(old_timeout)
+
+    customer_summary = _read_customer_pricing_summary(partner_name)
+    master_pricing = _read_master_part_pricing(part_number)
+    oem_pricing = _read_oem_pricing(part_number)
+    pricing_rules = _pricing_rule_evidence()
+    suggested_pricing = _suggest_rfq_pricing(
+        same_customer_history=same_customer_history,
+        general_part_history=general_part_history,
+        master_pricing=master_pricing,
+        oem_pricing=oem_pricing,
+        requested_quantity=requested_quantity,
+        available_quantity=available_quantity,
+    )
+
+    return {
+        "schema_version": 1,
+        "created_at": datetime.now(timezone.utc).replace(microsecond=0).isoformat(),
+        "scenario": {
+            "source": "hermes_canary_live_rfq_dry_run",
+            "rfq_id": "CANARY-RFQ-762367B-TURKISH",
+            "customer_query": customer_query,
+            "customer_name": partner_name,
+            "part_number": part_number,
+            "quantity": requested_quantity,
+            "draft_only": True,
+        },
+        "v11": {
+            "authenticated": True,
+            "url": os.getenv("ODOO_URL", "https://v11.advanced.aero"),
+            "database": os.getenv("ODOO_DB", "advancedaero"),
+            "read_only_methods": ["authenticate", "search_read", "read"],
+            "write_methods_called": [],
+            "product": {
+                "id": product_id,
+                "name": product.get("name", ""),
+                "display_name": product.get("display_name", ""),
+                "qty_available": _float_or_zero(product.get("qty_available")),
+                "template_id": template_id,
+                "description": template.get("description_sale") or template.get("description") or "",
+                "list_price_observed_not_used_as_quote": _float_or_zero(product.get("lst_price")),
+            },
+            "stock": {
+                "available_internal_quantity": available_quantity,
+                "quants": [
+                    {
+                        "quant_id": row.get("id"),
+                        "lot": _m2o_name(row.get("lot_id")),
+                        "quantity": _float_or_zero(row.get("quantity")),
+                        "reserved_quantity": _float_or_zero(row.get("reserved_quantity")),
+                        "location": _m2o_name(row.get("location_id")),
+                    }
+                    for row in internal_quants
+                ],
+            },
+            "customer": {
+                "id": partner_id,
+                "name": partner_name,
+            },
+            "history": {
+                "same_customer_same_part": _summarize_sale_lines(same_customer_history),
+                "customer_recent_sales": _summarize_sale_lines(customer_recent_history),
+                "general_same_part_sales": _summarize_sale_lines(general_part_history),
+            },
+        },
+        "pricing": {
+            "rules": pricing_rules,
+            "customer_summary": customer_summary,
+            "master_part_pricing": master_pricing,
+            "oem_pricing": oem_pricing,
+            "suggestion": suggested_pricing,
+            "decision": "draft_package_only",
+        },
+        "guardrails": {
+            "external_send": False,
+            "customer_facing_send": False,
+            "v11_create_or_write": False,
+            "approval_required_before_send": True,
+            "manual_review_required": bool(suggested_pricing.get("manual_review_required")),
+            "blocked_actions": [
+                "send_customer_email",
+                "send_customer_telegram",
+                "create_v11_sale_order",
+                "confirm_v11_sale_order",
+                "change_pricing_config",
+            ],
+        },
+        "sources": [
+            "live V11 XML-RPC read-only product.product/search_read",
+            "live V11 XML-RPC read-only stock.quant/search_read",
+            "live V11 XML-RPC read-only sale.order.line/search_read",
+            "live V11 XML-RPC read-only res.partner/search_read",
+            "alexandria/advanced/pricing/START_HERE.md",
+            "alexandria/advanced/pricing/HARDENED_FACTS.md",
+            "alexandria/advanced/pricing/data/v11_customer_pricing.csv",
+            "alexandria/advanced/pricing/data/v11_master_part_pricing.csv",
+            "alexandria/advanced/pricing/oem_master_2026.csv",
+        ],
+        "env": {
+            "loaded_files": env_info["files"],
+            "loaded_key_count": len(env_info["loaded_keys"]),
+        },
+    }
+
+
+def _rfq_package_slug(package: dict[str, Any]) -> str:
+    scenario = package.get("scenario", {})
+    customer = str(scenario.get("customer_name") or scenario.get("customer_query") or "customer")
+    part_number = str(scenario.get("part_number") or "part")
+    raw = f"{customer}-{part_number}".lower()
+    return "".join(ch if ch.isalnum() else "-" for ch in raw).strip("-")[:80] or "rfq-dry-run"
+
+
+def _render_rfq_package_markdown(package: dict[str, Any]) -> str:
+    scenario = package.get("scenario", {})
+    v11 = package.get("v11", {})
+    pricing = package.get("pricing", {})
+    guardrails = package.get("guardrails", {})
+    product = v11.get("product", {})
+    stock = v11.get("stock", {})
+    suggestion = (pricing.get("suggestion") or {})
+    sources = package.get("sources", [])
+    lines = [
+        "# Hermes RFQ Dry-Run Quote Package",
+        "",
+        f"- Customer: {scenario.get('customer_name', '')}",
+        f"- Part: {scenario.get('part_number', '')}",
+        f"- Quantity: {scenario.get('quantity', '')}",
+        f"- Description: {product.get('description', '')}",
+        f"- Internal available quantity: {stock.get('available_internal_quantity', 0)}",
+        f"- Candidate unit price: ${_float_or_zero(suggestion.get('candidate_unit_price')):,.2f}",
+        f"- Pricing basis: {suggestion.get('basis', '')}",
+        f"- Manual review required: {bool(suggestion.get('manual_review_required'))}",
+        "",
+        "## Guardrails",
+        "",
+        f"- Draft only: {bool(scenario.get('draft_only'))}",
+        f"- External send: {bool(guardrails.get('external_send'))}",
+        f"- V11 create/write: {bool(guardrails.get('v11_create_or_write'))}",
+        f"- Approval required before send: {bool(guardrails.get('approval_required_before_send'))}",
+        "",
+        "## Red Flags",
+        "",
+    ]
+    red_flags = suggestion.get("red_flags") or []
+    if red_flags:
+        lines.extend(f"- {flag}" for flag in red_flags)
+    else:
+        lines.append("- none")
+    lines.extend(["", "## Sources", ""])
+    lines.extend(f"- {source}" for source in sources)
+    lines.append("")
+    return "\n".join(lines)
+
+
+def _write_rfq_package_artifacts(options: CanaryOptions, package: dict[str, Any]) -> dict[str, str]:
+    output_dir = options.hermes_home / "canary" / "rfq_dry_runs"
+    output_dir.mkdir(parents=True, exist_ok=True)
+    timestamp = datetime.now(timezone.utc).strftime("%Y%m%d-%H%M%S")
+    slug = _rfq_package_slug(package)
+    json_path = output_dir / f"{timestamp}-{slug}.json"
+    markdown_path = output_dir / f"{timestamp}-{slug}.md"
+    json_path.write_text(json.dumps(package, indent=2, sort_keys=True), encoding="utf-8")
+    markdown_path.write_text(_render_rfq_package_markdown(package), encoding="utf-8")
+    latest_json = output_dir / "latest.json"
+    latest_markdown = output_dir / "latest.md"
+    latest_json.write_text(json.dumps(package, indent=2, sort_keys=True), encoding="utf-8")
+    latest_markdown.write_text(_render_rfq_package_markdown(package), encoding="utf-8")
+    return {
+        "json_path": str(json_path),
+        "markdown_path": str(markdown_path),
+        "latest_json": str(latest_json),
+        "latest_markdown": str(latest_markdown),
+    }
+
+
+def _attach_rfq_package_to_workspace(options: CanaryOptions, package: dict[str, Any], artifacts: dict[str, str]) -> dict[str, str]:
+    from hermes_cli.workspace import WorkspaceStore
+
+    scenario = package.get("scenario", {})
+    store = WorkspaceStore(options.hermes_home / "workspace" / "control_plane.json")
+    task = store.create_task(
+        f"RFQ dry-run canary: {scenario.get('customer_name', '')} {scenario.get('part_number', '')}",
+        owner="hermes",
+        priority="normal",
+        project="hermes-canary",
+        source="canary",
+        status="in_progress",
+        note="Draft-only RFQ package generated from V11 stock, sales history, customer summary, and pricing rules.",
+    )
+    store.add_evidence(
+        task_id=task["id"],
+        kind="rfq_dry_run",
+        title="Sourced draft-only quote package",
+        locator=artifacts["json_path"],
+        summary=f"Package JSON: {artifacts['json_path']}; Markdown: {artifacts['markdown_path']}",
+        metadata={"markdown_path": artifacts["markdown_path"]},
+    )
+    store.update_task(
+        task["id"],
+        status="done",
+        next_action="Manual operator review required before any V11 draft creation or customer-facing send.",
+    )
+    return {"task_id": task["id"], "store_path": str(store.path)}
+
+
+def _canary_rfq_dry_run_quote_package(options: CanaryOptions) -> CanaryResult:
+    if not options.rfq_dry_run:
+        return _result(
+            "live.rfq_dry_run_quote_package",
+            SKIP,
+            0,
+            25,
+            "RFQ dry-run canary not enabled; pass --rfq-dry-run for live V11 quote-package proof",
+            {"enabled": False},
+        )
+
+    try:
+        package = _build_live_rfq_dry_run_package(options)
+    except Exception as exc:
+        return _result(
+            "live.rfq_dry_run_quote_package",
+            FAIL if options.require_live else WARN,
+            0,
+            25,
+            f"RFQ dry-run package failed: {type(exc).__name__}: {exc}",
+            {
+                "enabled": True,
+                "failure_class": "v11_live_read_failure",
+                "error_type": type(exc).__name__,
+            },
+        )
+
+    artifacts = _write_rfq_package_artifacts(options, package)
+    workspace = _attach_rfq_package_to_workspace(options, package, artifacts)
+    package["workspace"] = workspace
+    artifacts = _write_rfq_package_artifacts(options, package)
+
+    v11 = package.get("v11", {})
+    pricing = package.get("pricing", {})
+    guardrails = package.get("guardrails", {})
+    checks = {
+        "v11_authenticated": bool(v11.get("authenticated")),
+        "product_found": bool((v11.get("product") or {}).get("id")),
+        "stock_checked": "available_internal_quantity" in (v11.get("stock") or {}),
+        "customer_found": bool((v11.get("customer") or {}).get("id")),
+        "history_checked": bool(
+            ((v11.get("history") or {}).get("same_customer_same_part") or [])
+            or ((v11.get("history") or {}).get("general_same_part_sales") or [])
+        ),
+        "pricing_rules_loaded": bool((pricing.get("rules") or {}).get("required_phrases_present")),
+        "customer_summary_loaded": bool((pricing.get("customer_summary") or {}).get("found")),
+        "master_pricing_loaded": bool((pricing.get("master_part_pricing") or {}).get("found")),
+        "oem_pricing_loaded": bool((pricing.get("oem_pricing") or {}).get("found")),
+        "draft_only_guard": bool((package.get("scenario") or {}).get("draft_only")),
+        "external_send_blocked": guardrails.get("external_send") is False
+        and guardrails.get("customer_facing_send") is False,
+        "v11_write_blocked": guardrails.get("v11_create_or_write") is False
+        and not (v11.get("write_methods_called") or []),
+        "workspace_task_created": bool(workspace.get("task_id")),
+        "artifacts_written": Path(artifacts["json_path"]).is_file() and Path(artifacts["markdown_path"]).is_file(),
+    }
+    failed = {name: value for name, value in checks.items() if not value}
+    score = round(25.0 * (len(checks) - len(failed)) / len(checks), 1)
+    status = PASS if not failed else WARN
+    return _result(
+        "live.rfq_dry_run_quote_package",
+        status,
+        score,
+        25,
+        f"{len(checks) - len(failed)}/{len(checks)} live RFQ dry-run quote-package checks passed",
+        {
+            "enabled": True,
+            "checks": checks,
+            "failed": failed,
+            "artifact": artifacts,
+            "workspace": workspace,
+            "scenario": package.get("scenario", {}),
+            "pricing_basis": (pricing.get("suggestion") or {}).get("basis", ""),
+            "manual_review_required": bool((pricing.get("suggestion") or {}).get("manual_review_required")),
+            "failure_class": "missing_evidence" if failed else "",
+        },
+    )
+
+
 def _canary_planner_self_heal(options: CanaryOptions) -> CanaryResult:
     run_path = options.repo_root / "gateway" / "run.py"
     config_path = options.hermes_home / "config.yaml"
@@ -2436,6 +3153,7 @@ def run_canary_suite(options: CanaryOptions) -> CanaryReport:
         ("contract.scorecard_trend", 10, lambda: _canary_scorecard_trend(options)),
         ("contract.aac_workflows", 15, lambda: _canary_aac_workflow_goldens(options)),
         ("contract.quote_ops_runtime", 20, lambda: _canary_quote_ops_runtime(options)),
+        ("live.rfq_dry_run_quote_package", 25, lambda: _canary_rfq_dry_run_quote_package(options)),
         ("contract.planner_self_heal", 20, lambda: _canary_planner_self_heal(options)),
     ]
     results = [_time_case(name, max_score, fn) for name, max_score, fn in cases]
@@ -2545,9 +3263,18 @@ def _quality_dimensions(report: CanaryReport) -> list[QualityDimension]:
         aac_workflows_summary = "AAC workflow canaries exist but one or more checks need hardening."
 
     quote_ops_result = _result_by_name(report, "contract.quote_ops_runtime")
+    rfq_dry_run_result = _result_by_name(report, "live.rfq_dry_run_quote_package")
     business_ops_score = 5.0
     business_ops_summary = "Quote automation runtime is not yet verified."
-    if quote_ops_result and quote_ops_result.status == PASS:
+    if (
+        quote_ops_result
+        and quote_ops_result.status == PASS
+        and rfq_dry_run_result
+        and rfq_dry_run_result.status == PASS
+    ):
+        business_ops_score = 9.5
+        business_ops_summary = "Quote runtime plus live draft-only RFQ package generation pass from V11, customer history, and pricing rules."
+    elif quote_ops_result and quote_ops_result.status == PASS:
         business_ops_score = 8.8
         business_ops_summary = "ILS RFQ, V11 draft quote, Telegram approval, and QAMFORM PDF runtime checks pass."
     elif quote_ops_result and quote_ops_result.status == WARN:
@@ -2668,7 +3395,12 @@ def quality_summary(report: CanaryReport) -> dict[str, Any]:
         {
             "target": "9.5/10",
             "increment": "Live RFQ dry-run creates a sourced quote package from V11 stock, customer history, and pricing rules",
-            "status": "open",
+            "status": "done" if (
+                _result_by_name(report, "contract.quote_ops_runtime")
+                and _result_by_name(report, "contract.quote_ops_runtime").status == PASS
+                and _result_by_name(report, "live.rfq_dry_run_quote_package")
+                and _result_by_name(report, "live.rfq_dry_run_quote_package").status == PASS
+            ) else "open",
         },
         {
             "target": "9.7/10",
@@ -3084,6 +3816,12 @@ def build_arg_parser() -> argparse.ArgumentParser:
         help="Run a signed local Telegram webhook simulation and require matching E2E evidence",
     )
     parser.add_argument(
+        "--rfq-dry-run",
+        action="store_true",
+        default=os.getenv("HERMES_CANARY_RFQ_DRY_RUN", "").strip().lower() in {"1", "true", "yes", "on"},
+        help="Run a live read-only V11 RFQ quote-package dry run; no V11 writes or customer sends",
+    )
+    parser.add_argument(
         "--api-key",
         default=os.getenv("HERMES_CANARY_API_KEY", ""),
         help="API key for live /v1/responses canaries; defaults to HERMES_CANARY_API_KEY",
@@ -3128,6 +3866,7 @@ def options_from_args(args: argparse.Namespace) -> CanaryOptions:
         frontier_api_key=str(getattr(args, "frontier_api_key", "") or ""),
         frontier_base_url=str(getattr(args, "frontier_base_url", "") or "https://api.openai.com/v1"),
         telegram_webhook_sim=bool(getattr(args, "telegram_webhook_sim", False)),
+        rfq_dry_run=bool(getattr(args, "rfq_dry_run", False)),
         require_live=bool(args.require_live),
         timeout=float(args.timeout),
         fail_under=float(args.fail_under),

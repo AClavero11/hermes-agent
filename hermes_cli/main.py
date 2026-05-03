@@ -6068,7 +6068,7 @@ def _cmd_update_impl(args, gateway_mode: bool):
                                     print(
                                         f"  ⚠ {svc_name} died after restart, retrying..."
                                     )
-                                    retry = subprocess.run(
+                                    _retry = subprocess.run(
                                         scope_cmd + ["restart", svc_name],
                                         capture_output=True,
                                         text=True,
@@ -7181,6 +7181,12 @@ For more help on a command:
         action="store_true",
         default=os.getenv("HERMES_CANARY_TELEGRAM_WEBHOOK_SIM", "").strip().lower() in {"1", "true", "yes", "on"},
         help="Run a signed local Telegram webhook simulation and require matching E2E evidence",
+    )
+    canary_parser.add_argument(
+        "--rfq-dry-run",
+        action="store_true",
+        default=os.getenv("HERMES_CANARY_RFQ_DRY_RUN", "").strip().lower() in {"1", "true", "yes", "on"},
+        help="Run a live read-only V11 RFQ quote-package dry run; no V11 writes or customer sends",
     )
     canary_parser.add_argument(
         "--api-key",

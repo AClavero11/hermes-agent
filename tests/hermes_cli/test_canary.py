@@ -60,6 +60,10 @@ def test_canary_suite_runs_without_live_gateway(tmp_path):
         result.name == "eval.frontier_wrapper" and result.status == SKIP
         for result in report.results
     )
+    assert any(
+        result.name == "live.rfq_dry_run_quote_package" and result.status == SKIP
+        for result in report.results
+    )
     assert report.effective_max_score > 0
 
 
@@ -275,6 +279,33 @@ def test_quality_score_9_requires_telegram_e2e():
         "telegram_e2e",
     }
     assert readiness["diagnostics"][0]["name"] == "raw_local_model_reasoning"
+
+
+def test_quality_score_9_5_requires_live_rfq_dry_run():
+    now = 1_700_000_000.0
+    report = CanaryReport(
+        started_at=now,
+        finished_at=now + 1,
+        fail_under=80.0,
+        results=[
+            CanaryResult("contract.quote_ops_runtime", PASS, 20, 20, "quote ops runtime passed"),
+            CanaryResult(
+                "live.rfq_dry_run_quote_package",
+                PASS,
+                25,
+                25,
+                "live RFQ dry-run package passed",
+            ),
+        ],
+    )
+
+    summary = quality_summary(report)
+
+    increment = next(item for item in summary["increments"] if item["target"] == "9.5/10")
+    assert increment["status"] == "done"
+    assert summary["score"] >= 9.5
+    business_ops = next(item for item in summary["dimensions"] if item["name"] == "business_ops")
+    assert business_ops["score"] == 9.5
 
 
 def test_frontier_wrapper_falls_back_to_gemini(monkeypatch, tmp_path):
