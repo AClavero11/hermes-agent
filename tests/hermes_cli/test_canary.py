@@ -53,6 +53,10 @@ def test_canary_suite_runs_without_live_gateway(tmp_path):
         for result in report.results
     )
     assert any(
+        result.name == "live.telegram_operator_response" and result.status == SKIP
+        for result in report.results
+    )
+    assert any(
         result.name == "eval.local_model_reasoning" and result.status == SKIP
         for result in report.results
     )
@@ -304,6 +308,13 @@ def _quality_foundation_results() -> list[CanaryResult]:
         CanaryResult("eval.hermes_reasoning", PASS, 30, 30, "full Hermes reasoning passed"),
         CanaryResult("eval.frontier_wrapper", PASS, 20, 20, "frontier wrapper passed"),
         CanaryResult("live.telegram_e2e", PASS, 20, 20, "Telegram E2E passed"),
+        CanaryResult(
+            "live.telegram_operator_response",
+            PASS,
+            20,
+            20,
+            "Telegram operator response passed",
+        ),
         CanaryResult("live.telegram_visible_delivery", PASS, 20, 20, "Visible Telegram delivery passed"),
     ]
 
@@ -402,6 +413,7 @@ def test_quality_score_9_requires_telegram_e2e():
         "hermes_reasoning_eval",
         "frontier_wrapper",
         "telegram_e2e",
+        "telegram_operator_response",
     }
     assert readiness["diagnostics"][0]["name"] == "raw_local_model_reasoning"
 
@@ -536,6 +548,104 @@ def test_quality_score_caps_without_visible_telegram_delivery():
     assert summary["score"] <= 8.9
     assert summary["caps"][0]["reason"] == "human-visible Telegram delivery is not currently proven"
     assert next(item for item in summary["increments"] if item["target"] == "9.0/10")["status"] == "open"
+
+
+def test_quality_score_caps_without_telegram_operator_response():
+    now = 1_700_000_000.0
+    report = CanaryReport(
+        started_at=now,
+        finished_at=now + 1,
+        fail_under=80.0,
+        results=[
+            *[
+                result
+                for result in _quality_foundation_results()
+                if result.name != "live.telegram_operator_response"
+            ],
+            CanaryResult("contract.quote_ops_runtime", PASS, 20, 20, "quote ops runtime passed"),
+            CanaryResult(
+                "live.rfq_dry_run_quote_package",
+                PASS,
+                25,
+                25,
+                "live RFQ dry-run package passed",
+            ),
+            CanaryResult(
+                "live.approved_rfq_draft_quote",
+                PASS,
+                30,
+                30,
+                "approved RFQ draft package passed",
+            ),
+        ],
+    )
+
+    summary = quality_summary(report)
+
+    assert summary["score"] <= 8.9
+    assert {
+        cap["reason"]
+        for cap in summary["caps"]
+    } >= {"Telegram operator prompt response is not currently proven"}
+    assert next(item for item in summary["increments"] if item["target"] == "9.0/10")["status"] == "open"
+
+
+def test_telegram_operator_response_probe_accepts_expected_menu(monkeypatch, tmp_path):
+    options = CanaryOptions(
+        repo_root=Path(__file__).resolve().parents[2],
+        hermes_home=tmp_path,
+        gateway_url="",
+        env_wrapper=None,
+        telegram_operator_probe=True,
+        require_live=True,
+        timeout=0.2,
+    )
+
+    monkeypatch.setattr(
+        canary_module,
+        "_run_telegram_operator_response_probe",
+        lambda options: {
+            "ok": True,
+            "evidence": {
+                "status": "pass",
+                "mode": "signed_operator_response_probe",
+                "latency_ms": 500,
+                "latency_budget_ms": 10_000,
+                "content_match": True,
+                "telegram_send_ok": True,
+                "nonce": "op-test",
+            },
+        },
+    )
+
+    result = canary_module._canary_telegram_operator_response(options)
+
+    assert result.status == PASS
+    assert result.details["checks"]["content_match"] is True
+    assert "500ms" in result.summary
+
+
+def test_telegram_operator_response_probe_flags_timeout(monkeypatch, tmp_path):
+    options = CanaryOptions(
+        repo_root=Path(__file__).resolve().parents[2],
+        hermes_home=tmp_path,
+        gateway_url="",
+        env_wrapper=None,
+        telegram_operator_probe=True,
+        require_live=False,
+        timeout=0.2,
+    )
+
+    monkeypatch.setattr(
+        canary_module,
+        "_run_telegram_operator_response_probe",
+        lambda options: {"ok": False, "error": "missing"},
+    )
+
+    result = canary_module._canary_telegram_operator_response(options)
+
+    assert result.status == WARN
+    assert result.details["failure_class"] == "telegram_operator_response_missing"
 
 
 def test_frontier_wrapper_falls_back_to_gemini(monkeypatch, tmp_path):

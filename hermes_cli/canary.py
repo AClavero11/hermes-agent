@@ -46,6 +46,8 @@ class CanaryOptions:
     telegram_webhook_sim: bool = False
     telegram_visible_probe: bool = False
     telegram_visible_wait: float = 15.0
+    telegram_operator_probe: bool = False
+    telegram_operator_wait: float = 15.0
     rfq_dry_run: bool = False
     approved_rfq_draft: bool = False
     require_live: bool = False
@@ -2315,6 +2317,225 @@ def _run_telegram_visible_probe(options: CanaryOptions) -> dict[str, Any]:
     return details
 
 
+def _telegram_operator_response_paths(options: CanaryOptions) -> tuple[Path, Path]:
+    canary_dir = options.hermes_home / "canary"
+    pending_path = Path(
+        os.getenv(
+            "HERMES_TELEGRAM_OPERATOR_PENDING_PATH",
+            str(canary_dir / "telegram_operator_response_pending.json"),
+        )
+    ).expanduser()
+    evidence_path = Path(
+        os.getenv(
+            "HERMES_TELEGRAM_OPERATOR_EVIDENCE_PATH",
+            str(canary_dir / "telegram_operator_response_last.json"),
+        )
+    ).expanduser()
+    return pending_path, evidence_path
+
+
+def _run_telegram_operator_response_probe(options: CanaryOptions) -> dict[str, Any]:
+    secret_path = options.hermes_home / "private" / "telegram-webhook-secret"
+    pending_path, evidence_path = _telegram_operator_response_paths(options)
+    local_url = os.getenv(
+        "HERMES_CANARY_TELEGRAM_WEBHOOK_URL",
+        f"http://127.0.0.1:{os.getenv('TELEGRAM_WEBHOOK_PORT', '8443')}/telegram",
+    )
+    chat_id = _telegram_e2e_channel_id(options)
+    prompt = os.getenv(
+        "HERMES_CANARY_TELEGRAM_OPERATOR_PROMPT",
+        "what can we do",
+    ).strip()
+    expected_substrings = [
+        "Immediate AAC moves",
+        "`rfq`",
+        "`inventory`",
+        "`followups`",
+        "`hermes`",
+    ]
+    started = time.time()
+    details: dict[str, Any] = {
+        "mode": "signed_operator_response_probe",
+        "url": local_url,
+        "secret_path": str(secret_path),
+        "pending_path": str(pending_path),
+        "evidence_path": str(evidence_path),
+        "chat_id_present": bool(chat_id),
+        "prompt": prompt,
+        "expected_substrings": expected_substrings,
+    }
+    if not chat_id:
+        details.update({"ok": False, "error": "No Telegram channel id found"})
+        return details
+    if not prompt:
+        details.update({"ok": False, "error": "Operator prompt is empty"})
+        return details
+    try:
+        secret = secret_path.read_text(encoding="utf-8").strip()
+    except OSError as exc:
+        details.update({"ok": False, "error": f"webhook secret unavailable: {exc}"})
+        return details
+    if not secret:
+        details.update({"ok": False, "error": "webhook secret is empty"})
+        return details
+
+    try:
+        chat_id_int = int(chat_id)
+    except ValueError:
+        details.update({"ok": False, "error": "Telegram channel id is not an integer"})
+        return details
+
+    nonce = f"op-{int(started * 1000)}"
+    update_id = int(started * 1000) % 2_000_000_000
+    inbound_message_id = update_id % 1_000_000
+    pending = {
+        "status": "pending",
+        "mode": "signed_operator_response_probe",
+        "chat_id": str(chat_id),
+        "sent_at": started,
+        "latency_budget_ms": 10_000,
+        "nonce": nonce,
+        "prompt": prompt,
+        "expected_substrings": expected_substrings,
+        "inbound_message_id": inbound_message_id,
+    }
+    pending_path.parent.mkdir(parents=True, exist_ok=True)
+    pending_path.write_text(
+        json.dumps(pending, indent=2, sort_keys=True) + "\n",
+        encoding="utf-8",
+    )
+    try:
+        evidence_path.unlink()
+    except FileNotFoundError:
+        pass
+    except OSError:
+        pass
+
+    update = {
+        "update_id": update_id,
+        "message": {
+            "message_id": inbound_message_id,
+            "from": {
+                "id": chat_id_int,
+                "is_bot": False,
+                "first_name": "Hermes",
+                "username": "hermes_operator_probe",
+            },
+            "chat": {
+                "id": chat_id_int,
+                "type": "private",
+                "first_name": "Hermes",
+            },
+            "date": int(started),
+            "text": prompt,
+        },
+    }
+    try:
+        status, raw = _post_telegram_webhook_update(
+            url=local_url,
+            secret=secret,
+            update=update,
+            timeout=max(options.timeout, 10.0),
+        )
+    except Exception as exc:
+        details.update(
+            {
+                "ok": False,
+                "nonce": nonce,
+                "error": f"{type(exc).__name__}: {exc}",
+                "duration_ms": round((time.time() - started) * 1000.0, 1),
+            }
+        )
+        return details
+
+    wait_seconds = max(1.0, min(float(options.telegram_operator_wait), 60.0))
+    deadline = time.time() + wait_seconds
+    evidence: dict[str, Any] = {}
+    while time.time() < deadline:
+        try:
+            evidence_payload = json.loads(evidence_path.read_text(encoding="utf-8"))
+        except (OSError, json.JSONDecodeError):
+            time.sleep(0.2)
+            continue
+        if isinstance(evidence_payload, dict) and evidence_payload.get("nonce") == nonce:
+            evidence = evidence_payload
+            break
+        time.sleep(0.2)
+
+    details.update(
+        {
+            "ok": bool(evidence),
+            "nonce": nonce,
+            "status": status,
+            "raw_preview": raw[:200],
+            "duration_ms": round((time.time() - started) * 1000.0, 1),
+            "evidence_observed": bool(evidence),
+            "evidence": evidence,
+            "wait_seconds": wait_seconds,
+        }
+    )
+    if not evidence:
+        details["error"] = (
+            "Webhook POST returned but no matching operator response "
+            "evidence was written"
+        )
+    return details
+
+
+def _canary_telegram_operator_response(options: CanaryOptions) -> CanaryResult:
+    if not options.telegram_operator_probe:
+        return _result(
+            "live.telegram_operator_response",
+            SKIP,
+            0,
+            20,
+            "Telegram operator response probe not enabled; pass "
+            "--telegram-operator-probe to require a real bot response",
+            {"enabled": False},
+        )
+
+    probe = _run_telegram_operator_response_probe(options)
+    evidence = probe.get("evidence") if isinstance(probe.get("evidence"), dict) else {}
+    latency_ms = float(evidence.get("latency_ms") or 0)
+    latency_budget_ms = float(evidence.get("latency_budget_ms") or 10_000)
+    content_match = bool(evidence.get("content_match"))
+    checks = {
+        "evidence_observed": bool(evidence),
+        "content_match": content_match,
+        "latency_budget": latency_ms > 0 and latency_ms <= latency_budget_ms,
+        "telegram_send_ok": bool(evidence.get("telegram_send_ok")),
+    }
+    failed = [name for name, ok in checks.items() if not ok]
+    if not failed:
+        return _result(
+            "live.telegram_operator_response",
+            PASS,
+            20,
+            20,
+            f"Telegram operator prompt returned expected menu in {latency_ms:.0f}ms",
+            {"enabled": True, "probe": probe, "checks": checks, "failure_class": ""},
+        )
+
+    send_ok = bool(evidence.get("telegram_send_ok"))
+    status = FAIL if options.require_live and not send_ok else WARN
+    return _result(
+        "live.telegram_operator_response",
+        status,
+        0,
+        20,
+        "Telegram operator prompt did not produce the expected menu within budget",
+        {
+            "enabled": True,
+            "probe": probe,
+            "checks": checks,
+            "failed": failed,
+            "failure_class": "telegram_operator_bad_response"
+            if evidence
+            else "telegram_operator_response_missing",
+        },
+    )
+
+
 def _canary_telegram_visible_delivery(options: CanaryOptions) -> CanaryResult:
     if not options.telegram_visible_probe:
         return _result(
@@ -4008,6 +4229,11 @@ def run_canary_suite(options: CanaryOptions) -> CanaryReport:
         ("eval.hermes_reasoning", 30, lambda: _canary_hermes_reasoning_eval(options)),
         ("eval.frontier_wrapper", 20, lambda: _canary_frontier_wrapper(options)),
         ("live.telegram_e2e", 20, lambda: _canary_telegram_e2e(options)),
+        (
+            "live.telegram_operator_response",
+            20,
+            lambda: _canary_telegram_operator_response(options),
+        ),
         ("live.telegram_visible_delivery", 20, lambda: _canary_telegram_visible_delivery(options)),
         ("live.x_scrape", 10, lambda: _canary_live_x_scrape(options)),
         ("contract.scorecard_trend", 10, lambda: _canary_scorecard_trend(options)),
@@ -4110,6 +4336,13 @@ def _quality_dimensions(report: CanaryReport) -> list[QualityDimension]:
     elif telegram_result and telegram_result.status == WARN:
         ux_score = min(ux_score, 4.0)
     elif telegram_result and telegram_result.status == FAIL:
+        ux_score = min(ux_score, 2.0)
+    telegram_operator_result = _result_by_name(report, "live.telegram_operator_response")
+    if telegram_operator_result and telegram_operator_result.status == PASS:
+        ux_score = max(ux_score, 8.7)
+    elif telegram_operator_result and telegram_operator_result.status == WARN:
+        ux_score = min(ux_score, 5.0)
+    elif telegram_operator_result and telegram_operator_result.status == FAIL:
         ux_score = min(ux_score, 2.0)
     ux_score = min(ux_score, 10.0)
 
@@ -4236,6 +4469,7 @@ def quality_summary(report: CanaryReport) -> dict[str, Any]:
         and passed("eval.hermes_reasoning")
         and passed("eval.frontier_wrapper")
         and passed("live.telegram_e2e")
+        and passed("live.telegram_operator_response")
         and passed("live.telegram_visible_delivery")
     )
     quote_ops_done = foundation_done and passed("contract.quote_ops_runtime")
@@ -4302,6 +4536,14 @@ def quality_summary(report: CanaryReport) -> dict[str, Any]:
                 "cap": 8.9,
                 "reason": "human-visible Telegram delivery is not currently proven",
                 "evidence": result_summary("live.telegram_visible_delivery"),
+            }
+        )
+    if result_status("live.telegram_operator_response") != PASS:
+        score_caps.append(
+            {
+                "cap": 8.9,
+                "reason": "Telegram operator prompt response is not currently proven",
+                "evidence": result_summary("live.telegram_operator_response"),
             }
         )
     readiness = readiness_summary(report)
@@ -4388,6 +4630,15 @@ def readiness_summary(report: CanaryReport) -> dict[str, Any]:
             "evidence": result_summary("live.telegram_e2e"),
         },
         {
+            "name": "telegram_operator_response",
+            "status": result_status("live.telegram_operator_response"),
+            "requirement": (
+                "Telegram webhook path returns a useful operator answer "
+                "through the bot send path within budget."
+            ),
+            "evidence": result_summary("live.telegram_operator_response"),
+        },
+        {
             "name": "grounding_and_retrieval",
             "status": PASS if grounding_ok else WARN,
             "requirement": "AAC workflow facts and X/Twitter retrieval contracts pass from source material.",
@@ -4432,6 +4683,15 @@ def readiness_summary(report: CanaryReport) -> dict[str, Any]:
                 "status": result_status("live.telegram_visible_delivery"),
                 "evidence": result_summary("live.telegram_visible_delivery"),
                 "purpose": "Human-visible Telegram DM loop; separate from signed webhook simulation.",
+            },
+            {
+                "name": "telegram_operator_response",
+                "status": result_status("live.telegram_operator_response"),
+                "evidence": result_summary("live.telegram_operator_response"),
+                "purpose": (
+                    "Operator-prompt response proof; verifies useful "
+                    "Telegram output, not just delivery ack."
+                ),
             }
         ],
         "docs_basis": [
@@ -4730,6 +4990,24 @@ def build_arg_parser() -> argparse.ArgumentParser:
         help="Seconds to wait for --telegram-visible-probe ack",
     )
     parser.add_argument(
+        "--telegram-operator-probe",
+        action="store_true",
+        default=os.getenv("HERMES_CANARY_TELEGRAM_OPERATOR_PROBE", "")
+        .strip()
+        .lower()
+        in {"1", "true", "yes", "on"},
+        help=(
+            "Post a signed operator prompt into the Telegram webhook and "
+            "require the bot to send the expected menu"
+        ),
+    )
+    parser.add_argument(
+        "--telegram-operator-wait",
+        type=float,
+        default=float(os.getenv("HERMES_CANARY_TELEGRAM_OPERATOR_WAIT", "15") or 15),
+        help="Seconds to wait for --telegram-operator-probe response evidence",
+    )
+    parser.add_argument(
         "--rfq-dry-run",
         action="store_true",
         default=os.getenv("HERMES_CANARY_RFQ_DRY_RUN", "").strip().lower() in {"1", "true", "yes", "on"},
@@ -4793,6 +5071,10 @@ def options_from_args(args: argparse.Namespace) -> CanaryOptions:
         telegram_webhook_sim=bool(getattr(args, "telegram_webhook_sim", False)),
         telegram_visible_probe=bool(getattr(args, "telegram_visible_probe", False)),
         telegram_visible_wait=float(getattr(args, "telegram_visible_wait", 15.0) or 15.0),
+        telegram_operator_probe=bool(getattr(args, "telegram_operator_probe", False)),
+        telegram_operator_wait=float(
+            getattr(args, "telegram_operator_wait", 15.0) or 15.0
+        ),
         rfq_dry_run=bool(getattr(args, "rfq_dry_run", False)),
         approved_rfq_draft=bool(getattr(args, "approved_rfq_draft", False)),
         require_live=bool(args.require_live),

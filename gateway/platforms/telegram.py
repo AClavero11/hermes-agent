@@ -983,7 +983,9 @@ class TelegramAdapter(BasePlatformAdapter):
 
             hermes_home = get_hermes_home()
         except Exception:
-            hermes_home = _Path(os.getenv("HERMES_HOME", _Path.home() / ".hermes")).expanduser()
+            hermes_home = _Path(
+                os.getenv("HERMES_HOME", _Path.home() / ".hermes")
+            ).expanduser()
         pending_path = _Path(
             os.getenv(
                 "HERMES_TELEGRAM_E2E_PENDING_PATH",
@@ -994,6 +996,36 @@ class TelegramAdapter(BasePlatformAdapter):
             os.getenv(
                 "HERMES_TELEGRAM_E2E_EVIDENCE_PATH",
                 str(hermes_home / "canary" / "telegram_e2e_last.json"),
+            )
+        ).expanduser()
+        return pending_path, evidence_path
+
+    @staticmethod
+    def _telegram_operator_probe_paths() -> tuple[_Path, _Path]:
+        try:
+            from hermes_constants import get_hermes_home
+
+            hermes_home = get_hermes_home()
+        except Exception:
+            hermes_home = _Path(os.getenv("HERMES_HOME", _Path.home() / ".hermes")).expanduser()
+        pending_path = _Path(
+            os.getenv(
+                "HERMES_TELEGRAM_OPERATOR_PENDING_PATH",
+                str(
+                    hermes_home
+                    / "canary"
+                    / "telegram_operator_response_pending.json"
+                ),
+            )
+        ).expanduser()
+        evidence_path = _Path(
+            os.getenv(
+                "HERMES_TELEGRAM_OPERATOR_EVIDENCE_PATH",
+                str(
+                    hermes_home
+                    / "canary"
+                    / "telegram_operator_response_last.json"
+                ),
             )
         ).expanduser()
         return pending_path, evidence_path
@@ -1021,7 +1053,8 @@ class TelegramAdapter(BasePlatformAdapter):
         if not pending_path.is_file():
             return False
         pending = self._read_json_object(pending_path)
-        if not pending or str(pending.get("status") or "").lower() not in {"sent", "pending"}:
+        pending_status = str(pending.get("status") or "").lower()
+        if not pending or pending_status not in {"sent", "pending"}:
             return False
 
         text = (getattr(message, "text", "") or "").strip()
@@ -1076,6 +1109,88 @@ class TelegramAdapter(BasePlatformAdapter):
             latency_ms,
         )
         return True
+
+    def _maybe_record_telegram_operator_response(
+        self,
+        *,
+        chat_id: str,
+        content: str,
+        reply_to: Optional[str],
+        message_id: Optional[str],
+        success: bool,
+    ) -> None:
+        pending_path, evidence_path = self._telegram_operator_probe_paths()
+        if not pending_path.is_file():
+            return
+        pending = self._read_json_object(pending_path)
+        if not pending or str(pending.get("status") or "").lower() not in {"sent", "pending"}:
+            return
+        if str(pending.get("mode") or "") != "signed_operator_response_probe":
+            return
+
+        expected_chat_id = str(pending.get("chat_id") or "").strip()
+        if expected_chat_id and str(chat_id) != expected_chat_id:
+            return
+
+        expected_substrings = pending.get("expected_substrings")
+        if not isinstance(expected_substrings, list):
+            expected_substrings = []
+        expected_text = [
+            str(item)
+            for item in expected_substrings
+            if str(item).strip()
+        ]
+        normalized_content = re.sub(r"\s+", " ", (content or "").lower()).strip()
+        missing = [
+            item
+            for item in expected_text
+            if item.lower() not in normalized_content
+        ]
+        content_match = bool(expected_text) and not missing
+        if not content_match:
+            return
+
+        now = time.time()
+        sent_at = float(pending.get("sent_at") or now)
+        latency_ms = max(1.0, round((now - sent_at) * 1000.0, 1))
+        inbound_message_id = pending.get("inbound_message_id")
+        evidence = {
+            "status": "pass",
+            "mode": "signed_operator_response_probe",
+            "source": "telegram_bot_send",
+            "nonce": pending.get("nonce", ""),
+            "chat_id": str(chat_id),
+            "prompt": pending.get("prompt", ""),
+            "expected_substrings": expected_text,
+            "missing_substrings": missing,
+            "content_match": content_match,
+            "telegram_send_ok": bool(success),
+            "sent_message_id": message_id,
+            "reply_to_message_id": reply_to,
+            "inbound_message_id": inbound_message_id,
+            "reply_target_match": str(reply_to or "")
+            == str(inbound_message_id or ""),
+            "sent_at": sent_at,
+            "observed_at": now,
+            "latency_ms": latency_ms,
+            "latency_budget_ms": float(pending.get("latency_budget_ms") or 10_000),
+            "text_preview": (content or "")[:500],
+        }
+        try:
+            self._write_json_atomic(evidence_path, evidence)
+        except OSError as exc:
+            logger.warning(
+                "[%s] Telegram operator response evidence write failed: %s",
+                self.name,
+                exc,
+            )
+            return
+        logger.info(
+            "[%s] Telegram operator response recorded mode=%s latency_ms=%.1f",
+            self.name,
+            evidence["mode"],
+            latency_ms,
+        )
 
     async def send(
         self,
@@ -1217,9 +1332,17 @@ class TelegramAdapter(BasePlatformAdapter):
                         raise
                 message_ids.append(str(msg.message_id))
             
+            first_message_id = message_ids[0] if message_ids else None
+            self._maybe_record_telegram_operator_response(
+                chat_id=chat_id,
+                content=content,
+                reply_to=reply_to,
+                message_id=first_message_id,
+                success=True,
+            )
             return SendResult(
                 success=True,
-                message_id=message_ids[0] if message_ids else None,
+                message_id=first_message_id,
                 raw_response={"message_ids": message_ids}
             )
             

@@ -7195,6 +7195,24 @@ For more help on a command:
         help="Seconds to wait for --telegram-visible-probe ack",
     )
     canary_parser.add_argument(
+        "--telegram-operator-probe",
+        action="store_true",
+        default=os.getenv("HERMES_CANARY_TELEGRAM_OPERATOR_PROBE", "")
+        .strip()
+        .lower()
+        in {"1", "true", "yes", "on"},
+        help=(
+            "Post a signed operator prompt into the Telegram webhook and "
+            "require the bot to send the expected menu"
+        ),
+    )
+    canary_parser.add_argument(
+        "--telegram-operator-wait",
+        type=float,
+        default=float(os.getenv("HERMES_CANARY_TELEGRAM_OPERATOR_WAIT", "15") or 15),
+        help="Seconds to wait for --telegram-operator-probe response evidence",
+    )
+    canary_parser.add_argument(
         "--rfq-dry-run",
         action="store_true",
         default=os.getenv("HERMES_CANARY_RFQ_DRY_RUN", "").strip().lower() in {"1", "true", "yes", "on"},
