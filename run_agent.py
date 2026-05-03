@@ -763,6 +763,7 @@ class AIAgent:
         checkpoint_max_snapshots: int = 50,
         pass_session_id: bool = False,
         persist_session: bool = True,
+        request_timeout_seconds: float = None,
     ):
         """
         Initialize the AI Agent.
@@ -835,6 +836,11 @@ class AIAgent:
         self.skip_context_files = skip_context_files
         self.pass_session_id = pass_session_id
         self.persist_session = persist_session
+        try:
+            _request_timeout = float(request_timeout_seconds) if request_timeout_seconds is not None else None
+        except (TypeError, ValueError):
+            _request_timeout = None
+        self.request_timeout_seconds = _request_timeout if _request_timeout and _request_timeout > 0 else None
         self._credential_pool = credential_pool
         self.log_prefix_chars = log_prefix_chars
         self.log_prefix = f"{log_prefix} " if log_prefix else ""
@@ -1095,7 +1101,7 @@ class AIAgent:
         # every client construction path below (Anthropic native, OpenAI-wire,
         # router-based implicit auth) can apply it consistently.  Bedrock
         # Claude uses its own timeout path and is not covered here.
-        _provider_timeout = get_provider_request_timeout(self.provider, self.model)
+        _provider_timeout = self._resolved_api_call_timeout()
 
         if self.api_mode == "anthropic_messages":
             from agent.anthropic_adapter import build_anthropic_client, resolve_anthropic_token
@@ -1963,7 +1969,7 @@ class AIAgent:
             self._anthropic_base_url = base_url or getattr(self, "_anthropic_base_url", None)
             self._anthropic_client = build_anthropic_client(
                 effective_key, self._anthropic_base_url,
-                timeout=get_provider_request_timeout(self.provider, self.model),
+                timeout=self._resolved_api_call_timeout(),
             )
             self._is_anthropic_oauth = _is_oauth_token(effective_key) if _is_native_anthropic else False
             self.client = None
@@ -1975,7 +1981,7 @@ class AIAgent:
                 "api_key": effective_key,
                 "base_url": effective_base,
             }
-            _sm_timeout = get_provider_request_timeout(self.provider, self.model)
+            _sm_timeout = self._resolved_api_call_timeout()
             if _sm_timeout is not None:
                 self._client_kwargs["timeout"] = _sm_timeout
             self.client = self._create_openai_client(
@@ -2340,9 +2346,29 @@ class AIAgent:
         timeout the AIAgent.__init__ path configured.
         """
         cfg = get_provider_request_timeout(self.provider, self.model)
+        configured = cfg if cfg is not None else float(os.getenv("HERMES_API_TIMEOUT", 1800.0))
+        hard_timeout = getattr(self, "request_timeout_seconds", None)
+        if hard_timeout is not None:
+            return min(float(configured), float(hard_timeout))
+        return float(configured)
+
+    def _resolved_stream_read_timeout(self, base_timeout: float) -> float:
+        """Resolve streaming read timeout, honoring gateway hard caps."""
+        cfg = get_provider_request_timeout(self.provider, self.model)
         if cfg is not None:
-            return cfg
-        return float(os.getenv("HERMES_API_TIMEOUT", 1800.0))
+            stream_timeout = float(cfg)
+        else:
+            stream_timeout = float(os.getenv("HERMES_STREAM_READ_TIMEOUT", 120.0))
+            if stream_timeout == 120.0 and self.base_url and is_local_endpoint(self.base_url):
+                stream_timeout = float(base_timeout)
+                logger.debug(
+                    "Local provider detected (%s) — stream read timeout raised to %.0fs",
+                    self.base_url, stream_timeout,
+                )
+        hard_timeout = getattr(self, "request_timeout_seconds", None)
+        if hard_timeout is not None:
+            stream_timeout = min(float(stream_timeout), float(hard_timeout))
+        return stream_timeout
 
     def _resolved_api_call_stale_timeout_base(self) -> tuple[float, bool]:
         """Resolve the base non-stream stale timeout and whether it is implicit.
@@ -2372,15 +2398,20 @@ class AIAgent:
         """Compute the effective non-stream stale timeout for this request."""
         stale_base, uses_implicit_default = self._resolved_api_call_stale_timeout_base()
         base_url = getattr(self, "_base_url", None) or self.base_url or ""
+        hard_timeout = getattr(self, "request_timeout_seconds", None)
         if uses_implicit_default and base_url and is_local_endpoint(base_url):
-            return float("inf")
+            return float(hard_timeout) if hard_timeout is not None else float("inf")
 
         est_tokens = sum(len(str(v)) for v in messages) // 4
         if est_tokens > 100_000:
-            return max(stale_base, 600.0)
-        if est_tokens > 50_000:
-            return max(stale_base, 450.0)
-        return stale_base
+            stale_timeout = max(stale_base, 600.0)
+        elif est_tokens > 50_000:
+            stale_timeout = max(stale_base, 450.0)
+        else:
+            stale_timeout = stale_base
+        if hard_timeout is not None:
+            return min(float(stale_timeout), float(hard_timeout))
+        return stale_timeout
 
     def _is_openrouter_url(self) -> bool:
         """Return True when the base URL targets OpenRouter."""
@@ -5450,7 +5481,7 @@ class AIAgent:
             self._anthropic_client = build_anthropic_client(
                 new_token,
                 getattr(self, "_anthropic_base_url", None),
-                timeout=get_provider_request_timeout(self.provider, self.model),
+                timeout=self._resolved_api_call_timeout(),
             )
         except Exception as exc:
             logger.warning("Failed to rebuild Anthropic client after credential refresh: %s", exc)
@@ -5504,7 +5535,7 @@ class AIAgent:
             self._anthropic_base_url = runtime_base
             self._anthropic_client = build_anthropic_client(
                 runtime_key, runtime_base,
-                timeout=get_provider_request_timeout(self.provider, self.model),
+                timeout=self._resolved_api_call_timeout(),
             )
             self._is_anthropic_oauth = _is_oauth_token(runtime_key) if self.provider == "anthropic" else False
             self.api_key = runtime_key
@@ -5711,7 +5742,7 @@ class AIAgent:
                         self._anthropic_client = build_anthropic_client(
                             self._anthropic_api_key,
                             getattr(self, "_anthropic_base_url", None),
-                            timeout=get_provider_request_timeout(self.provider, self.model),
+                            timeout=self._resolved_api_call_timeout(),
                         )
                     else:
                         rc = request_client_holder.get("client")
@@ -5743,7 +5774,7 @@ class AIAgent:
                         self._anthropic_client = build_anthropic_client(
                             self._anthropic_api_key,
                             getattr(self, "_anthropic_base_url", None),
-                            timeout=get_provider_request_timeout(self.provider, self.model),
+                            timeout=self._resolved_api_call_timeout(),
                         )
                     else:
                         request_client = request_client_holder.get("client")
@@ -5960,30 +5991,8 @@ class AIAgent:
         def _call_chat_completions():
             """Stream a chat completions response."""
             import httpx as _httpx
-            # Per-provider / per-model request_timeout_seconds (from config.yaml)
-            # wins over the HERMES_API_TIMEOUT env default if the user set it.
-            _provider_timeout_cfg = get_provider_request_timeout(self.provider, self.model)
-            _base_timeout = (
-                _provider_timeout_cfg
-                if _provider_timeout_cfg is not None
-                else float(os.getenv("HERMES_API_TIMEOUT", 1800.0))
-            )
-            # Read timeout: config wins here too.  Otherwise use
-            # HERMES_STREAM_READ_TIMEOUT (default 120s) for cloud providers.
-            if _provider_timeout_cfg is not None:
-                _stream_read_timeout = _provider_timeout_cfg
-            else:
-                _stream_read_timeout = float(os.getenv("HERMES_STREAM_READ_TIMEOUT", 120.0))
-                # Local providers (Ollama, llama.cpp, vLLM) can take minutes for
-                # prefill on large contexts before producing the first token.
-                # Auto-increase the httpx read timeout unless the user explicitly
-                # overrode HERMES_STREAM_READ_TIMEOUT.
-                if _stream_read_timeout == 120.0 and self.base_url and is_local_endpoint(self.base_url):
-                    _stream_read_timeout = _base_timeout
-                    logger.debug(
-                        "Local provider detected (%s) — stream read timeout raised to %.0fs",
-                        self.base_url, _stream_read_timeout,
-                    )
+            _base_timeout = self._resolved_api_call_timeout()
+            _stream_read_timeout = self._resolved_stream_read_timeout(_base_timeout)
             stream_kwargs = {
                 **api_kwargs,
                 "stream": True,
@@ -6521,6 +6530,9 @@ class AIAgent:
                 _stream_stale_timeout = max(_stream_stale_timeout_base, 240.0)
             else:
                 _stream_stale_timeout = _stream_stale_timeout_base
+        _hard_stream_timeout = getattr(self, "request_timeout_seconds", None)
+        if _hard_stream_timeout is not None:
+            _stream_stale_timeout = min(float(_stream_stale_timeout), float(_hard_stream_timeout))
 
         t = threading.Thread(target=_call, daemon=True)
         t.start()
@@ -6591,7 +6603,7 @@ class AIAgent:
                         self._anthropic_client = build_anthropic_client(
                             self._anthropic_api_key,
                             getattr(self, "_anthropic_base_url", None),
-                            timeout=get_provider_request_timeout(self.provider, self.model),
+                            timeout=self._resolved_api_call_timeout(),
                         )
                     else:
                         request_client = request_client_holder.get("client")
@@ -6886,7 +6898,7 @@ class AIAgent:
                 self._anthropic_base_url = rt["anthropic_base_url"]
                 self._anthropic_client = build_anthropic_client(
                     rt["anthropic_api_key"], rt["anthropic_base_url"],
-                    timeout=get_provider_request_timeout(self.provider, self.model),
+                    timeout=self._resolved_api_call_timeout(),
                 )
                 self._is_anthropic_oauth = rt["is_anthropic_oauth"]
                 self.client = None
@@ -6985,7 +6997,7 @@ class AIAgent:
                 self._anthropic_base_url = rt["anthropic_base_url"]
                 self._anthropic_client = build_anthropic_client(
                     rt["anthropic_api_key"], rt["anthropic_base_url"],
-                    timeout=get_provider_request_timeout(self.provider, self.model),
+                    timeout=self._resolved_api_call_timeout(),
                 )
                 self._is_anthropic_oauth = rt["is_anthropic_oauth"]
                 self.client = None

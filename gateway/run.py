@@ -97,10 +97,33 @@ _hermes_home = get_hermes_home()
 
 # Load environment variables from ~/.hermes/.env first.
 # User-managed env files should override stale shell exports on restart.
-from dotenv import load_dotenv  # backward-compat for tests that monkeypatch this symbol
+from dotenv import dotenv_values, load_dotenv  # backward-compat for tests that monkeypatch this symbol
 from hermes_cli.env_loader import load_hermes_dotenv
 _env_path = _hermes_home / '.env'
 load_hermes_dotenv(hermes_home=_hermes_home, project_env=Path(__file__).resolve().parents[1] / '.env')
+
+
+def _load_gateway_service_env_from_planner_file() -> None:
+    """Load only gateway service HTTP settings from the launchd planner env."""
+    planner_env = os.getenv("HERMES_PLANNER_ENV_FILE", "").strip()
+    if not planner_env:
+        return
+    path = Path(planner_env).expanduser()
+    if not path.is_file():
+        return
+    try:
+        values = dotenv_values(path)
+    except Exception:
+        return
+    for name in ("HERMES_SERVICE_KEY", "HERMES_API_PORT"):
+        if os.getenv(name):
+            continue
+        value = values.get(name)
+        if isinstance(value, str) and value.strip():
+            os.environ[name] = value.strip()
+
+
+_load_gateway_service_env_from_planner_file()
 
 
 _DOCKER_VOLUME_SPEC_RE = re.compile(r"^(?P<host>.+):(?P<container>/[^:]+?)(?::(?P<options>[^:]+))?$")
@@ -862,9 +885,34 @@ def _is_operator_capability_prompt(message: str) -> bool:
     normalized = re.sub(r"[^a-z0-9]+", "", lowered)
     if normalized in _OPERATOR_CAPABILITY_EXACT:
         return True
+    if normalized in {
+        "ifeellikeyoureregressedsincemarchhowareyoupotentiallybetter",
+        "ifeellikeyouregressedsincemarchhowareyoupotentiallybetter",
+        "howareyoupotentiallybetter",
+        "areyoubetternow",
+        "areyoubetterthanmarch",
+        "areyoubetterthansonnet",
+    }:
+        return True
     if re.fullmatch(r"how\s+can\s+you\s+help(?:\s+me)?(?:\s+right\s+now)?\??", lowered):
         return True
     if re.fullmatch(r"what\s+can\s+(?:you|we)\s+do(?:\s+right\s+now)?\??", lowered):
+        return True
+    capability_terms = (
+        "what can you do",
+        "how can you help",
+        "how are you better",
+        "potentially better",
+        "why are you better",
+    )
+    regression_terms = ("regressed", "regress", "march", "sonnet")
+    if any(term in lowered for term in capability_terms):
+        return True
+    if (
+        any(term in lowered for term in regression_terms)
+        and any(term in lowered for term in ("better", "improve", "capable", "help", "useful"))
+        and any(term in lowered for term in ("you", "hermes"))
+    ):
         return True
     return False
 
@@ -929,16 +977,20 @@ def _build_operator_capability_prompt(message: str) -> str:
     routes = policy["routes"]
     return (
         "You are Hermes in AC Telegram operator mode. This is not a generic chatbot turn.\n"
-        "Answer the operator's capability question with the old Sonnet-era Hermes feel: "
+        "Answer the operator's broad capability/status question with the old Sonnet-era Hermes feel: "
         "concise, grounded, operational, no preamble, no apology, no character voice.\n"
         "Do not call tools. Do not mention terminal commands. Do not say 'I can help' "
         "or 'let me know'. Do not start bullets with 'I can'. Do not invent meetings, "
-        "generic project management, or assistant roleplay. Give AC the highest-value "
-        "current ways to use Hermes.\n"
-        "Return exactly six plain hyphen bullets with these labels: RFQ/quotes, V11 context, "
-        "Follow-ups, Hermes runtime, Research links, Code/files. Then end with one approval sentence. "
-        "State that customer sends, V11 writes, Atlas writes, and destructive actions require approval. "
-        "Each bullet must be a complete sentence with operational detail, not just a label. "
+        "generic project management, assistant roleplay, 'operational parameters', "
+        "'current capabilities include', code snippets, or file structures.\n"
+        "If AC says Hermes regressed, answer what is concretely better now: stronger hosted "
+        "planner/synthesizer routing, bounded fast-path behavior, explicit runtime truth, "
+        "and approval-gated business writes. Sound like an operator in the shop, not a product brochure.\n"
+        "Generate a fresh operator answer, not a fixed menu. Mention only the lanes that fit "
+        "the user's wording, but keep it useful for AC: RFQ/quotes, V11/inventory context, "
+        "follow-ups, Hermes runtime repair, research links, and code/files are valid examples. "
+        "Use tight paragraphs or short bullets. End with exactly one short approval-gate sentence: "
+        "customer sends, V11 writes, Atlas writes, and destructive actions require approval. "
         "Keep under 150 words.\n\n"
         f"Current routes: planner={_friendly_model_route_label(routes['planner'])}; "
         f"executor={_friendly_model_route_label(routes['executor'])}; "
@@ -948,16 +1000,27 @@ def _build_operator_capability_prompt(message: str) -> str:
     )
 
 
-def _operator_capability_fallback(error: str) -> str:
+def _operator_route_summary() -> str:
+    try:
+        policy = resolve_model_routes()
+        routes = policy["routes"]
+        return (
+            f"planner={route_label(routes['planner'])}; "
+            f"executor={route_label(routes['executor'])}; "
+            f"synthesizer={route_label(routes['synthesizer'])}"
+        )
+    except Exception:
+        return "route=unresolved"
+
+
+def _operator_capability_fallback(error: str, *, elapsed: float | None = None) -> str:
+    elapsed_line = f"Elapsed: {elapsed:.1f}s.\n" if elapsed is not None else ""
     return (
-        "Hermes operator planner did not return inside the fast path.\n"
-        f"Failure: {error[:160]}.\n"
-        "- RFQ: draft quote packages from V11 stock, customer history, and pricing rules.\n"
-        "- Inventory: inspect V11 on-hand IDG/CSD parts and quote targets.\n"
-        "- Follow-ups: prepare customer drafts only.\n"
-        "- Hermes: inspect runtime, canaries, logs, and patch failures.\n"
-        "- Research/code: digest links, inspect files, patch code, and attach evidence.\n"
-        "Approval required before customer sends, V11/Atlas writes, or destructive actions."
+        "Hermes fast operator route failed before producing a model answer.\n"
+        f"Route: {_operator_route_summary()}.\n"
+        f"{elapsed_line}"
+        f"Failure: {error[:220]}.\n"
+        "Next safe action: retry once, or use `/runtime status` if you want the live route and health facts."
     )
 
 
@@ -971,6 +1034,17 @@ def _operator_capability_answer_failure_reason(text: str) -> str:
         "cannot execute",
         "cannot access files",
         "as an ai",
+        "as an ai language model",
+        "received. working",
+        "how can i assist",
+        "how may i assist",
+        "here are some things i can help",
+        "here's how i can help",
+        "i can assist with",
+        "operational parameters",
+        "current capabilities include",
+        "code snippets",
+        "file structures",
         "let me know",
         "scheduling internal meetings",
         "project management certification",
@@ -981,21 +1055,23 @@ def _operator_capability_answer_failure_reason(text: str) -> str:
             return f"bad marker: {marker}"
     if len(re.findall(r"\w+", text or "")) < 25:
         return "too short"
-    required_groups = {
+    if "approval" not in lowered:
+        return "missing approval gate"
+    operator_groups = {
         "rfq": ("rfq", "quote"),
         "v11": ("v11", "inventory", "stock"),
         "followups": ("follow",),
         "hermes": ("hermes", "runtime", "canary"),
         "code": ("code", "file", "patch"),
-        "approval": ("approval",),
+        "research": ("research", "link", "source"),
     }
-    missing = [
-        group
-        for group, terms in required_groups.items()
-        if not any(term in lowered for term in terms)
-    ]
-    if missing:
-        return "missing lanes: " + ", ".join(missing)
+    hits = sum(
+        1
+        for terms in operator_groups.values()
+        if any(term in lowered for term in terms)
+    )
+    if hits < 3:
+        return "missing operator grounding"
     return ""
 
 
@@ -1026,15 +1102,23 @@ def _finalize_operator_capability_answer(
 
 
 def _build_operator_capability_model_answer_sync(message: str) -> str:
+    started = time.perf_counter()
     policy = resolve_model_routes()
     routes = policy.get("routes") if isinstance(policy, dict) else {}
+    planner = routes.get("planner") if isinstance(routes, dict) else {}
     synthesizer = routes.get("synthesizer") if isinstance(routes, dict) else {}
     executor = routes.get("executor") if isinstance(routes, dict) else {}
     prompt = _build_operator_capability_prompt(message)
-    timeout = float(os.getenv("HERMES_OPERATOR_CAPABILITY_TIMEOUT", "4") or "4")
-    fallback_timeout = float(os.getenv("HERMES_OPERATOR_CAPABILITY_FALLBACK_TIMEOUT", "4") or "4")
+    timeout = float(os.getenv("HERMES_OPERATOR_CAPABILITY_TIMEOUT", "8") or "8")
+    fallback_timeout = float(os.getenv("HERMES_OPERATOR_CAPABILITY_FALLBACK_TIMEOUT", "8") or "8")
     local_timeout = float(os.getenv("HERMES_OPERATOR_CAPABILITY_LOCAL_TIMEOUT", "1.5") or "1.5")
     hosted_attempted = False
+    prefer_runtime = os.getenv("HERMES_OPERATOR_CAPABILITY_PREFER_RUNTIME", "1").strip().lower() not in {
+        "0",
+        "false",
+        "no",
+        "off",
+    }
 
     openai_api_key = (
         os.getenv("HERMES_FRONTIER_API_KEY", "").strip()
@@ -1046,7 +1130,7 @@ def _build_operator_capability_model_answer_sync(message: str) -> str:
         or os.getenv("HERMES_FRONTIER_MODEL", "").strip()
         or "gpt-5.4-mini"
     )
-    if openai_api_key and openai_model:
+    if not prefer_runtime and openai_api_key and openai_model:
         hosted_attempted = True
         openai_base = os.getenv("OPENAI_BASE_URL", "https://api.openai.com/v1").rstrip("/")
         payload = {
@@ -1078,39 +1162,129 @@ def _build_operator_capability_model_answer_sync(message: str) -> str:
         except Exception as exc:
             logger.info("Operator capability OpenAI route failed: %s", exc)
 
-    provider = str((synthesizer or {}).get("provider") or "").lower()
-    model = str((synthesizer or {}).get("model") or "").strip()
-    if provider == "gemini" and model:
-        api_key = os.getenv("GEMINI_API_KEY", "").strip() or os.getenv("GOOGLE_API_KEY", "").strip()
-        if api_key:
-            hosted_attempted = True
-            url = (
-                "https://generativelanguage.googleapis.com/v1beta/models/"
-                f"{model}:generateContent?key={api_key}"
-            )
-            payload = {
-                "contents": [{"role": "user", "parts": [{"text": prompt}]}],
-                "generationConfig": {
-                    "temperature": 0.2,
-                    "maxOutputTokens": 512,
-                    "thinkingConfig": {"thinkingBudget": 0},
+    try:
+        runtime_kwargs = _resolve_runtime_agent_kwargs()
+    except Exception as exc:
+        runtime_kwargs = {}
+        logger.info("Operator capability runtime route unavailable: %s", exc)
+
+    runtime_provider = str(runtime_kwargs.get("provider") or "").lower()
+    synthesizer_provider = str((synthesizer or {}).get("provider") or "").lower()
+    if synthesizer_provider and synthesizer_provider == runtime_provider:
+        runtime_model = str((synthesizer or {}).get("model") or "").strip()
+    else:
+        runtime_model = str(
+            _resolve_gateway_model()
+            or os.getenv("HERMES_PLANNER_MODEL")
+            or os.getenv("DEEPSEEK_V4_MODEL")
+            or os.getenv("DEEPSEEK_LOCAL_MODEL")
+            or ""
+        ).strip()
+    runtime_base = str(runtime_kwargs.get("base_url") or "").strip()
+    runtime_key = str(runtime_kwargs.get("api_key") or "").strip()
+    runtime_api_mode = str(runtime_kwargs.get("api_mode") or "chat_completions").strip()
+    runtime_attempted = False
+    runtime_failure = ""
+    if (
+        runtime_model
+        and runtime_base
+        and runtime_key
+        and runtime_provider not in {"gemini"}
+        and runtime_api_mode in {"", "chat_completions"}
+    ):
+        hosted_attempted = True
+        runtime_attempted = True
+        payload = {
+            "model": runtime_model,
+            "messages": [
+                {
+                    "role": "system",
+                    "content": "You are Hermes for AC. Concise operational answer only. No tools.",
                 },
-            }
-            try:
-                text = _extract_gemini_text(_post_json(url, payload, timeout=fallback_timeout))
+                {"role": "user", "content": prompt},
+            ],
+            "temperature": 0.2,
+            "max_tokens": 320,
+            "stream": False,
+        }
+        try:
+            data = _post_json(
+                f"{runtime_base.rstrip('/')}/chat/completions",
+                payload,
+                headers={"Authorization": f"Bearer {runtime_key}"} if runtime_key != "no-key-required" else None,
+                timeout=timeout,
+            )
+            choices = data.get("choices") if isinstance(data, dict) else []
+            if isinstance(choices, list) and choices:
+                message_payload = choices[0].get("message") if isinstance(choices[0], dict) else {}
+                text = str(message_payload.get("content") or "").strip()
                 if text:
                     answer = _finalize_operator_capability_answer(
                         text,
-                        provider_label="Gemini",
+                        provider_label=runtime_provider or "runtime",
                         fallback_on_failure=False,
                     )
                     if answer:
                         return answer
-            except Exception as exc:
-                logger.info("Operator capability Gemini route failed: %s", exc)
+        except Exception as exc:
+            logger.info("Operator capability runtime route failed: %s", exc)
+            runtime_failure = f"runtime route failed: {type(exc).__name__}: {exc}"
+        if not runtime_failure:
+            runtime_failure = "runtime planner route did not return a usable operator answer"
+
+    gemini_models: list[str] = []
+    env_gemini_model = os.getenv("HERMES_OPERATOR_CAPABILITY_GEMINI_MODEL", "").strip()
+    if env_gemini_model:
+        gemini_models.append(env_gemini_model)
+    for route in (planner, synthesizer):
+        provider = str((route or {}).get("provider") or "").lower()
+        model = str((route or {}).get("model") or "").strip()
+        if provider == "gemini" and model and model not in gemini_models:
+            gemini_models.append(model)
+    if gemini_models:
+        api_key = os.getenv("GEMINI_API_KEY", "").strip() or os.getenv("GOOGLE_API_KEY", "").strip()
+        if api_key:
+            hosted_attempted = True
+            gemini_timeout = min(fallback_timeout, 3.0) if runtime_attempted else fallback_timeout
+            for model in gemini_models:
+                url = (
+                    "https://generativelanguage.googleapis.com/v1beta/models/"
+                    f"{model}:generateContent?key={api_key}"
+                )
+                generation_config: dict[str, Any] = {
+                    "temperature": 0.2,
+                    "maxOutputTokens": 512,
+                }
+                if "pro" not in model.lower():
+                    generation_config["thinkingConfig"] = {"thinkingBudget": 0}
+                payload = {
+                    "contents": [{"role": "user", "parts": [{"text": prompt}]}],
+                    "generationConfig": generation_config,
+                }
+                try:
+                    text = _extract_gemini_text(_post_json(url, payload, timeout=gemini_timeout))
+                    if text:
+                        answer = _finalize_operator_capability_answer(
+                            text,
+                            provider_label=f"Gemini {model}",
+                            fallback_on_failure=False,
+                        )
+                        if answer:
+                            return answer
+                except Exception as exc:
+                    logger.info("Operator capability Gemini route failed for %s: %s", model, exc)
+
+    if runtime_attempted:
+        return _operator_capability_fallback(
+            runtime_failure or "runtime planner route did not return inside the fast budget",
+            elapsed=time.perf_counter() - started,
+        )
 
     if hosted_attempted:
-        return _operator_capability_fallback("hosted synthesizer route did not return inside the fast budget")
+        return _operator_capability_fallback(
+            "hosted synthesizer route did not return inside the fast budget",
+            elapsed=time.perf_counter() - started,
+        )
 
     local_provider = str((executor or {}).get("provider") or "").lower()
     local_model = str((executor or {}).get("model") or "").strip()
@@ -1148,13 +1322,39 @@ def _build_operator_capability_model_answer_sync(message: str) -> str:
                         return answer
         except Exception as exc:
             logger.info("Operator capability local route failed: %s", exc)
-            return _operator_capability_fallback(f"{type(exc).__name__}: {exc}")
+            return _operator_capability_fallback(
+                f"{type(exc).__name__}: {exc}",
+                elapsed=time.perf_counter() - started,
+            )
 
-    return _operator_capability_fallback("no usable synthesizer or local executor route")
+    return _operator_capability_fallback(
+        "no usable synthesizer or local executor route",
+        elapsed=time.perf_counter() - started,
+    )
 
 
 async def _build_operator_capability_model_answer(message: str) -> str:
     return await asyncio.to_thread(_build_operator_capability_model_answer_sync, message)
+
+
+async def _run_operator_capability_fast_path(message: str) -> str:
+    started = time.perf_counter()
+    timeout = float(os.getenv("HERMES_OPERATOR_FAST_PATH_TIMEOUT", "12") or "12")
+    try:
+        return await asyncio.wait_for(
+            _build_operator_capability_model_answer(message),
+            timeout=max(0.05, timeout),
+        )
+    except asyncio.TimeoutError:
+        return _operator_capability_fallback(
+            f"operator model did not return inside {timeout:.0f}s",
+            elapsed=time.perf_counter() - started,
+        )
+    except Exception as exc:
+        return _operator_capability_fallback(
+            f"{type(exc).__name__}: {exc}",
+            elapsed=time.perf_counter() - started,
+        )
 
 
 def _build_hermes_direct_answer(message: str) -> str:
@@ -1180,6 +1380,13 @@ def _build_hermes_direct_answer(message: str) -> str:
             "Sends, writes, and destructive actions stay approval-gated. "
             "Full route IDs live in `hermes runtime status`."
         )
+    if normalized in {"statusbuthumanreadable", "humanreadablestatus", "runtimestatus"}:
+        try:
+            from hermes_cli.runtime_status import collect_runtime_status, format_runtime_status
+
+            return format_runtime_status(collect_runtime_status(timeout=3.0)).strip()
+        except Exception as exc:
+            return f"Runtime status unavailable: {exc}"
     if normalized in {"rfq", "quotes", "quote"}:
         return (
             "RFQ mode.\n"
@@ -1368,6 +1575,14 @@ def _classify_malformed_hermes_response(response: str) -> str:
         if "notification_rules.md" in lowered:
             return "file path treated as a terminal command"
         return "bogus command/file capability refusal"
+    generic_menu_terms = (
+        "as an ai language model",
+        "how can i assist you today",
+        "here are some things i can help",
+        "i can assist with",
+    )
+    if any(term in lowered for term in generic_menu_terms):
+        return "generic assistant menu"
 
     return ""
 
@@ -1501,6 +1716,63 @@ def _resolve_agent_notify_interval(source: SessionSource) -> tuple[Optional[floa
     else:
         first = first_raw if first_raw > 0 else None
     return first, interval
+
+
+def _coerce_positive_float(value: Any, default: float) -> float:
+    try:
+        parsed = float(value)
+    except (TypeError, ValueError):
+        return default
+    return parsed if parsed > 0 else default
+
+
+def _gateway_model_request_timeout(*, tool_enabled: bool) -> float:
+    """Hard cap provider waits for gateway turns."""
+    if tool_enabled:
+        configured = os.getenv("HERMES_TOOL_AGENT_PROVIDER_TIMEOUT", "").strip()
+        if not configured:
+            configured = os.getenv("HERMES_PROVIDER_TOOL_TIMEOUT", "").strip()
+        return _coerce_positive_float(configured, 120.0)
+    configured = os.getenv("HERMES_NORMAL_MODEL_PROVIDER_TIMEOUT", "").strip()
+    if not configured:
+        configured = os.getenv("HERMES_PROVIDER_NORMAL_TIMEOUT", "").strip()
+    return _coerce_positive_float(configured, 45.0)
+
+
+def _is_provider_timeout_error(error: Any) -> bool:
+    text = str(error or "").lower()
+    if not text:
+        return False
+    timeout_markers = (
+        "timeout",
+        "timed out",
+        "readtimeout",
+        "connecttimeout",
+        "pooltimeout",
+        "apitimer",
+        "api timeout",
+        "no response from provider",
+    )
+    return any(marker in text for marker in timeout_markers)
+
+
+def _format_provider_timeout_failure(
+    *,
+    provider: str,
+    model: str,
+    elapsed: float,
+    error: Any,
+    fallback_used: bool = False,
+) -> str:
+    route = f"{provider or 'unknown'}:{model or 'unknown'}"
+    return (
+        "Provider timed out before Hermes could finish the turn.\n"
+        f"Route: {route}.\n"
+        f"Elapsed: {elapsed:.1f}s.\n"
+        f"Fallback used: {'yes' if fallback_used else 'no'}.\n"
+        f"Failure: {str(error or 'timeout')[:220]}.\n"
+        "Next safe action: retry once, or use `/runtime status` to inspect the live route before retrying."
+    )
 
 
 def _build_alexandria_context_prompt(message: str) -> str:
@@ -2580,7 +2852,7 @@ class GatewayRunner:
                     invalidation_reason="operator_capability_prompt",
                 )
                 self._reset_session_for_operator_lane(event.source, "operator_capability")
-                capability_answer = await _build_operator_capability_model_answer(event.text or "")
+                capability_answer = await _run_operator_capability_fast_path(event.text or "")
                 thread_meta = {"thread_id": event.source.thread_id} if event.source.thread_id else None
                 await adapter._send_with_retry(
                     chat_id=event.source.chat_id,
@@ -4197,6 +4469,16 @@ class GatewayRunner:
     def _goal_manager_for_event(self, event: MessageEvent):
         return self._goal_manager_for_session_key(self._session_key_for_source(event.source))
 
+    def _session_is_busy_for_goal(self, event: MessageEvent, session_key: str) -> bool:
+        if session_key in getattr(self, "_running_agents", {}):
+            return True
+        adapter = self.adapters.get(event.source.platform) if getattr(event, "source", None) else None
+        if not adapter:
+            return False
+        active_sessions = getattr(adapter, "_active_sessions", {}) or {}
+        pending_messages = getattr(adapter, "_pending_messages", {}) or {}
+        return session_key in active_sessions or session_key in pending_messages
+
     def _schedule_goal_prompt(
         self,
         event: MessageEvent,
@@ -4319,6 +4601,8 @@ class GatewayRunner:
         goal_text = args if verb not in {"set"} else rest.strip()
         if not goal_text:
             return "Usage: /goal <objective>"
+        if self._session_is_busy_for_goal(event, session_key):
+            return "Agent is running - wait for the current turn or use `/stop` before setting a new goal."
 
         try:
             workspace_task_id = self._create_goal_workspace_task(event, goal_text)
@@ -4914,7 +5198,7 @@ class GatewayRunner:
                     invalidation_reason="operator_capability_prompt",
                 )
                 self._reset_session_for_operator_lane(source, "operator_capability")
-                return await _build_operator_capability_model_answer(event.text or "")
+                return await _run_operator_capability_fast_path(event.text or "")
 
             plain_control = "" if event.get_command() else _classify_plain_operator_control(event.text or "")
             if plain_control == "status" or event.get_command() == "status":
@@ -5113,6 +5397,8 @@ class GatewayRunner:
                     return await self._handle_commands_command(event)
                 if _cmd_def_inner.name == "profile":
                     return await self._handle_profile_command(event)
+                if _cmd_def_inner.name == "runtime":
+                    return await self._handle_runtime_command(event)
                 if _cmd_def_inner.name == "update":
                     return await self._handle_update_command(event)
 
@@ -5297,6 +5583,9 @@ class GatewayRunner:
 
         if canonical == "status":
             return await self._handle_status_command(event)
+
+        if canonical == "runtime":
+            return await self._handle_runtime_command(event)
 
         if canonical == "agents":
             return await self._handle_agents_command(event)
@@ -5556,7 +5845,7 @@ class GatewayRunner:
         # execution of a dangerous command.
         if not command:
             if _is_operator_capability_prompt(event.text or ""):
-                return await _build_operator_capability_model_answer(event.text or "")
+                return await _run_operator_capability_fast_path(event.text or "")
 
             direct_answer = _build_hermes_direct_answer(event.text or "")
             if direct_answer:
@@ -6336,19 +6625,24 @@ class GatewayRunner:
             if not response and agent_result.get("failed"):
                 error_detail = agent_result.get("error", "unknown error")
                 error_str = str(error_detail).lower()
-
-                # Detect context-overflow failures and give specific guidance.
-                # Generic 400 "Error" from Anthropic with large sessions is the
-                # most common cause of this (#1630).
-                _is_ctx_fail = any(p in error_str for p in (
+                if _is_provider_timeout_error(error_detail):
+                    response = _format_provider_timeout_failure(
+                        provider=str(agent_result.get("provider") or ""),
+                        model=str(agent_result.get("model") or ""),
+                        elapsed=_response_time,
+                        error=error_detail,
+                        fallback_used=bool(agent_result.get("fallback_used")),
+                    )
+                elif any(p in error_str for p in (
                     "context", "token", "too large", "too long",
                     "exceed", "payload",
                 )) or (
                     "400" in error_str
                     and len(history) > 50
-                )
-
-                if _is_ctx_fail:
+                ):
+                    # Detect context-overflow failures and give specific guidance.
+                    # Generic 400 "Error" from Anthropic with large sessions is the
+                    # most common cause of this (#1630).
                     response = (
                         "⚠️ Session too large for the model's context window.\n"
                         "Use /compact to compress the conversation, or "
@@ -6876,6 +7170,19 @@ class GatewayRunner:
         lines.extend(self._build_inference_status_lines())
 
         return "\n".join(lines)
+
+    async def _handle_runtime_command(self, event: MessageEvent) -> str:
+        """Handle /runtime status in gateway/messaging."""
+        args = (event.get_command_args() or "").strip().lower()
+        if args and args not in {"status", "stat", "show"}:
+            return "Usage: /runtime status"
+        try:
+            from hermes_cli.runtime_status import collect_runtime_status, format_runtime_status
+
+            return format_runtime_status(collect_runtime_status(timeout=3.0)).strip()
+        except Exception as exc:
+            logger.warning("Runtime status command failed: %s", exc, exc_info=True)
+            return f"Runtime status unavailable: {exc}"
 
     def _build_inference_status_lines(self) -> list[str]:
         """Return bounded local inference health lines for /status."""
@@ -8398,6 +8705,7 @@ class GatewayRunner:
                     quiet_mode=True,
                     verbose_logging=False,
                     enabled_toolsets=enabled_toolsets,
+                    request_timeout_seconds=_gateway_model_request_timeout(tool_enabled=bool(enabled_toolsets)),
                     reasoning_config=reasoning_config,
                     service_tier=self._service_tier,
                     request_overrides=turn_route.get("request_overrides"),
@@ -8585,6 +8893,7 @@ class GatewayRunner:
                     quiet_mode=True,
                     verbose_logging=False,
                     enabled_toolsets=[],
+                    request_timeout_seconds=_gateway_model_request_timeout(tool_enabled=False),
                     reasoning_config=reasoning_config,
                     service_tier=self._service_tier,
                     request_overrides=turn_route.get("request_overrides"),
@@ -11687,6 +11996,7 @@ class GatewayRunner:
                     quiet_mode=True,
                     verbose_logging=False,
                     enabled_toolsets=enabled_toolsets,
+                    request_timeout_seconds=_gateway_model_request_timeout(tool_enabled=bool(enabled_toolsets)),
                     ephemeral_system_prompt=combined_ephemeral or None,
                     prefill_messages=self._prefill_messages or None,
                     reasoning_config=reasoning_config,
@@ -12068,6 +12378,8 @@ class GatewayRunner:
                     "input_tokens": _input_toks,
                     "output_tokens": _output_toks,
                     "model": _resolved_model,
+                    "provider": getattr(_agent, "provider", None) if _agent else None,
+                    "fallback_used": bool(getattr(_agent, "_fallback_activated", False)) if _agent else False,
                 }
             
             # Scan tool results for MEDIA:<path> tags that need to be delivered
@@ -12157,6 +12469,8 @@ class GatewayRunner:
                 "input_tokens": _input_toks,
                 "output_tokens": _output_toks,
                 "model": _resolved_model,
+                "provider": getattr(agent, "provider", None) if agent else None,
+                "fallback_used": bool(getattr(agent, "_fallback_activated", False)) if agent else False,
                 "session_id": effective_session_id,
                 "response_previewed": result.get("response_previewed", False),
             }

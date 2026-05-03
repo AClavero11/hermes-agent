@@ -95,10 +95,16 @@ echo "▶ running pytest with $WORKERS workers, hermetic env, in $REPO_ROOT"
 echo "  (TZ=UTC LANG=C.UTF-8 PYTHONHASHSEED=0; all credential env vars unset)"
 
 # -o "addopts=" clears pyproject.toml's `-n auto` so our -n wins.
-exec "$PYTHON" -m pytest \
-  -o "addopts=" \
-  -n "$WORKERS" \
-  --ignore=tests/integration \
-  --ignore=tests/e2e \
-  -m "not integration" \
-  "${ARGS[@]}"
+PYTEST_BASE_ARGS=(
+  -o "addopts="
+  -n "$WORKERS"
+  --ignore=tests/integration
+  --ignore=tests/e2e
+  -m "not integration"
+)
+
+if [ "$#" -gt 0 ]; then
+  exec "$PYTHON" -m pytest "${PYTEST_BASE_ARGS[@]}" "${ARGS[@]}"
+else
+  exec "$PYTHON" -m pytest "${PYTEST_BASE_ARGS[@]}"
+fi

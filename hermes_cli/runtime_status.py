@@ -25,6 +25,7 @@ ENV_SNAPSHOT_KEYS = [
     "AAC_HERMES_DEEPSEEK_PYTHON",
     "AAC_HERMES_DEEPSEEK_HOME",
     "HERMES_HOME",
+    "HERMES_PLANNER_ENV_FILE",
     "HERMES_PLANNER_PROVIDER",
     "HERMES_PLANNER_MODEL",
     "HERMES_EXECUTOR_PROVIDER",
@@ -53,12 +54,14 @@ ENV_SNAPSHOT_KEYS = [
     "OPENAI_API_KEY_PRESENT",
     "GEMINI_API_KEY_PRESENT",
     "GOOGLE_API_KEY_PRESENT",
+    "HERMES_SERVICE_KEY_PRESENT",
 ]
 
 SECRET_PRESENCE_KEYS = {
     "OPENAI_API_KEY": "OPENAI_API_KEY_PRESENT",
     "GEMINI_API_KEY": "GEMINI_API_KEY_PRESENT",
     "GOOGLE_API_KEY": "GOOGLE_API_KEY_PRESENT",
+    "HERMES_SERVICE_KEY": "HERMES_SERVICE_KEY_PRESENT",
 }
 
 
@@ -344,6 +347,24 @@ def _parse_launchd_value(output: str, names: tuple[str, ...]) -> str:
     return ""
 
 
+def _parse_launchd_environment(output: str) -> dict[str, str]:
+    env: dict[str, str] = {}
+    in_block = False
+    for raw_line in output.splitlines():
+        line = raw_line.rstrip()
+        stripped = line.strip()
+        if stripped == "environment = {":
+            in_block = True
+            continue
+        if in_block and stripped == "}":
+            break
+        if not in_block or "=>" not in stripped:
+            continue
+        key, value = stripped.split("=>", 1)
+        env[key.strip()] = value.strip().strip('"')
+    return env
+
+
 def _launchd_snapshot(label: str, *, timeout: float) -> dict[str, Any]:
     target = f"gui/{os.getuid()}/{label}"
     result = _run(["launchctl", "print", target], timeout=timeout)
@@ -361,10 +382,33 @@ def _launchd_snapshot(label: str, *, timeout: float) -> dict[str, Any]:
         "pid": pid,
         "state": state,
         "working_directory": cwd,
+        "environment": _parse_launchd_environment(output),
     }
     if not result["ok"]:
         snapshot["error"] = (result["stderr"] or result["stdout"] or "launchctl unavailable")[-1000:]
     return snapshot
+
+
+def _env_file_has_secret(path_value: str, secret_name: str) -> bool:
+    path_value = str(path_value or "").strip()
+    if not path_value:
+        return False
+    path = Path(path_value).expanduser()
+    try:
+        lines = path.read_text(encoding="utf-8").splitlines()
+    except OSError:
+        return False
+    pattern = re.compile(rf"^(?:export\s+)?{re.escape(secret_name)}\s*=\s*(.*)$")
+    for line in lines:
+        stripped = line.strip()
+        if not stripped or stripped.startswith("#"):
+            continue
+        match = pattern.match(stripped)
+        if not match:
+            continue
+        value = match.group(1).strip().strip('"').strip("'")
+        return bool(value)
+    return False
 
 
 def _normalize_health_url(health_url: str | None) -> str:
@@ -372,7 +416,7 @@ def _normalize_health_url(health_url: str | None) -> str:
         health_url
         or os.getenv("HERMES_RUNTIME_HEALTH_URL")
         or os.getenv("HERMES_CANARY_GATEWAY_URL")
-        or "http://127.0.0.1:8643"
+        or "http://127.0.0.1:8642"
     ).strip()
     if not value:
         return ""
@@ -475,6 +519,56 @@ def _gateway_state_snapshot(hermes_home: Path) -> dict[str, Any]:
     return {"ok": False, "error": "no gateway state file found"}
 
 
+def _goal_snapshot(hermes_home: Path) -> dict[str, Any]:
+    path = hermes_home / "goals.json"
+    try:
+        data = json.loads(path.read_text(encoding="utf-8"))
+    except FileNotFoundError:
+        return {"ok": True, "path": str(path), "active_count": 0}
+    except (OSError, json.JSONDecodeError) as exc:
+        return {"ok": False, "path": str(path), "error": str(exc)}
+    if not isinstance(data, dict):
+        return {"ok": False, "path": str(path), "error": "goal store is not an object"}
+    active = [
+        item for item in data.values()
+        if isinstance(item, dict)
+        and item.get("active", True)
+        and not item.get("paused", False)
+        and str(item.get("status") or "running") == "running"
+    ]
+    return {
+        "ok": True,
+        "path": str(path),
+        "active_count": len(active),
+        "total_count": len(data),
+    }
+
+
+def _workspace_snapshot(hermes_home: Path) -> dict[str, Any]:
+    path = Path(os.getenv("HERMES_WORKSPACE_STORE", "") or hermes_home / "workspace" / "control_plane.json")
+    try:
+        data = json.loads(path.read_text(encoding="utf-8"))
+    except FileNotFoundError:
+        return {"ok": True, "path": str(path), "task_count": 0, "active_task_count": 0}
+    except (OSError, json.JSONDecodeError) as exc:
+        return {"ok": False, "path": str(path), "error": str(exc)}
+    if not isinstance(data, dict):
+        return {"ok": False, "path": str(path), "error": "workspace store is not an object"}
+    tasks = data.get("tasks", {})
+    task_values = list(tasks.values()) if isinstance(tasks, dict) else []
+    active = [
+        task for task in task_values
+        if isinstance(task, dict)
+        and str(task.get("status") or "open") in {"open", "pending", "in_progress", "blocked"}
+    ]
+    return {
+        "ok": True,
+        "path": str(path),
+        "task_count": len(task_values),
+        "active_task_count": len(active),
+    }
+
+
 def collect_runtime_status(
     *,
     env_wrapper: Path | None = None,
@@ -523,18 +617,21 @@ def collect_runtime_status(
     )
     model_routes = resolve_model_routes(env)
     normalized_health_url = _normalize_health_url(health_url)
+    service_key_present = str(env.get("HERMES_SERVICE_KEY_PRESENT") or "").lower() in {"1", "true", "yes", "on"}
     runtime_repo = Path(str(selected_repo)).expanduser() if selected_repo else repo_root
     label = (
         launchd_label
         or os.getenv("HERMES_RUNTIME_LAUNCHD_LABEL")
         or "ai.hermes.deepseek-gateway"
     )
+    launchd = _launchd_snapshot(label, timeout=timeout)
+    launchd_env = launchd.get("environment", {}) if isinstance(launchd, dict) else {}
     return {
         "collected_at": time.time(),
         "host": platform.node(),
         "hermes_home": str(hermes_home),
         "repo_root": str(repo_root),
-        "launchd": _launchd_snapshot(label, timeout=timeout),
+        "launchd": launchd,
         "wrapper": {
             "path": str(wrapper_path) if wrapper_path else "",
             "exists": bool(wrapper_path),
@@ -561,12 +658,34 @@ def collect_runtime_status(
             "synthesizer_model": str(env.get("HERMES_SYNTHESIZER_MODEL", "")),
             "routing": model_routes,
         },
-        "health": _health_probe(normalized_health_url, timeout=timeout),
+        "health": (
+            _health_probe(normalized_health_url, timeout=timeout)
+            if (
+                service_key_present
+                or bool(os.getenv("HERMES_SERVICE_KEY", "").strip())
+                or _env_file_has_secret(
+                    str(
+                        env.get("HERMES_PLANNER_ENV_FILE")
+                        or os.getenv("HERMES_PLANNER_ENV_FILE", "")
+                        or launchd_env.get("HERMES_PLANNER_ENV_FILE", "")
+                    ),
+                    "HERMES_SERVICE_KEY",
+                )
+            )
+            else {
+                "ok": False,
+                "skipped": True,
+                "url": normalized_health_url,
+                "error": "HERMES_SERVICE_KEY missing; HTTP API server is skipped",
+            }
+        ),
         "git": {
             "repo_root": _git_info(repo_root, timeout=timeout),
             "runtime_repo": _git_info(runtime_repo, timeout=timeout),
         },
         "state": _gateway_state_snapshot(hermes_home),
+        "goals": _goal_snapshot(hermes_home),
+        "workspace": _workspace_snapshot(hermes_home),
     }
 
 
@@ -586,6 +705,8 @@ def format_runtime_status(status: dict[str, Any]) -> str:
     repo_git = git.get("repo_root", {}) if isinstance(git, dict) else {}
     runtime_git = git.get("runtime_repo", {}) if isinstance(git, dict) else {}
     state = status.get("state", {})
+    goals = status.get("goals", {})
+    workspace = status.get("workspace", {})
     route = " -> ".join(
         part
         for part in (
@@ -622,6 +743,8 @@ def format_runtime_status(status: dict[str, Any]) -> str:
         f"repo git: {repo_git.get('short_sha', '') or 'unknown'} branch={repo_git.get('branch', '') or 'unknown'} dirty={repo_git.get('dirty', '')}",
         f"runtime git: {runtime_git.get('short_sha', '') or 'unknown'} branch={runtime_git.get('branch', '') or 'unknown'} dirty={runtime_git.get('dirty', '')}",
         f"gateway state: {state.get('path', '') or 'not found'} active_agents={state.get('active_agents_count', 0)}",
+        f"goals: active={goals.get('active_count', 0)} total={goals.get('total_count', 0)}",
+        f"workspace: active_tasks={workspace.get('active_task_count', 0)} total_tasks={workspace.get('task_count', 0)}",
     ]
     if launchd.get("error"):
         lines.append(f"launchd error: {launchd['error']}")
