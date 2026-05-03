@@ -897,6 +897,14 @@ def _resolve_api_key(options: CanaryOptions) -> tuple[str, str]:
     return "", ""
 
 
+def _gateway_url_is_loopback(url: str) -> bool:
+    try:
+        host = urllib.parse.urlparse(url).hostname or ""
+    except Exception:
+        return False
+    return host in {"localhost", "127.0.0.1", "::1"}
+
+
 def _extract_response_text(data: dict[str, Any] | None) -> str:
     if not isinstance(data, dict):
         return ""
@@ -1181,7 +1189,7 @@ def _canary_live_behavior(options: CanaryOptions) -> CanaryResult:
             "No gateway URL configured",
         )
     api_key, api_key_source = _resolve_api_key(options)
-    if not api_key:
+    if not api_key and not _gateway_url_is_loopback(base):
         return _result(
             "live.behavior_golden",
             FAIL if options.require_live else SKIP,
@@ -1190,6 +1198,8 @@ def _canary_live_behavior(options: CanaryOptions) -> CanaryResult:
             "No API key available for /v1/responses",
             {"api_key_present": False},
         )
+    if not api_key:
+        api_key_source = "loopback_unauthenticated"
 
     cases = [
         {
@@ -1237,8 +1247,9 @@ def _canary_live_behavior(options: CanaryOptions) -> CanaryResult:
         20,
         f"{len(passed)}/{len(cases)} live LLM behavior goldens passed",
         {
-            "api_key_present": True,
+            "api_key_present": bool(api_key),
             "api_key_source": api_key_source,
+            "loopback_unauthenticated": api_key_source == "loopback_unauthenticated",
             "passed": passed,
             "failed": failed,
             "url": url,
