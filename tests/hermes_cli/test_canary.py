@@ -286,8 +286,13 @@ def _quality_foundation_results() -> list[CanaryResult]:
     return [
         CanaryResult("contract.behavior_goldens", PASS, 20, 20, "behavior goldens passed"),
         CanaryResult("live.behavior_golden", PASS, 20, 20, "live behavior passed"),
+        CanaryResult("live.gateway_health", PASS, 15, 15, "gateway health passed"),
         CanaryResult("contract.scorecard_trend", PASS, 10, 10, "trend installed"),
         CanaryResult("contract.aac_workflows", PASS, 15, 15, "AAC workflows passed"),
+        CanaryResult("contract.x_scrape", PASS, 10, 10, "X scrape contract passed"),
+        CanaryResult("contract.workspace_store", PASS, 10, 10, "Workspace store passed"),
+        CanaryResult("contract.goal_workspace", PASS, 15, 15, "Goal workspace passed"),
+        CanaryResult("contract.operator_safety", PASS, 10, 10, "Operator safety passed"),
         CanaryResult("contract.planner_self_heal", PASS, 20, 20, "planner self-heal passed"),
         CanaryResult(
             "runtime.model_route",
@@ -299,6 +304,7 @@ def _quality_foundation_results() -> list[CanaryResult]:
         CanaryResult("eval.hermes_reasoning", PASS, 30, 30, "full Hermes reasoning passed"),
         CanaryResult("eval.frontier_wrapper", PASS, 20, 20, "frontier wrapper passed"),
         CanaryResult("live.telegram_e2e", PASS, 20, 20, "Telegram E2E passed"),
+        CanaryResult("live.telegram_visible_delivery", PASS, 20, 20, "Visible Telegram delivery passed"),
     ]
 
 
@@ -495,6 +501,43 @@ def test_quality_score_does_not_skip_foundation_for_business_gates():
     assert summary["score"] < 9.0
 
 
+def test_quality_score_caps_without_visible_telegram_delivery():
+    now = 1_700_000_000.0
+    report = CanaryReport(
+        started_at=now,
+        finished_at=now + 1,
+        fail_under=80.0,
+        results=[
+            *[
+                result
+                for result in _quality_foundation_results()
+                if result.name != "live.telegram_visible_delivery"
+            ],
+            CanaryResult("contract.quote_ops_runtime", PASS, 20, 20, "quote ops runtime passed"),
+            CanaryResult(
+                "live.rfq_dry_run_quote_package",
+                PASS,
+                25,
+                25,
+                "live RFQ dry-run package passed",
+            ),
+            CanaryResult(
+                "live.approved_rfq_draft_quote",
+                PASS,
+                30,
+                30,
+                "approved RFQ draft package passed",
+            ),
+        ],
+    )
+
+    summary = quality_summary(report)
+
+    assert summary["score"] <= 8.9
+    assert summary["caps"][0]["reason"] == "human-visible Telegram delivery is not currently proven"
+    assert next(item for item in summary["increments"] if item["target"] == "9.0/10")["status"] == "open"
+
+
 def test_frontier_wrapper_falls_back_to_gemini(monkeypatch, tmp_path):
     options = CanaryOptions(
         repo_root=Path(__file__).resolve().parents[2],
@@ -530,6 +573,44 @@ def test_frontier_wrapper_falls_back_to_gemini(monkeypatch, tmp_path):
     assert result.status == PASS
     assert result.details["provider"] == "gemini"
     assert [attempt["provider"] for attempt in result.details["attempts"]] == ["openai", "gemini"]
+
+
+def test_gemini_frontier_probe_retries_after_timeout(monkeypatch, tmp_path):
+    options = CanaryOptions(
+        repo_root=Path(__file__).resolve().parents[2],
+        hermes_home=tmp_path,
+        gateway_url="",
+        env_wrapper=None,
+        frontier_eval=True,
+        require_live=True,
+        timeout=0.2,
+    )
+    monkeypatch.setenv("GEMINI_API_KEY", "test-key")
+    monkeypatch.setattr(canary_module, "_gemini_model_candidates", lambda: ["gemini-2.5-pro", "gemini-2.5-flash"])
+
+    def fake_model_probe(*, model, **_kwargs):
+        if model == "gemini-2.5-pro":
+            return {
+                "provider": "gemini",
+                "model": model,
+                "ok": False,
+                "error_type": "TimeoutError",
+                "summary": "Gemini frontier probe failed: TimeoutError",
+            }
+        return {
+            "provider": "gemini",
+            "model": model,
+            "ok": True,
+            "summary": "gemini-2.5-flash Gemini wrapper passed structured reasoning probe in 1000ms",
+        }
+
+    monkeypatch.setattr(canary_module, "_run_gemini_model_probe", fake_model_probe)
+
+    result = canary_module._run_gemini_frontier_probe(options)
+
+    assert result["ok"] is True
+    assert result["model"] == "gemini-2.5-flash"
+    assert [attempt["model"] for attempt in result["model_attempts"]] == ["gemini-2.5-pro", "gemini-2.5-flash"]
 
 
 def test_telegram_e2e_accepts_signed_webhook_simulation_evidence(tmp_path):

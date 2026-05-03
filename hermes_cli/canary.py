@@ -1824,7 +1824,12 @@ def _run_gemini_frontier_probe(options: CanaryOptions) -> dict[str, Any]:
             successful_attempt = dict(attempt)
             successful_attempt["model_attempts"] = [dict(item) for item in model_attempts]
             return successful_attempt
-        if int(attempt.get("status") or 0) not in {429, 500, 502, 503, 504}:
+        retryable_error = str(attempt.get("error_type") or "") in {
+            "TimeoutError",
+            "ConnectionError",
+            "URLError",
+        }
+        if int(attempt.get("status") or 0) not in {429, 500, 502, 503, 504} and not retryable_error:
             break
     final_attempt = dict(model_attempts[-1] if model_attempts else {})
     final_attempt["model_attempts"] = model_attempts
@@ -4206,6 +4211,14 @@ def quality_summary(report: CanaryReport) -> dict[str, Any]:
         result = _result_by_name(report, name)
         return bool(result and result.status == PASS)
 
+    def result_status(name: str) -> str:
+        result = _result_by_name(report, name)
+        return result.status if result else FAIL
+
+    def result_summary(name: str) -> str:
+        result = _result_by_name(report, name)
+        return result.summary if result else "missing result"
+
     model_result = _result_by_name(report, "runtime.model_route")
     local_deepseek_done = bool(
         model_result
@@ -4223,6 +4236,7 @@ def quality_summary(report: CanaryReport) -> dict[str, Any]:
         and passed("eval.hermes_reasoning")
         and passed("eval.frontier_wrapper")
         and passed("live.telegram_e2e")
+        and passed("live.telegram_visible_delivery")
     )
     quote_ops_done = foundation_done and passed("contract.quote_ops_runtime")
     rfq_dry_run_done = quote_ops_done and passed("live.rfq_dry_run_quote_package")
@@ -4281,11 +4295,32 @@ def quality_summary(report: CanaryReport) -> dict[str, Any]:
         if item["status"] == "done"
     ]
     score = round(max([raw_score, *completed_targets]), 1)
+    score_caps: list[dict[str, Any]] = []
+    if result_status("live.telegram_visible_delivery") != PASS:
+        score_caps.append(
+            {
+                "cap": 8.9,
+                "reason": "human-visible Telegram delivery is not currently proven",
+                "evidence": result_summary("live.telegram_visible_delivery"),
+            }
+        )
+    readiness = readiness_summary(report)
+    if readiness.get("status") != "frontier_ready":
+        score_caps.append(
+            {
+                "cap": 8.9,
+                "reason": "frontier readiness has open gates",
+                "evidence": readiness.get("open_gates", []),
+            }
+        )
+    if score_caps:
+        score = round(min(score, *(float(item["cap"]) for item in score_caps)), 1)
     return {
         "score": score,
         "target": 9.0,
         "dimensions": [asdict(item) for item in dimensions],
         "increments": increments,
+        "caps": score_caps,
     }
 
 

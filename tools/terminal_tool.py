@@ -211,6 +211,21 @@ def _check_all_guards(command: str, env_type: str) -> dict:
 # dot, hyphen, underscore, space, plus, at, equals, and comma.  Everything
 # else is rejected.
 _WORKDIR_SAFE_RE = re.compile(r'^[A-Za-z0-9/\\:_\-.~ +@=,]+$')
+_BARE_FILE_COMMAND_EXTENSIONS = {
+    ".csv",
+    ".env",
+    ".html",
+    ".ini",
+    ".json",
+    ".log",
+    ".md",
+    ".pdf",
+    ".toml",
+    ".txt",
+    ".xml",
+    ".yaml",
+    ".yml",
+}
 
 
 def _validate_workdir(workdir: str) -> str | None:
@@ -233,6 +248,31 @@ def _validate_workdir(workdir: str) -> str | None:
                 )
         return "Blocked: workdir contains disallowed characters."
     return None
+
+
+def _bare_file_command_error(command: str) -> str | None:
+    """Reject file/path strings accidentally sent to the terminal as commands."""
+    candidate = (command or "").strip()
+    if not candidate:
+        return None
+    if "\n" in candidate or re.search(r"\s", candidate):
+        return None
+    if re.search(r"[;&|`$<>*?()[\]{}]", candidate):
+        return None
+    if len(candidate) >= 2 and candidate[0] == candidate[-1] and candidate[0] in {"'", '"'}:
+        candidate = candidate[1:-1].strip()
+    if not candidate or candidate.endswith(("/", "\\")):
+        return None
+
+    suffix = Path(candidate).suffix.lower()
+    if suffix not in _BARE_FILE_COMMAND_EXTENSIONS:
+        return None
+
+    return (
+        f"Blocked: `{candidate}` looks like a file path, not a shell command. "
+        "Use the file/read-file tool to inspect it, or run an explicit command "
+        f"such as `cat {candidate}` if terminal output is required."
+    )
 
 
 def _handle_sudo_failure(output: str, env_type: str) -> str:
@@ -1439,6 +1479,16 @@ def terminal_tool(
                 "output": "",
                 "exit_code": -1,
                 "error": f"Invalid command: expected string, got {type(command).__name__}",
+                "status": "error",
+            }, ensure_ascii=False)
+
+        bare_file_error = _bare_file_command_error(command)
+        if bare_file_error:
+            logger.info("Rejected bare file/path terminal command: %s", command)
+            return json.dumps({
+                "output": "",
+                "exit_code": -1,
+                "error": bare_file_error,
                 "status": "error",
             }, ensure_ascii=False)
 
