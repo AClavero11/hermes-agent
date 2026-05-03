@@ -7,10 +7,10 @@ Inspection basis: live Studio runtime, local source repo, launchd state, listene
 | Score type | Score | Meaning |
 |---|---:|---|
 | Measured canary readiness | 9.7/10 | Latest full Studio canary is `365/365 (100.0%)`, `frontier_ready 9/9`; current deploy SHA is recorded in `latest.json` |
-| Operational condition | 8.4/10 | Serviceable for guarded operator work; not yet overhauled for fully autonomous business operation |
+| Operational condition | 8.6/10 | Studio-only runtime now enforced locally; still not overhauled for fully autonomous business operation |
 | Business automation ceiling today | 9.7/10 | Can prepare guarded RFQ/quote packages; cannot yet perform approved customer-send + audit/follow-up loop |
 
-Current condition: serviceable with discrepancies.
+Current condition: serviceable with discrepancies. Production runtime is Studio-only; the MacBook is source/deploy/control, not an active Hermes runtime.
 
 ## Verified Evidence
 
@@ -24,6 +24,7 @@ Current condition: serviceable with discrepancies.
 | Frontier wrapper | Gemini `gemini-2.5-pro` structured probe passed; OpenAI quota remains separate |
 | Telegram webhook | Telegram API reports webhook URL `https://hermes.advanced.aero/telegram`, pending updates `0`, no last error |
 | Quote PDF server | `http://127.0.0.1:8699/health` returns OK |
+| Local MacBook runtime | Local `ai.hermes.deepseek-gateway`, legacy `ai.hermes.gateway`, and local LiteLLM are disabled; no local `8443/8642/8643` runtime listener is expected |
 | Focused tests | `176 passed`, `120 warnings` |
 | Compile/shell checks | `py_compile` and `bash -n` pass |
 | Secret scan | No live token/key pattern found in tracked repo or AAC service files; hits were test/docs placeholders |
@@ -41,7 +42,7 @@ Current condition: serviceable with discrepancies.
 | Quote/RFQ ops | 8.2 | Guarded serviceable | Quote ops runtime `8/8`; RFQ dry-run `14/14`; approved draft `13/13`; QAMFORM preview works | Still guarded payload mode: no production V11/Atlas write and no customer-facing send |
 | Safety/security | 8.6 | Serviceable | Approval bot customer-send blocked; external sends guarded; secret scan clean | General email platform still exists and needs policy-level routing audit before 10.0 customer-send automation |
 | Observability/logs | 7.6 | Marginal serviceable | Logs and scorecards exist; latest scorecard clean | Logs are noisy and partly unstructured; no alerting dashboard; no launchd-fired daily log yet |
-| Deployment/config drift | 7.4 | Needs overhaul | Deploy script writes runtime metadata; Studio clean | Local MacBook launchd/runtime is stale: `8643` refused locally, state file points to old `feishu` pytest process, only local `8443` listens |
+| Deployment/config drift | 8.2 | Serviceable with remaining discrepancy | Deploy script writes runtime metadata; Studio clean; local gateway/LiteLLM disabled | `8642` decision and launchd-fired canary proof still need closure |
 | Code health/tests | 8.0 | Serviceable | Targeted tests pass | Scoped ruff finds existing F401/F841 issues in `gateway/run.py` and older gateway tests; warnings are high |
 | Alexandria/memory continuity | 8.4 | Serviceable | Hermes context, patterns, corrections updated | Needs a single active runtime truth table that reconciles Studio/local/Alexandria docs automatically |
 
@@ -49,7 +50,7 @@ Current condition: serviceable with discrepancies.
 
 | Finding | Severity | Evidence | Required action |
 |---|---|---|---|
-| Local MacBook Hermes runtime drift | High | Local launchd says running, but `8643` health refused; state file shows stale pytest `feishu` process from 2026-04-27 | Either disable local gateway or make it a real mirror with clean state, health, and same scorecard contract |
+| Local MacBook Hermes runtime drift | Closed | Local launchd had stale gateway/LiteLLM state | Local `ai.hermes.deepseek-gateway`, legacy `ai.hermes.gateway`, and local LiteLLM disabled; stale `.hermes/gateway_state.json` archived |
 | `8642` API surface drift | Medium | Studio `8642/health` connection refused while older context describes `8642` as org health | Decide: restore `8642` or delete stale docs/tests/context references |
 | Daily canary launchd not yet proven by launchd | Medium | `ai.hermes.deepseek-canary` installed but `runs = 0`; latest report was manual scheduled-path run | Trigger one launchd run or wait for 06:20, then verify stdout/stderr logs and history entry |
 | Business loop stops before customer send | Medium | Latest 9.7 canary explicitly uses `write_mode=guarded_payload_only` | Build 10.0 approved-send workflow with audit proof, V11/Atlas write proof, follow-up, and rollback evidence |
@@ -60,7 +61,7 @@ Current condition: serviceable with discrepancies.
 
 | Priority | Package | Acceptance criteria |
 |---|---|---|
-| P0 | Runtime drift overhaul | One authoritative Studio runtime, one rollback, local gateway disabled or healthy mirror, no stale state files, `8642` decision closed |
+| P0 | Runtime drift overhaul | One authoritative Studio runtime and local gateway disabled are done; remaining acceptance is `8642` decision closed and launchd-fired canary proof captured |
 | P0 | Scheduled canary proof | Launchd-triggered daily canary produces logs and latest report without manual invocation |
 | P1 | Model routing overhaul | Explicit planner/executor/judge/synthesizer routes; local DeepSeek for bounded work, frontier/judge for ambiguous business decisions, deterministic calculator/verifier for numeric work |
 | P1 | 10.0 business-send gate | Approved quote can create production draft/write, send customer email only after approval, write audit artifact, schedule follow-up, and surface exceptions |
@@ -74,4 +75,4 @@ Hermes is currently fit for guarded internal operator workflows and RFQ/quote pa
 
 Hermes is not yet fit for unattended customer-facing operation because the customer-send/audit/follow-up loop is intentionally not built, and runtime drift remains between Studio and local.
 
-Next overhaul step: close P0 runtime drift first, then build the 10.0 approved-send gate.
+Next overhaul step: close the remaining P0 items (`8642` decision and launchd-fired canary proof), then build the 10.0 approved-send gate.
