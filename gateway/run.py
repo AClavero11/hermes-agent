@@ -1001,6 +1001,47 @@ def _build_hermes_direct_answer(message: str) -> str:
     return ""
 
 
+def _classify_malformed_hermes_response(response: str) -> str:
+    """Detect model outputs that should never be delivered in Hermes operator mode."""
+    text = (response or "").strip()
+    if not text:
+        return ""
+
+    lowered = text.lower()
+    quote_refusal = (
+        "i'm sorry, but i cannot provide a quote for this request. "
+        "please contact me if you have any other questions."
+    )
+    if lowered.count(quote_refusal) >= 3:
+        return "repeated quote refusal loop"
+
+    command_refusal_terms = (
+        "i cannot execute commands on your system",
+        "i cannot execute shell commands",
+        "i'm a text-based ai",
+        "terminal tool is not available",
+    )
+    if any(term in lowered for term in command_refusal_terms):
+        if "custom:office-deepseek-v4" in lowered:
+            return "provider alias treated as a shell command"
+        if "notification_rules.md" in lowered:
+            return "file path treated as a terminal command"
+        return "bogus command/file capability refusal"
+
+    return ""
+
+
+def _build_malformed_hermes_recovery(reason: str) -> str:
+    return (
+        "Blocked malformed Hermes model output.\n"
+        f"Reason: {reason}.\n\n"
+        "I reset this Telegram session so stale continuation history cannot keep "
+        "dumping bad refusals into the chat.\n\n"
+        "Use `what can we do` for the operator menu, or reply with one of: "
+        "`rfq`, `inventory`, `followups`, `hermes`."
+    )
+
+
 _FAST_RECEIPT_SKIP_NORMALIZED = {
     "ack",
     "acknowledged",
@@ -5770,6 +5811,35 @@ class GatewayRunner:
                     "rephrase your question."
                 )
             agent_messages = agent_result.get("messages", [])
+            malformed_reason = ""
+            if source.platform == Platform.TELEGRAM:
+                malformed_reason = _classify_malformed_hermes_response(response)
+            if malformed_reason:
+                logger.warning(
+                    "Blocking malformed Telegram response for session %s: %s",
+                    session_key[:20] if session_key else "?",
+                    malformed_reason,
+                )
+                response = _build_malformed_hermes_recovery(malformed_reason)
+                agent_result["failed"] = True
+                agent_result["malformed_response_blocked"] = True
+                agent_result["malformed_response_reason"] = malformed_reason
+                agent_result["messages"] = history
+                agent_messages = history
+                if session_key:
+                    try:
+                        new_entry = self.session_store.reset_session(session_key)
+                        if new_entry:
+                            session_entry = new_entry
+                    except Exception as exc:
+                        logger.warning(
+                            "Failed to reset malformed Telegram session %s: %s",
+                            session_key[:20],
+                            exc,
+                        )
+                    self._evict_cached_agent(session_key)
+                    self._session_model_overrides.pop(session_key, None)
+                    self._clear_session_boundary_security_state(session_key)
             _response_time = time.time() - _msg_start_time
             _api_calls = agent_result.get("api_calls", 0)
             _resp_len = len(response)

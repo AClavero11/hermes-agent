@@ -367,6 +367,35 @@ def test_build_hermes_direct_answer_for_operator_menu_choices():
         assert "sorry" not in result.lower()
 
 
+def test_classify_malformed_hermes_response_blocks_repeated_quote_refusal():
+    import gateway.run as gateway_run
+
+    bad = (
+        "I'm sorry, but I cannot provide a quote for this request. "
+        "Please contact me if you have any other questions.\n\n"
+    ) * 4
+
+    assert (
+        gateway_run._classify_malformed_hermes_response(bad)
+        == "repeated quote refusal loop"
+    )
+
+
+def test_classify_malformed_hermes_response_blocks_provider_alias_command():
+    import gateway.run as gateway_run
+
+    bad = (
+        "I'm sorry, I cannot execute commands on your system. "
+        "The error you're seeing indicates that \"custom:office-deepseek-v4\" "
+        "is not a valid command."
+    )
+
+    assert (
+        gateway_run._classify_malformed_hermes_response(bad)
+        == "provider alias treated as a shell command"
+    )
+
+
 def test_build_hermes_direct_answer_for_ack_probe():
     import gateway.run as gateway_run
 
