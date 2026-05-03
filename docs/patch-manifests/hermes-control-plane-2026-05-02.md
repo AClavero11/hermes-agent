@@ -28,6 +28,7 @@ These files define the reproducible Hermes control-plane patch stack:
 | `tools/x_scraper_tool.py` | X/Twitter source retrieval tool |
 | `tests/gateway/test_api_server.py` | API behavior coverage |
 | `tests/gateway/test_status_command.py` | Status/direct answer coverage |
+| `tests/gateway/test_telegram_e2e_ack.py` | Visible Telegram ack matching coverage |
 | `tests/hermes_cli/test_canary.py` | Canary harness coverage |
 | `tests/tools/test_x_scraper_tool.py` | X scraper tool coverage |
 | `docs/AAC_LOCAL_DEEPSEEK.md` | Local DeepSeek operating notes |
@@ -68,9 +69,9 @@ The deploy script syncs the repo patch stack to both active Studio checkouts:
 Run these after applying the manifest:
 
 ```bash
-python -m py_compile hermes_cli/runtime_status.py hermes_cli/main.py hermes_cli/commands.py hermes_cli/canary.py
+python -m py_compile hermes_cli/runtime_status.py hermes_cli/main.py hermes_cli/commands.py hermes_cli/canary.py gateway/platforms/telegram.py
 bash -n scripts/deploy-hermes-control-plane.sh
-pytest -o addopts='' tests/hermes_cli/test_canary.py tests/gateway/test_api_server.py tests/gateway/test_status_command.py
+pytest -o addopts='' tests/hermes_cli/test_canary.py tests/gateway/test_api_server.py tests/gateway/test_status_command.py tests/gateway/test_telegram_e2e_ack.py
 hermes runtime status --json
 hermes canary --require-live --live-behavior --reasoning-eval --frontier-eval --json
 ```
@@ -78,3 +79,4 @@ hermes canary --require-live --live-behavior --reasoning-eval --frontier-eval --
 Every canary JSON/Markdown report now records a `runtime` object with the runtime repo SHA and wrapper-selected repo.
 For rsync-only Studio trees without `.git`, the deploy script writes `.hermes-runtime-version.json` so `hermes runtime status` and canary reports still record the source SHA.
 The daily canary runs `--telegram-webhook-sim` so the Telegram gate can be exercised through the signed webhook path without requiring a visible DM for every scheduled run.
+Manual visible-delivery probes use `--telegram-visible-probe`; a same-chat exact nonce ack is recorded as `ack_match=exact`, while a same-chat plain `ack` after the pending visible probe is recorded as `ack_match=loose`.

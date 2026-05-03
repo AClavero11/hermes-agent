@@ -35,6 +35,7 @@ REPO_FILES=(
   tools/x_scraper_tool.py
   tests/gateway/test_api_server.py
   tests/gateway/test_status_command.py
+  tests/gateway/test_telegram_e2e_ack.py
   tests/hermes_cli/test_canary.py
   tests/tools/test_x_scraper_tool.py
   docs/AAC_LOCAL_DEEPSEEK.md

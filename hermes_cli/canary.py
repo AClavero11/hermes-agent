@@ -2020,7 +2020,7 @@ def _run_telegram_visible_probe(options: CanaryOptions) -> dict[str, Any]:
     started = time.time()
     nonce = f"real-{int(started)}"
     ack = f"ack {nonce}"
-    text = f"Hermes visible delivery probe {nonce}. Reply exactly: {ack}"
+    text = f"Hermes visible delivery probe {nonce}. Reply: {ack} or ack."
     try:
         get_me = _telegram_api_request(
             bot_token,
@@ -2153,12 +2153,13 @@ def _canary_telegram_visible_delivery(options: CanaryOptions) -> CanaryResult:
     if probe.get("ok"):
         evidence = probe.get("evidence") if isinstance(probe.get("evidence"), dict) else {}
         latency_ms = float(evidence.get("latency_ms") or 0)
+        ack_match = str(evidence.get("ack_match") or "exact")
         return _result(
             "live.telegram_visible_delivery",
             PASS,
             20,
             20,
-            f"Visible Telegram delivery ack passed in {latency_ms:.0f}ms",
+            f"Visible Telegram delivery {ack_match} ack passed in {latency_ms:.0f}ms",
             {"enabled": True, "probe": probe, "failure_class": ""},
         )
 

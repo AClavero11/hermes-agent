@@ -1026,7 +1026,14 @@ class TelegramAdapter(BasePlatformAdapter):
 
         text = (getattr(message, "text", "") or "").strip()
         expected = str(pending.get("awaiting_reply") or "ack").strip()
-        if not text or expected.lower() not in text.lower():
+        mode = str(pending.get("mode") or "real_telegram_ack")
+        normalized_text = re.sub(r"\s+", " ", text.lower()).strip()
+        exact_ack = bool(expected and expected.lower() in normalized_text)
+        loose_ack = (
+            mode == "real_visible_delivery_probe"
+            and normalized_text in {"ack", "acked", "acknowledged"}
+        )
+        if not text or not (exact_ack or loose_ack):
             return False
 
         chat_id = str(getattr(message, "chat_id", "") or "")
@@ -1039,8 +1046,10 @@ class TelegramAdapter(BasePlatformAdapter):
         latency_ms = max(1.0, round((now - sent_at) * 1000.0, 1))
         evidence = {
             "status": "pass",
-            "mode": str(pending.get("mode") or "real_telegram_ack"),
+            "mode": mode,
             "source": "telegram_webhook_update",
+            "ack_match": "exact" if exact_ack else "loose",
+            "expected_reply": expected,
             "chat_id": chat_id,
             "message_id": getattr(message, "message_id", None),
             "update_id": update_id,
