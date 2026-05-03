@@ -996,36 +996,35 @@ def _reasoning_eval_cases(
             {
                 "name": "multi_step_arithmetic_capacity",
                 "input": (
-                    "Calculate exactly. First compute 3*6*4. Then compute 1*6*0.5. "
-                    "Then subtract. Final answer must be on the last line as FINAL: <integer>."
+                    'Return JSON only: {"answer": integer}. '
+                    "Compute (3*6*4) - (1*6*0.5)."
                 ),
                 "expected_final_number": "69",
                 "forbidden": ["sorry", "cannot", "as an ai"],
                 "latency_budget_ms": latency_budget_ms,
-                "max_tokens": 128,
+                "max_tokens": 32,
             },
             {
                 "name": "multi_step_arithmetic_quote_total",
                 "input": (
-                    "Calculate exactly. First compute 5*1200. Then compute 10% of that "
-                    "subtotal. Then subtract the discount. Then add 250. Final answer must "
-                    "be on the last line as FINAL: <integer>."
+                    'Return JSON only: {"answer": integer}. '
+                    "Compute (5*1200) - (10% of (5*1200)) + 250."
                 ),
                 "expected_final_number": "5650",
                 "forbidden": ["sorry", "cannot", "as an ai"],
                 "latency_budget_ms": latency_budget_ms,
-                "max_tokens": 128,
+                "max_tokens": 32,
             },
             {
                 "name": "multi_step_arithmetic_lot_revenue",
                 "input": (
-                    "Calculate exactly. First compute 3*7500. Then compute 2*8250. "
-                    "Then add them. Final answer must be on the last line as FINAL: <integer>."
+                    'Return JSON only: {"answer": integer}. '
+                    "Compute (3*7500) + (2*8250)."
                 ),
                 "expected_final_number": "39000",
                 "forbidden": ["sorry", "cannot", "as an ai"],
                 "latency_budget_ms": latency_budget_ms,
-                "max_tokens": 128,
+                "max_tokens": 32,
             },
         ]
     else:

@@ -262,7 +262,7 @@ def test_score_text_case_accepts_final_numeric_answer():
     assert result["final_number"] == "69"
 
 
-def test_local_reasoning_cases_use_scaffolded_arithmetic():
+def test_local_reasoning_cases_use_structured_arithmetic():
     cases = canary_module._reasoning_eval_cases(
         latency_budget_ms=45_000,
         scaffold_arithmetic=True,
@@ -275,7 +275,8 @@ def test_local_reasoning_cases_use_scaffolded_arithmetic():
         "5650",
         "39000",
     }
-    assert all(case["max_tokens"] >= 128 for case in arithmetic_cases)
+    assert all('Return JSON only: {"answer": integer}' in case["input"] for case in arithmetic_cases)
+    assert all(case["max_tokens"] == 32 for case in arithmetic_cases)
 
 
 def test_quality_score_floor_tracks_completed_increment():
