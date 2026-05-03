@@ -40,6 +40,7 @@ REPO_FILES=(
   tests/gateway/test_telegram_e2e_ack.py
   tests/gateway/test_telegram_operator_latency.py
   tests/hermes_cli/test_canary.py
+  tests/hermes_cli/test_runtime_status.py
   tests/tools/test_x_scraper_tool.py
   docs/AAC_LOCAL_DEEPSEEK.md
   docs/AAC_MIGRATION_v2026.4.23.md
