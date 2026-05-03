@@ -453,22 +453,31 @@ def test_build_hermes_direct_answer_for_release_status(monkeypatch):
     assert "V4 planner is active" in result
 
 
-def test_build_hermes_direct_answer_for_test_probe():
+def test_build_hermes_direct_answer_for_test_probe(monkeypatch):
     import gateway.run as gateway_run
+
+    monkeypatch.setenv("HERMES_PLANNER_PROVIDER", "custom:office-deepseek-v4")
+    monkeypatch.setenv("HERMES_PLANNER_MODEL", "deepseek-v4")
+    monkeypatch.setenv("HERMES_V4_PLANNER_AVAILABLE", "1")
 
     result = gateway_run._build_hermes_direct_answer("Test")
 
     assert result.startswith("Hermes online.")
-    assert "custom:office-deepseek-v4" in result
+    assert "Planner: `custom:office-deepseek-v4:deepseek-v4`" in result
+    assert "Executor: `custom:office-deepseek-v4:deepseek-v4`" in result
     assert "operator mode" in result
 
 
-def test_build_hermes_direct_answer_for_testing_probe():
+def test_build_hermes_direct_answer_for_testing_probe(monkeypatch):
     import gateway.run as gateway_run
+
+    monkeypatch.setenv("HERMES_PLANNER_PROVIDER", "custom:office-deepseek-v4")
+    monkeypatch.setenv("HERMES_PLANNER_MODEL", "deepseek-v4")
 
     result = gateway_run._build_hermes_direct_answer("testing")
 
     assert result.startswith("Hermes online.")
+    assert "Judge:" in result
     assert "operator mode" in result
 
 

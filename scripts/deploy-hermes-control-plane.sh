@@ -29,6 +29,7 @@ REPO_FILES=(
   hermes_cli/commands.py
   hermes_cli/goals.py
   hermes_cli/main.py
+  hermes_cli/model_routes.py
   hermes_cli/runtime_status.py
   hermes_cli/workspace.py
   run_agent.py
@@ -41,6 +42,7 @@ REPO_FILES=(
   tests/gateway/test_telegram_e2e_ack.py
   tests/gateway/test_telegram_operator_latency.py
   tests/hermes_cli/test_canary.py
+  tests/hermes_cli/test_model_routes.py
   tests/hermes_cli/test_runtime_status.py
   tests/tools/test_terminal_bare_file_guard.py
   tests/tools/test_x_scraper_tool.py

@@ -58,4 +58,5 @@ def test_runtime_status_uses_wrapper_exported_home(monkeypatch, tmp_path):
 
     assert status["hermes_home"] == str(runtime_home)
     assert status["state"]["path"] == str(runtime_home / "gateway_state.json")
-
+    assert status["model"]["routing"]["routes"]["planner"]["provider"] == "custom:office-deepseek-v4"
+    assert status["model"]["routing"]["routes"]["planner"]["model"] == "deepseek-v4"

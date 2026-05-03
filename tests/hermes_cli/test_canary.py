@@ -35,6 +35,7 @@ def test_canary_suite_runs_without_live_gateway(tmp_path):
     names = {result.name for result in report.results}
 
     assert "runtime.imports" in names
+    assert "runtime.model_routes" in names
     assert "contract.workspace_store" in names
     assert "contract.goal_workspace" in names
     assert any(
@@ -155,6 +156,44 @@ def test_current_repo_sha_reads_deploy_runtime_version(tmp_path):
     )
 
     assert canary_module._current_repo_sha(tmp_path) == "runtime-sha-123"
+
+
+def test_model_routes_canary_passes_with_verified_frontier(monkeypatch, tmp_path):
+    monkeypatch.setenv("HERMES_PLANNER_PROVIDER", "custom:office-deepseek-v4")
+    monkeypatch.setenv("HERMES_PLANNER_MODEL", "deepseek-v4")
+    monkeypatch.setenv("HERMES_OPENAI_FRONTIER_AVAILABLE", "1")
+    monkeypatch.setenv("OPENAI_FRONTIER_MODEL", "gpt-5.4-mini")
+    options = CanaryOptions(
+        repo_root=Path(__file__).resolve().parents[2],
+        hermes_home=tmp_path,
+        env_wrapper=None,
+        timeout=0.2,
+    )
+
+    result = canary_module._canary_model_routes(options)
+
+    assert result.status == PASS
+    assert "hard_task_planner=custom:openai-frontier:gpt-5.4-mini" in result.summary
+
+
+def test_model_routes_canary_warns_without_frontier(monkeypatch, tmp_path):
+    monkeypatch.setenv("HERMES_PLANNER_PROVIDER", "custom:office-deepseek-v4")
+    monkeypatch.setenv("HERMES_PLANNER_MODEL", "deepseek-v4")
+    monkeypatch.delenv("HERMES_OPENAI_FRONTIER_AVAILABLE", raising=False)
+    monkeypatch.delenv("HERMES_GEMINI_FRONTIER_AVAILABLE", raising=False)
+    monkeypatch.delenv("GEMINI_API_KEY", raising=False)
+    monkeypatch.delenv("GOOGLE_API_KEY", raising=False)
+    options = CanaryOptions(
+        repo_root=Path(__file__).resolve().parents[2],
+        hermes_home=tmp_path,
+        env_wrapper=None,
+        timeout=0.2,
+    )
+
+    result = canary_module._canary_model_routes(options)
+
+    assert result.status == WARN
+    assert "no frontier planner route" in result.summary
 
 
 def test_live_behavior_allows_loopback_without_api_key(monkeypatch, tmp_path):
@@ -349,6 +388,13 @@ def _quality_foundation_results() -> list[CanaryResult]:
             15,
             "custom:office-deepseek-v4 -> mlx-community/deepseek-ai-DeepSeek-V4-Flash-4bit",
         ),
+        CanaryResult(
+            "runtime.model_routes",
+            PASS,
+            20,
+            20,
+            "planner=custom:office-deepseek-v4:deepseek-v4, hard_task_planner=custom:openai-frontier:gpt-5.4-mini",
+        ),
         CanaryResult("eval.hermes_reasoning", PASS, 30, 30, "full Hermes reasoning passed"),
         CanaryResult("eval.frontier_wrapper", PASS, 20, 20, "frontier wrapper passed"),
         CanaryResult("live.telegram_e2e", PASS, 20, 20, "Telegram E2E passed"),
@@ -453,7 +499,7 @@ def test_quality_score_9_requires_telegram_e2e():
     assert summary["increments"][4]["status"] == "open"
     assert readiness["status"] == "not_frontier_ready"
     assert {gate["name"] for gate in readiness["open_gates"]} >= {
-        "local_deepseek_route",
+        "local_deepseek_executor",
         "hermes_reasoning_eval",
         "frontier_wrapper",
         "telegram_e2e",
@@ -648,8 +694,9 @@ def test_telegram_operator_expected_substrings_follow_prompt_choice():
     ]
     assert canary_module._telegram_operator_expected_substrings("testing") == [
         "Hermes online",
-        "V4 planner",
-        "Alexandria/V11",
+        "Planner:",
+        "Executor:",
+        "Judge:",
     ]
     assert canary_module._telegram_operator_expected_substrings("status") == [
         "Hermes Gateway Status",

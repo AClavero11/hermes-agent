@@ -90,6 +90,7 @@ sys.path.insert(0, str(Path(__file__).parent.parent))
 # Resolve Hermes home directory (respects HERMES_HOME override)
 from hermes_constants import get_hermes_home
 from gateway import context_router as alexandria_router
+from hermes_cli.model_routes import format_route_contract, resolve_model_routes, route_label
 from utils import atomic_yaml_write, base_url_host_matches, is_truthy_value
 _hermes_home = get_hermes_home()
 
@@ -798,15 +799,16 @@ def _build_hard_task_planner_prompt(message: str) -> str:
 
     return (
         "[System note: Hard task planner route]\n"
-        "This turn has hard-task or high-risk signals. Treat `custom:office-deepseek-v4` "
-        "as the active local planner and `model_aliases.frontier` as the stronger planner "
-        "route when the runtime reports frontier availability. Use the stronger route for "
-        "architecture decisions, root-cause debugging, production changes, quote/RFQ work, "
-        "and finance/customer-facing decisions when available; otherwise keep the task "
-        "bounded under the active planner and compensate with retrieval, explicit checks, "
-        "and canary verification. Follow `docs/HERMES_SELF_HEAL_PLAYBOOKS.md` if a gateway, "
-        "model, API, Telegram, or canary regression appears. Destructive commands and "
-        "external sends remain approval-gated.\n"
+        "This turn has hard-task or high-risk signals. Use the resolved role route table; "
+        "do not treat provider aliases as shell commands or final answers.\n"
+        f"{format_route_contract()}\n"
+        "Use the hard_task_planner route for architecture decisions, root-cause debugging, "
+        "production changes, quote/RFQ work, and finance/customer-facing decisions. Keep "
+        "tool execution bounded under the executor route, verify math deterministically, "
+        "and use the verifier/synthesizer routes for final operator-facing judgment. "
+        "Follow `docs/HERMES_SELF_HEAL_PLAYBOOKS.md` if a gateway, model, API, Telegram, "
+        "or canary regression appears. Destructive commands and external sends remain "
+        "approval-gated.\n"
         "[End hard task planner route]"
     )
 
@@ -826,9 +828,21 @@ def _build_hermes_direct_answer(message: str) -> str:
     if normalized in {"ack", "acknowledged"}:
         return "Ack received. No task started."
     if normalized in {"test", "testing", "ping"}:
+        policy = resolve_model_routes()
+        routes = policy["routes"]
+        frontier_state = "available" if policy["frontier_available"] else "not configured"
+        if policy["frontier_available"] and not policy["frontier_verified"]:
+            frontier_state = "configured, unverified"
         return (
-            "Hermes online. V4 planner is active via `custom:office-deepseek-v4`; "
-            "Alexandria/V11 grounding is enabled; AC Telegram DM is operator mode with file/terminal/code/delegation/web tools."
+            "Hermes online. AC Telegram DM is operator mode.\n"
+            f"Planner: `{route_label(routes['planner'])}`.\n"
+            f"Hard task planner: `{route_label(routes['hard_task_planner'])}`.\n"
+            f"Executor: `{route_label(routes['executor'])}`.\n"
+            f"Judge: `{route_label(routes['verifier'])}`.\n"
+            f"Synthesizer: `{route_label(routes['synthesizer'])}`.\n"
+            f"Frontier: {frontier_state} source={policy.get('frontier_source') or 'none'}.\n"
+            "Grounding: Alexandria/V11 enabled. Tools: file, terminal, code, delegation, and web. "
+            "External sends and destructive actions stay approval-gated."
         )
     if normalized in {"whatcanwedo", "whatshouldwedo", "whatnow", "whatnext", "help", "menu"}:
         return (

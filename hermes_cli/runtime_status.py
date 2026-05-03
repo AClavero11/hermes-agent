@@ -15,6 +15,8 @@ import urllib.request
 from pathlib import Path
 from typing import Any
 
+from hermes_cli.model_routes import resolve_model_routes, route_label
+
 
 PROJECT_ROOT = Path(__file__).resolve().parents[1]
 
@@ -31,18 +33,31 @@ ENV_SNAPSHOT_KEYS = [
     "HERMES_JUDGE_MODEL",
     "HERMES_SYNTHESIZER_PROVIDER",
     "HERMES_SYNTHESIZER_MODEL",
+    "HERMES_FRONTIER_PROVIDER",
+    "HERMES_FRONTIER_MODEL",
+    "HERMES_FRONTIER_AVAILABLE",
     "HERMES_INFERENCE_PROVIDER",
     "DEEPSEEK_LOCAL_BASE_URL",
     "DEEPSEEK_LOCAL_MODEL",
     "DEEPSEEK_V4_BASE_URL",
     "DEEPSEEK_V4_MODEL",
     "HERMES_OPENAI_FRONTIER_AVAILABLE",
+    "HERMES_GEMINI_FRONTIER_AVAILABLE",
     "HERMES_V4_PLANNER_AVAILABLE",
     "OPENAI_FRONTIER_MODEL",
-    "HERMES_FRONTIER_MODEL",
     "HERMES_FRONTIER_BASE_URL",
+    "HERMES_GEMINI_FRONTIER_MODEL",
     "GEMINI_FRONTIER_MODEL",
+    "OPENAI_API_KEY_PRESENT",
+    "GEMINI_API_KEY_PRESENT",
+    "GOOGLE_API_KEY_PRESENT",
 ]
+
+SECRET_PRESENCE_KEYS = {
+    "OPENAI_API_KEY": "OPENAI_API_KEY_PRESENT",
+    "GEMINI_API_KEY": "GEMINI_API_KEY_PRESENT",
+    "GOOGLE_API_KEY": "GOOGLE_API_KEY_PRESENT",
+}
 
 
 def _run(
@@ -156,7 +171,11 @@ def _source_wrapper_snapshot(path: Path, *, timeout: float) -> dict[str, Any]:
     py = (
         "import json, os\n"
         f"keys = {ENV_SNAPSHOT_KEYS!r}\n"
-        "print(json.dumps({key: os.environ.get(key, '') for key in keys}))\n"
+        f"presence = {SECRET_PRESENCE_KEYS!r}\n"
+        "data = {key: os.environ.get(key, '') for key in keys}\n"
+        "for env_name, snapshot_name in presence.items():\n"
+        "    data[snapshot_name] = '1' if os.environ.get(env_name, '').strip() else '0'\n"
+        "print(json.dumps(data))\n"
     )
     script = "\n".join(
         [
@@ -222,6 +241,10 @@ def _env_snapshot(
             "ok": False,
             "error": "no env wrapper found",
             **{key: os.getenv(key, "") for key in ENV_SNAPSHOT_KEYS},
+            **{
+                snapshot_name: "1" if os.getenv(env_name, "").strip() else "0"
+                for env_name, snapshot_name in SECRET_PRESENCE_KEYS.items()
+            },
         },
         candidates,
         None,
@@ -496,6 +519,7 @@ def collect_runtime_status(
         or env.get("DEEPSEEK_LOCAL_MODEL")
         or os.getenv("HERMES_PLANNER_MODEL", "")
     )
+    model_routes = resolve_model_routes(env)
     normalized_health_url = _normalize_health_url(health_url)
     runtime_repo = Path(str(selected_repo)).expanduser() if selected_repo else repo_root
     label = (
@@ -533,6 +557,7 @@ def collect_runtime_status(
             "judge_model": str(env.get("HERMES_JUDGE_MODEL", "")),
             "synthesizer_provider": str(env.get("HERMES_SYNTHESIZER_PROVIDER", "")),
             "synthesizer_model": str(env.get("HERMES_SYNTHESIZER_MODEL", "")),
+            "routing": model_routes,
         },
         "health": _health_probe(normalized_health_url, timeout=timeout),
         "git": {
@@ -567,6 +592,13 @@ def format_runtime_status(status: dict[str, Any]) -> str:
         )
         if part
     ) or "unresolved"
+    routing = model.get("routing", {})
+    routes = routing.get("routes", {}) if isinstance(routing, dict) else {}
+    planner_route = routes.get("planner", {}) if isinstance(routes, dict) else {}
+    hard_route = routes.get("hard_task_planner", {}) if isinstance(routes, dict) else {}
+    executor_route = routes.get("executor", {}) if isinstance(routes, dict) else {}
+    verifier_route = routes.get("verifier", {}) if isinstance(routes, dict) else {}
+    synthesizer_route = routes.get("synthesizer", {}) if isinstance(routes, dict) else {}
     health_state = "ok" if health.get("ok") else "fail"
     lines = [
         "Hermes runtime status",
@@ -577,6 +609,12 @@ def format_runtime_status(status: dict[str, Any]) -> str:
         f"wrapper-selected repo: {wrapper.get('selected_repo', '')}",
         f"python path: {python.get('path', '')}",
         f"model route: {route}",
+        f"planner: {route_label(planner_route)}",
+        f"hard-task planner: {route_label(hard_route)}",
+        f"executor: {route_label(executor_route)}",
+        f"verifier: {route_label(verifier_route)}",
+        f"synthesizer: {route_label(synthesizer_route)}",
+        f"frontier: {'available' if routing.get('frontier_available') else 'not configured'} source={routing.get('frontier_source') or 'none'} verified={bool(routing.get('frontier_verified'))}",
         f"health URL: {health.get('url', '')}",
         f"health: {health_state} status={health.get('status', '') or 'n/a'} latency_ms={health.get('duration_ms', '') or 'n/a'}",
         f"repo git: {repo_git.get('short_sha', '') or 'unknown'} branch={repo_git.get('branch', '') or 'unknown'} dirty={repo_git.get('dirty', '')}",

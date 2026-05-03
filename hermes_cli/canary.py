@@ -23,11 +23,23 @@ from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any, Callable
 
+from hermes_cli.model_routes import (
+    missing_required_routes,
+    resolve_model_routes,
+    route_summary,
+)
+
 
 PASS = "pass"
 WARN = "warn"
 FAIL = "fail"
 SKIP = "skip"
+
+SECRET_PRESENCE_KEYS = {
+    "OPENAI_API_KEY": "OPENAI_API_KEY_PRESENT",
+    "GEMINI_API_KEY": "GEMINI_API_KEY_PRESENT",
+    "GOOGLE_API_KEY": "GOOGLE_API_KEY_PRESENT",
+}
 
 
 @dataclass(frozen=True)
@@ -267,19 +279,38 @@ def _probe_env_wrapper(path: Path, timeout: float) -> dict[str, Any]:
         "HERMES_HOME",
         "HERMES_PLANNER_PROVIDER",
         "HERMES_PLANNER_MODEL",
+        "HERMES_EXECUTOR_PROVIDER",
+        "HERMES_EXECUTOR_MODEL",
+        "HERMES_JUDGE_PROVIDER",
+        "HERMES_JUDGE_MODEL",
+        "HERMES_SYNTHESIZER_PROVIDER",
+        "HERMES_SYNTHESIZER_MODEL",
+        "HERMES_FRONTIER_PROVIDER",
+        "HERMES_FRONTIER_MODEL",
+        "HERMES_FRONTIER_AVAILABLE",
         "HERMES_INFERENCE_PROVIDER",
         "DEEPSEEK_LOCAL_BASE_URL",
         "DEEPSEEK_LOCAL_MODEL",
         "DEEPSEEK_V4_BASE_URL",
         "DEEPSEEK_V4_MODEL",
         "HERMES_OPENAI_FRONTIER_AVAILABLE",
+        "HERMES_GEMINI_FRONTIER_AVAILABLE",
         "HERMES_V4_PLANNER_AVAILABLE",
         "OPENAI_FRONTIER_MODEL",
+        "HERMES_GEMINI_FRONTIER_MODEL",
+        "GEMINI_FRONTIER_MODEL",
+        "OPENAI_API_KEY_PRESENT",
+        "GEMINI_API_KEY_PRESENT",
+        "GOOGLE_API_KEY_PRESENT",
     ]
     py = (
         "import json, os\n"
         f"keys = {keys!r}\n"
-        "print(json.dumps({key: os.environ.get(key, '') for key in keys}))\n"
+        f"presence = {SECRET_PRESENCE_KEYS!r}\n"
+        "data = {key: os.environ.get(key, '') for key in keys}\n"
+        "for env_name, snapshot_name in presence.items():\n"
+        "    data[snapshot_name] = '1' if os.environ.get(env_name, '').strip() else '0'\n"
+        "print(json.dumps(data))\n"
     )
     script = "\n".join(
         [
@@ -324,23 +355,42 @@ def _env_model_snapshot(options: CanaryOptions) -> dict[str, Any]:
     keys = [
         "HERMES_PLANNER_PROVIDER",
         "HERMES_PLANNER_MODEL",
+        "HERMES_EXECUTOR_PROVIDER",
+        "HERMES_EXECUTOR_MODEL",
+        "HERMES_JUDGE_PROVIDER",
+        "HERMES_JUDGE_MODEL",
+        "HERMES_SYNTHESIZER_PROVIDER",
+        "HERMES_SYNTHESIZER_MODEL",
+        "HERMES_FRONTIER_PROVIDER",
+        "HERMES_FRONTIER_MODEL",
+        "HERMES_FRONTIER_AVAILABLE",
         "HERMES_INFERENCE_PROVIDER",
         "DEEPSEEK_LOCAL_BASE_URL",
         "DEEPSEEK_LOCAL_MODEL",
         "DEEPSEEK_V4_BASE_URL",
         "DEEPSEEK_V4_MODEL",
+        "HERMES_OPENAI_FRONTIER_AVAILABLE",
+        "HERMES_GEMINI_FRONTIER_AVAILABLE",
+        "HERMES_V4_PLANNER_AVAILABLE",
+        "OPENAI_FRONTIER_MODEL",
+        "HERMES_GEMINI_FRONTIER_MODEL",
+        "GEMINI_FRONTIER_MODEL",
+        "OPENAI_API_KEY_PRESENT",
+        "GEMINI_API_KEY_PRESENT",
+        "GOOGLE_API_KEY_PRESENT",
     ]
-    return {key: os.getenv(key, "") for key in keys}
+    snapshot = {key: os.getenv(key, "") for key in keys}
+    for env_name, snapshot_name in SECRET_PRESENCE_KEYS.items():
+        snapshot[snapshot_name] = "1" if os.getenv(env_name, "").strip() else "0"
+    return snapshot
 
 
 def _canary_model_route(options: CanaryOptions) -> CanaryResult:
     snapshot = _env_model_snapshot(options)
-    provider = (
-        snapshot.get("HERMES_PLANNER_PROVIDER")
-        or snapshot.get("HERMES_INFERENCE_PROVIDER")
-        or ""
-    )
-    model = snapshot.get("HERMES_PLANNER_MODEL") or ""
+    policy = resolve_model_routes(snapshot)
+    planner = policy["routes"]["planner"]
+    provider = planner.get("provider") or ""
+    model = planner.get("model") or ""
     if provider and model:
         status = PASS
         score = 15
@@ -359,14 +409,86 @@ def _canary_model_route(options: CanaryOptions) -> CanaryResult:
             status = WARN
             score = 8
             summary += " (OpenAI generation probe is false)"
-        return _result("runtime.model_route", status, score, 15, summary, snapshot)
+        return _result(
+            "runtime.model_route",
+            status,
+            score,
+            15,
+            summary,
+            {"snapshot": snapshot, "routing": policy},
+        )
     return _result(
         "runtime.model_route",
         WARN,
         6,
         15,
         "No resolved provider/model in env snapshot",
-        snapshot,
+        {"snapshot": snapshot, "routing": policy},
+    )
+
+
+def _canary_model_routes(options: CanaryOptions) -> CanaryResult:
+    snapshot = _env_model_snapshot(options)
+    policy = resolve_model_routes(snapshot)
+    missing = missing_required_routes(policy)
+    routes = policy.get("routes", {})
+    details = {
+        "snapshot": snapshot,
+        "routing": policy,
+        "missing_roles": missing,
+    }
+    if missing:
+        return _result(
+            "runtime.model_routes",
+            FAIL,
+            0,
+            20,
+            f"Missing required model routes: {', '.join(missing)}",
+            details,
+        )
+
+    deterministic_math = routes.get("deterministic_math", {})
+    if deterministic_math.get("provider") != "python":
+        return _result(
+            "runtime.model_routes",
+            FAIL,
+            0,
+            20,
+            "Deterministic math route is not Python-backed",
+            details,
+        )
+
+    frontier_available = bool(policy.get("frontier_available"))
+    hard_task_source = (routes.get("hard_task_planner") or {}).get("source")
+    verifier_source = (routes.get("verifier") or {}).get("source")
+    synthesizer_source = (routes.get("synthesizer") or {}).get("source")
+
+    if not frontier_available:
+        return _result(
+            "runtime.model_routes",
+            WARN,
+            12,
+            20,
+            "Required role routes exist, but no frontier planner route is configured",
+            details,
+        )
+    if {hard_task_source, verifier_source, synthesizer_source} != {"frontier"}:
+        return _result(
+            "runtime.model_routes",
+            WARN,
+            16,
+            20,
+            "Frontier exists but hard planner/verifier/synthesizer are not all routed to it",
+            details,
+        )
+
+    return _result(
+        "runtime.model_routes",
+        PASS,
+        20,
+        20,
+        route_summary(policy),
+        details,
     )
 
 
@@ -432,6 +554,7 @@ def _http_exception_details(exc: Exception) -> dict[str, Any]:
 
 
 _RELEASE_REQUIRED_CHECKS = {
+    "runtime.model_routes",
     "live.gateway_health",
     "live.behavior_golden",
     "eval.local_model_reasoning",
@@ -1429,7 +1552,7 @@ def _canary_live_behavior(options: CanaryOptions) -> CanaryResult:
         {
             "name": "testing_probe_direct",
             "input": "testing",
-            "required": ["Hermes online", "operator mode"],
+            "required": ["Hermes online", "Planner:", "Executor:", "Judge:"],
             "forbidden": ["Still working", "waiting for provider", "cannot", "sorry"],
             "latency_budget_ms": 1000,
         },
@@ -2540,7 +2663,7 @@ def _telegram_operator_expected_substrings(prompt: str) -> list[str]:
     if normalized in {"ack", "acknowledged"}:
         return ["Ack received", "No task started"]
     if normalized in {"test", "testing", "ping"}:
-        return ["Hermes online", "V4 planner", "Alexandria/V11"]
+        return ["Hermes online", "Planner:", "Executor:", "Judge:"]
     if normalized in {"status", "hermesstatus"}:
         return ["Hermes Gateway Status", "Agent Running"]
     if normalized in {"new", "reset", "newsession", "freshsession"}:
@@ -4492,6 +4615,7 @@ def run_canary_suite(options: CanaryOptions) -> CanaryReport:
     cases: list[tuple[str, float, Callable[[], CanaryResult]]] = [
         ("runtime.imports", 10, _canary_imports),
         ("runtime.model_route", 15, lambda: _canary_model_route(options)),
+        ("runtime.model_routes", 20, lambda: _canary_model_routes(options)),
         ("live.gateway_health", 15, lambda: _canary_gateway_health(options)),
         ("contract.command_registry", 10, _canary_command_registry),
         ("contract.x_scrape", 10, _canary_x_scrape_contract),
@@ -4552,9 +4676,23 @@ def _result_by_name(report: CanaryReport, name: str) -> CanaryResult | None:
     return None
 
 
+def _executor_route_is_local_deepseek(report: CanaryReport) -> bool:
+    result = _result_by_name(report, "runtime.model_routes")
+    if not result:
+        return False
+    routing = result.details.get("routing") if isinstance(result.details, dict) else {}
+    routes = routing.get("routes") if isinstance(routing, dict) else {}
+    executor = routes.get("executor") if isinstance(routes, dict) else {}
+    if not isinstance(executor, dict):
+        return False
+    label = f"{executor.get('provider', '')} {executor.get('model', '')}".lower()
+    return "deepseek" in label or "office-deepseek" in label
+
+
 def _quality_dimensions(report: CanaryReport) -> list[QualityDimension]:
     model_result = _result_by_name(report, "runtime.model_route")
     model_summary = model_result.summary if model_result else "unknown model route"
+    model_routes_result = _result_by_name(report, "runtime.model_routes")
     model_score = 5.5
     if model_result and "openai-frontier" in model_result.summary:
         model_score = 8.2
@@ -4565,6 +4703,10 @@ def _quality_dimensions(report: CanaryReport) -> list[QualityDimension]:
     planner_self_heal_result = _result_by_name(report, "contract.planner_self_heal")
     if planner_self_heal_result and planner_self_heal_result.status == PASS:
         model_score = max(model_score, 8.0)
+    if model_routes_result and model_routes_result.status == PASS:
+        model_score = max(model_score, 8.4)
+    elif model_routes_result and model_routes_result.status == WARN:
+        model_score = min(max(model_score, 7.2), 8.0)
     local_model_reasoning_result = _result_by_name(report, "eval.local_model_reasoning")
     hermes_reasoning_result = _result_by_name(report, "eval.hermes_reasoning")
     frontier_wrapper_result = _result_by_name(report, "eval.frontier_wrapper")
@@ -4744,10 +4886,14 @@ def quality_summary(report: CanaryReport) -> dict[str, Any]:
         ]
 
     model_result = _result_by_name(report, "runtime.model_route")
+    model_routes_result = _result_by_name(report, "runtime.model_routes")
     local_deepseek_done = bool(
-        model_result
-        and model_result.status == PASS
-        and "deepseek" in model_result.summary.lower()
+        _executor_route_is_local_deepseek(report)
+        or (
+            model_result
+            and model_result.status == PASS
+            and "deepseek" in model_result.summary.lower()
+        )
     )
     golden_done = passed("contract.behavior_goldens")
     live_behavior_done = golden_done and passed("live.behavior_golden")
@@ -4757,6 +4903,7 @@ def quality_summary(report: CanaryReport) -> dict[str, Any]:
         workflows_done
         and passed("contract.planner_self_heal")
         and local_deepseek_done
+        and bool(model_routes_result and model_routes_result.status == PASS)
         and passed("eval.hermes_reasoning")
         and passed("eval.frontier_wrapper")
         and passed("live.telegram_e2e")
@@ -4875,12 +5022,16 @@ def readiness_summary(report: CanaryReport) -> dict[str, Any]:
         return result.summary if result else "missing result"
 
     model_result = _result_by_name(report, "runtime.model_route")
+    model_routes_result = _result_by_name(report, "runtime.model_routes")
     model_route_ok = bool(
-        model_result
-        and model_result.status == PASS
-        and (
-            "deepseek" in model_result.summary.lower()
-            or "office-deepseek" in model_result.summary.lower()
+        _executor_route_is_local_deepseek(report)
+        or (
+            model_result
+            and model_result.status == PASS
+            and (
+                "deepseek" in model_result.summary.lower()
+                or "office-deepseek" in model_result.summary.lower()
+            )
         )
     )
     grounding_ok = (
@@ -4899,10 +5050,16 @@ def readiness_summary(report: CanaryReport) -> dict[str, Any]:
 
     gates = [
         {
-            "name": "local_deepseek_route",
+            "name": "local_deepseek_executor",
             "status": PASS if model_route_ok else WARN,
-            "requirement": "Active Hermes planner is the local DeepSeek route, not a stale fallback.",
-            "evidence": result_summary("runtime.model_route"),
+            "requirement": "Bounded executor route is local DeepSeek/V4, even when planner/judge routes differ.",
+            "evidence": result_summary("runtime.model_routes"),
+        },
+        {
+            "name": "model_route_contract",
+            "status": model_routes_result.status if model_routes_result else WARN,
+            "requirement": "Planner, executor, verifier, synthesizer, and deterministic math roles are explicitly routed.",
+            "evidence": result_summary("runtime.model_routes"),
         },
         {
             "name": "hermes_reasoning_eval",
