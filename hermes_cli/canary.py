@@ -2366,6 +2366,25 @@ def _telegram_operator_response_paths(options: CanaryOptions) -> tuple[Path, Pat
     return pending_path, evidence_path
 
 
+def _telegram_operator_expected_substrings(prompt: str) -> list[str]:
+    normalized = re.sub(r"[^a-z0-9]+", "", (prompt or "").lower())
+    if normalized in {"rfq", "quote", "quotes"}:
+        return ["RFQ mode", "draft package", "No customer sends"]
+    if normalized in {"inventory", "stock", "parts"}:
+        return ["Inventory mode", "V11", "read-only"]
+    if normalized in {"followups", "followup", "followupsdraft", "followupdraft"}:
+        return ["Follow-up mode", "drafts only", "approval"]
+    if normalized == "hermes":
+        return ["Hermes mode", "runtime path", "canary"]
+    return [
+        "Immediate AAC moves",
+        "`rfq`",
+        "`inventory`",
+        "`followups`",
+        "`hermes`",
+    ]
+
+
 def _run_telegram_operator_response_probe(options: CanaryOptions) -> dict[str, Any]:
     secret_path = options.hermes_home / "private" / "telegram-webhook-secret"
     pending_path, evidence_path = _telegram_operator_response_paths(options)
@@ -2378,13 +2397,7 @@ def _run_telegram_operator_response_probe(options: CanaryOptions) -> dict[str, A
         "HERMES_CANARY_TELEGRAM_OPERATOR_PROMPT",
         "what can we do",
     ).strip()
-    expected_substrings = [
-        "Immediate AAC moves",
-        "`rfq`",
-        "`inventory`",
-        "`followups`",
-        "`hermes`",
-    ]
+    expected_substrings = _telegram_operator_expected_substrings(prompt)
     started = time.time()
     details: dict[str, Any] = {
         "mode": "signed_operator_response_probe",
@@ -2544,7 +2557,7 @@ def _canary_telegram_operator_response(options: CanaryOptions) -> CanaryResult:
             PASS,
             20,
             20,
-            f"Telegram operator prompt returned expected menu in {latency_ms:.0f}ms",
+            f"Telegram operator prompt returned expected response in {latency_ms:.0f}ms",
             {"enabled": True, "probe": probe, "checks": checks, "failure_class": ""},
         )
 
@@ -2555,7 +2568,7 @@ def _canary_telegram_operator_response(options: CanaryOptions) -> CanaryResult:
         status,
         0,
         20,
-        "Telegram operator prompt did not produce the expected menu within budget",
+        "Telegram operator prompt did not produce the expected response within budget",
         {
             "enabled": True,
             "probe": probe,

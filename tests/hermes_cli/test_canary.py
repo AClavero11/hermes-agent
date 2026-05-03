@@ -590,6 +590,36 @@ def test_quality_score_caps_without_telegram_operator_response():
     assert next(item for item in summary["increments"] if item["target"] == "9.0/10")["status"] == "open"
 
 
+def test_telegram_operator_expected_substrings_follow_prompt_choice():
+    assert canary_module._telegram_operator_expected_substrings("what can we do") == [
+        "Immediate AAC moves",
+        "`rfq`",
+        "`inventory`",
+        "`followups`",
+        "`hermes`",
+    ]
+    assert canary_module._telegram_operator_expected_substrings("rfq") == [
+        "RFQ mode",
+        "draft package",
+        "No customer sends",
+    ]
+    assert canary_module._telegram_operator_expected_substrings("inventory") == [
+        "Inventory mode",
+        "V11",
+        "read-only",
+    ]
+    assert canary_module._telegram_operator_expected_substrings("followups") == [
+        "Follow-up mode",
+        "drafts only",
+        "approval",
+    ]
+    assert canary_module._telegram_operator_expected_substrings("hermes") == [
+        "Hermes mode",
+        "runtime path",
+        "canary",
+    ]
+
+
 def test_telegram_operator_response_probe_accepts_expected_menu(monkeypatch, tmp_path):
     options = CanaryOptions(
         repo_root=Path(__file__).resolve().parents[2],
