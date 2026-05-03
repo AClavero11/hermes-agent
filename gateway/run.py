@@ -817,6 +817,26 @@ def _read_hermes_release_context_snippet(message: str, max_chars: int = 5000) ->
     return alexandria_router.read_hermes_release_context_snippet(message, max_chars=max_chars)
 
 
+def _friendly_model_route_label(route: dict[str, Any]) -> str:
+    provider = str(route.get("provider") or "").lower()
+    model = str(route.get("model") or "")
+    model_lower = model.lower()
+    if "office-deepseek-v4" in provider or "deepseek-v4" in model_lower:
+        return "DeepSeek V4 Flash (local Studio)"
+    if provider == "gemini":
+        if "flash" in model_lower:
+            return "Gemini 2.5 Flash"
+        if "pro" in model_lower:
+            return "Gemini 2.5 Pro"
+        return f"Gemini ({model})" if model else "Gemini"
+    if "openai-frontier" in provider:
+        return f"OpenAI frontier ({model})" if model else "OpenAI frontier"
+    if provider == "python":
+        return "Python deterministic verifier"
+    label = route_label(route)
+    return label if label != "missing:missing" else "unresolved"
+
+
 def _build_hermes_direct_answer(message: str) -> str:
     """Answer narrow Hermes/Alexandria capability checks without an LLM call."""
     text = (message or "").strip()
@@ -830,19 +850,15 @@ def _build_hermes_direct_answer(message: str) -> str:
     if normalized in {"test", "testing", "ping"}:
         policy = resolve_model_routes()
         routes = policy["routes"]
-        frontier_state = "available" if policy["frontier_available"] else "not configured"
-        if policy["frontier_available"] and not policy["frontier_verified"]:
-            frontier_state = "configured; live proof is canary-scored separately"
         return (
-            "Hermes online. AC Telegram DM is operator mode.\n"
-            f"Planner: `{route_label(routes['planner'])}`.\n"
-            f"Hard task planner: `{route_label(routes['hard_task_planner'])}`.\n"
-            f"Executor: `{route_label(routes['executor'])}`.\n"
-            f"Judge: `{route_label(routes['verifier'])}`.\n"
-            f"Synthesizer: `{route_label(routes['synthesizer'])}`.\n"
-            f"Frontier: {frontier_state} source={policy.get('frontier_source') or 'none'}.\n"
-            "Grounding: Alexandria/V11 enabled. Tools: file, terminal, code, delegation, and web. "
-            "External sends and destructive actions stay approval-gated."
+            "Hermes online. Telegram operator path is healthy.\n"
+            f"Planner: {_friendly_model_route_label(routes['planner'])}.\n"
+            f"Executor: {_friendly_model_route_label(routes['executor'])}.\n"
+            f"Judge: {_friendly_model_route_label(routes['verifier'])}.\n"
+            f"Synthesizer: {_friendly_model_route_label(routes['synthesizer'])}.\n"
+            "Grounding: Alexandria/V11. Tools: file, terminal, code, delegation, web. "
+            "Sends, writes, and destructive actions stay approval-gated. "
+            "Full route IDs live in `hermes runtime status`."
         )
     if normalized in {"whatcanwedo", "whatshouldwedo", "whatnow", "whatnext", "help", "menu"}:
         return (

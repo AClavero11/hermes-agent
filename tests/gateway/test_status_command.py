@@ -463,9 +463,9 @@ def test_build_hermes_direct_answer_for_test_probe(monkeypatch):
     result = gateway_run._build_hermes_direct_answer("Test")
 
     assert result.startswith("Hermes online.")
-    assert "Planner: `custom:office-deepseek-v4:deepseek-v4`" in result
-    assert "Executor: `custom:office-deepseek-v4:deepseek-v4`" in result
-    assert "operator mode" in result
+    assert "Planner: DeepSeek V4 Flash (local Studio)." in result
+    assert "Executor: DeepSeek V4 Flash (local Studio)." in result
+    assert "Telegram operator path is healthy" in result
 
 
 def test_build_hermes_direct_answer_for_testing_probe(monkeypatch):
@@ -478,7 +478,7 @@ def test_build_hermes_direct_answer_for_testing_probe(monkeypatch):
 
     assert result.startswith("Hermes online.")
     assert "Judge:" in result
-    assert "operator mode" in result
+    assert "Telegram operator path is healthy" in result
 
 
 def test_build_hermes_direct_answer_for_operator_menu():

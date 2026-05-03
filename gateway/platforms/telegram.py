@@ -2635,6 +2635,11 @@ class TelegramAdapter(BasePlatformAdapter):
         if not self._should_process_message(update.message):
             return
         if self._maybe_record_telegram_e2e_ack(update.message, update.update_id):
+            await self.send(
+                str(update.message.chat_id),
+                "Ack received. Visible delivery confirmed.",
+                reply_to=str(update.message.message_id),
+            )
             return
 
         event = self._build_message_event(update.message, MessageType.TEXT, update_id=update.update_id)
@@ -2648,6 +2653,11 @@ class TelegramAdapter(BasePlatformAdapter):
         if not self._should_process_message(update.message, is_command=True):
             return
         if self._maybe_record_telegram_e2e_ack(update.message, update.update_id):
+            await self.send(
+                str(update.message.chat_id),
+                "Ack received. Visible delivery confirmed.",
+                reply_to=str(update.message.message_id),
+            )
             return
         
         event = self._build_message_event(update.message, MessageType.COMMAND, update_id=update.update_id)
