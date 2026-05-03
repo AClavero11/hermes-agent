@@ -884,6 +884,28 @@ def _extract_gemini_text(payload: dict[str, Any]) -> str:
     ).strip()
 
 
+def _extract_openai_responses_text(payload: dict[str, Any]) -> str:
+    direct = payload.get("output_text") if isinstance(payload, dict) else None
+    if direct:
+        return str(direct).strip()
+    output = payload.get("output") if isinstance(payload, dict) else None
+    if not isinstance(output, list):
+        return ""
+    texts: list[str] = []
+    for item in output:
+        if not isinstance(item, dict):
+            continue
+        content = item.get("content")
+        if not isinstance(content, list):
+            continue
+        for part in content:
+            if not isinstance(part, dict):
+                continue
+            if part.get("type") == "output_text" and str(part.get("text") or "").strip():
+                texts.append(str(part.get("text") or "").strip())
+    return "\n".join(texts).strip()
+
+
 def _post_json(url: str, payload: dict[str, Any], *, headers: dict[str, str] | None = None, timeout: float = 8.0) -> dict[str, Any]:
     data = json.dumps(payload).encode("utf-8")
     req = urllib.request.Request(
@@ -914,6 +936,7 @@ def _build_operator_capability_prompt(message: str) -> str:
         "Return exactly six plain hyphen bullets with these labels: RFQ/quotes, V11 context, "
         "Follow-ups, Hermes runtime, Research links, Code/files. Then end with one approval sentence. "
         "State that customer sends, V11 writes, Atlas writes, and destructive actions require approval. "
+        "Each bullet must be a complete sentence with operational detail, not just a label. "
         "Keep under 150 words.\n\n"
         f"Current routes: planner={_friendly_model_route_label(routes['planner'])}; "
         f"executor={_friendly_model_route_label(routes['executor'])}; "
@@ -1002,13 +1025,59 @@ def _build_operator_capability_model_answer_sync(message: str) -> str:
     synthesizer = routes.get("synthesizer") if isinstance(routes, dict) else {}
     executor = routes.get("executor") if isinstance(routes, dict) else {}
     prompt = _build_operator_capability_prompt(message)
-    timeout = float(os.getenv("HERMES_OPERATOR_CAPABILITY_TIMEOUT", "8") or "8")
+    timeout = float(os.getenv("HERMES_OPERATOR_CAPABILITY_TIMEOUT", "4") or "4")
+    fallback_timeout = float(os.getenv("HERMES_OPERATOR_CAPABILITY_FALLBACK_TIMEOUT", "4") or "4")
+    local_timeout = float(os.getenv("HERMES_OPERATOR_CAPABILITY_LOCAL_TIMEOUT", "1.5") or "1.5")
+    hosted_attempted = False
+
+    openai_api_key = (
+        os.getenv("HERMES_FRONTIER_API_KEY", "").strip()
+        or os.getenv("OPENAI_API_KEY", "").strip()
+    )
+    openai_model = (
+        os.getenv("HERMES_OPERATOR_CAPABILITY_OPENAI_MODEL", "").strip()
+        or os.getenv("OPENAI_FRONTIER_MODEL", "").strip()
+        or os.getenv("HERMES_FRONTIER_MODEL", "").strip()
+        or "gpt-5.4-mini"
+    )
+    if openai_api_key and openai_model:
+        hosted_attempted = True
+        openai_base = os.getenv("OPENAI_BASE_URL", "https://api.openai.com/v1").rstrip("/")
+        payload = {
+            "model": openai_model,
+            "instructions": "You are Hermes for AC. Concise operational answer only. No tools.",
+            "input": prompt,
+            "max_output_tokens": 260,
+            "temperature": 0.2,
+            "tools": [],
+            "store": False,
+        }
+        try:
+            text = _extract_openai_responses_text(
+                _post_json(
+                    f"{openai_base}/responses",
+                    payload,
+                    headers={"Authorization": f"Bearer {openai_api_key}"},
+                    timeout=timeout,
+                )
+            )
+            if text:
+                answer = _finalize_operator_capability_answer(
+                    text,
+                    provider_label="OpenAI",
+                    fallback_on_failure=False,
+                )
+                if answer:
+                    return answer
+        except Exception as exc:
+            logger.info("Operator capability OpenAI route failed: %s", exc)
 
     provider = str((synthesizer or {}).get("provider") or "").lower()
     model = str((synthesizer or {}).get("model") or "").strip()
     if provider == "gemini" and model:
         api_key = os.getenv("GEMINI_API_KEY", "").strip() or os.getenv("GOOGLE_API_KEY", "").strip()
         if api_key:
+            hosted_attempted = True
             url = (
                 "https://generativelanguage.googleapis.com/v1beta/models/"
                 f"{model}:generateContent?key={api_key}"
@@ -1021,7 +1090,7 @@ def _build_operator_capability_model_answer_sync(message: str) -> str:
                 },
             }
             try:
-                text = _extract_gemini_text(_post_json(url, payload, timeout=timeout))
+                text = _extract_gemini_text(_post_json(url, payload, timeout=fallback_timeout))
                 if text:
                     answer = _finalize_operator_capability_answer(
                         text,
@@ -1032,6 +1101,9 @@ def _build_operator_capability_model_answer_sync(message: str) -> str:
                         return answer
             except Exception as exc:
                 logger.info("Operator capability Gemini route failed: %s", exc)
+
+    if hosted_attempted:
+        return _operator_capability_fallback("hosted synthesizer route did not return inside the fast budget")
 
     local_provider = str((executor or {}).get("provider") or "").lower()
     local_model = str((executor or {}).get("model") or "").strip()
@@ -1051,7 +1123,11 @@ def _build_operator_capability_model_answer_sync(message: str) -> str:
             "stream": False,
         }
         try:
-            data = _post_json(f"{local_base.rstrip('/')}/chat/completions", payload, timeout=timeout)
+            data = _post_json(
+                f"{local_base.rstrip('/')}/chat/completions",
+                payload,
+                timeout=local_timeout,
+            )
             choices = data.get("choices") if isinstance(data, dict) else []
             if isinstance(choices, list) and choices:
                 message_payload = choices[0].get("message") if isinstance(choices[0], dict) else {}

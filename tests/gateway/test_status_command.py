@@ -588,6 +588,45 @@ def test_operator_capability_guard_replaces_incomplete_model_output():
     assert "Research/code" in result
 
 
+def test_operator_capability_uses_openai_fast_path(monkeypatch):
+    import gateway.run as gateway_run
+
+    answer_text = (
+        "- RFQ/quotes: draft quote packages from V11 stock and customer history.\n"
+        "- V11 context: pull inventory, customer terms, and source evidence.\n"
+        "- Follow-ups: prepare customer drafts and next-action notes.\n"
+        "- Hermes runtime: inspect canaries, logs, and stuck sessions.\n"
+        "- Research links: digest X links and vendor pages.\n"
+        "- Code/files: patch repo issues and attach test proof.\n"
+        "Approval required before customer sends, V11/Atlas writes, or destructive actions."
+    )
+
+    def fake_post_json(url, payload, *, headers=None, timeout=8.0):
+        assert url == "https://api.openai.com/v1/responses"
+        assert headers == {"Authorization": "Bearer test-key"}
+        assert payload["model"] == "gpt-test"
+        assert payload["tools"] == []
+        assert timeout == 4.0
+        return {
+            "output": [
+                {
+                    "type": "message",
+                    "content": [{"type": "output_text", "text": answer_text}],
+                }
+            ]
+        }
+
+    monkeypatch.setenv("OPENAI_API_KEY", "test-key")
+    monkeypatch.setenv("OPENAI_FRONTIER_MODEL", "gpt-test")
+    monkeypatch.delenv("GEMINI_API_KEY", raising=False)
+    monkeypatch.setattr(gateway_run, "_post_json", fake_post_json)
+
+    result = gateway_run._build_operator_capability_model_answer_sync("how can you help me right now")
+
+    assert result == answer_text
+    assert "Hermes operator planner did not return" not in result
+
+
 def test_classify_malformed_hermes_response_blocks_repeated_quote_refusal():
     import gateway.run as gateway_run
 
