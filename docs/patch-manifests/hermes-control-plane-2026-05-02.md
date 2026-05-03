@@ -24,12 +24,14 @@ These files define the reproducible Hermes control-plane patch stack:
 | `hermes_cli/workspace.py` | Workspace task/evidence/report ledger |
 | `run_agent.py` | Agent runtime integration |
 | `toolsets.py` | Toolset registration |
+| `tools/terminal_tool.py` | Terminal execution guardrails |
 | `tools/workspace_tool.py` | Workspace tool |
 | `tools/x_scraper_tool.py` | X/Twitter source retrieval tool |
 | `tests/gateway/test_api_server.py` | API behavior coverage |
 | `tests/gateway/test_status_command.py` | Status/direct answer coverage |
 | `tests/gateway/test_telegram_e2e_ack.py` | Visible Telegram ack matching coverage |
 | `tests/hermes_cli/test_canary.py` | Canary harness coverage |
+| `tests/tools/test_terminal_bare_file_guard.py` | Terminal bare-file rejection coverage |
 | `tests/tools/test_x_scraper_tool.py` | X scraper tool coverage |
 | `docs/AAC_LOCAL_DEEPSEEK.md` | Local DeepSeek operating notes |
 | `docs/AAC_MIGRATION_v2026.4.23.md` | Migration notes |
