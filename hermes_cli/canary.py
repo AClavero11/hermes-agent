@@ -537,6 +537,15 @@ def _canary_behavior_goldens(options: CanaryOptions) -> CanaryResult:
             "Telegram operator turns get deterministic ack handling and early progress receipts.",
         ),
         (
+            "operator_menu_direct",
+            [
+                "whatcanwedo",
+                "Immediate AAC moves",
+                "Reply with one word",
+            ],
+            "Short operator-menu prompts bypass generic chatbot mode.",
+        ),
+        (
             "goal_idle_supervisor",
             [
                 "_schedule_goal_prompt",
@@ -1258,6 +1267,21 @@ def _canary_live_behavior(options: CanaryOptions) -> CanaryResult:
                 "Telegram E2E gate",
             ],
             "forbidden": ["cannot", "sorry", "as an ai", "waiting for model"],
+            "latency_budget_ms": 1000,
+        },
+        {
+            "name": "operator_menu_direct",
+            "input": "what can we do",
+            "required": ["Immediate AAC moves", "RFQ", "V11", "Reply with one word"],
+            "forbidden": [
+                "roleplay",
+                "song",
+                "poetry",
+                "project management certification",
+                "I'm glad",
+                "cannot",
+                "sorry",
+            ],
             "latency_budget_ms": 1000,
         },
     ]

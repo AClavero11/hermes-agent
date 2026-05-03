@@ -339,6 +339,18 @@ def test_build_hermes_direct_answer_for_testing_probe():
     assert "operator mode" in result
 
 
+def test_build_hermes_direct_answer_for_operator_menu():
+    import gateway.run as gateway_run
+
+    result = gateway_run._build_hermes_direct_answer("what can we do")
+
+    assert result.startswith("Immediate AAC moves:")
+    assert "`rfq`" in result
+    assert "`inventory`" in result
+    assert "Reply with one word" in result
+    assert "roleplay" not in result.lower()
+
+
 def test_build_hermes_direct_answer_for_ack_probe():
     import gateway.run as gateway_run
 
@@ -714,7 +726,7 @@ async def test_status_command_bypasses_active_session_guard():
     import asyncio
     from gateway.platforms.base import BasePlatformAdapter, MessageEvent, MessageType
     from gateway.session import build_session_key
-    from gateway.config import Platform, PlatformConfig, GatewayConfig
+    from gateway.config import Platform, PlatformConfig
 
     source = _make_source()
     session_key = build_session_key(source)

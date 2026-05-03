@@ -830,6 +830,15 @@ def _build_hermes_direct_answer(message: str) -> str:
             "Hermes online. V4 planner is active via `custom:office-deepseek-v4`; "
             "Alexandria/V11 grounding is enabled; AC Telegram DM is operator mode with file/terminal/code/delegation/web tools."
         )
+    if normalized in {"whatcanwedo", "whatshouldwedo", "whatnow", "whatnext", "help", "menu"}:
+        return (
+            "Immediate AAC moves:\n"
+            "1. `rfq` - pull live RFQs/stale quotes, draft the next quote packages.\n"
+            "2. `inventory` - scan V11 on-hand IDG parts for quote targets.\n"
+            "3. `followups` - prepare customer follow-up drafts only, no sends without approval.\n"
+            "4. `hermes` - inspect runtime/logs/canaries and patch failures.\n\n"
+            "Reply with one word: `rfq`, `inventory`, `followups`, or `hermes`."
+        )
     if normalized in {"finishit", "continueit", "doit"}:
         return (
             "Hermes will not run an unbounded `finish it` loop without a target.\n\n"

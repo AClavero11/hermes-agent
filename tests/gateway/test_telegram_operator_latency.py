@@ -70,6 +70,26 @@ async def test_busy_testing_probe_returns_direct_answer_without_interrupt():
     assert adapter._send_with_retry.await_args.kwargs["content"].startswith("Hermes online.")
 
 
+@pytest.mark.asyncio
+async def test_busy_operator_menu_returns_direct_answer_without_interrupt():
+    from gateway.run import GatewayRunner
+
+    adapter = SimpleNamespace(_send_with_retry=AsyncMock())
+    runner = object.__new__(GatewayRunner)
+    runner._draining = False
+    runner.adapters = {Platform.TELEGRAM: adapter}
+
+    event = _telegram_event("what can we do")
+
+    handled = await runner._handle_active_session_busy_message(event, "telegram:496461229")
+
+    assert handled is True
+    adapter._send_with_retry.assert_awaited_once()
+    content = adapter._send_with_retry.await_args.kwargs["content"]
+    assert content.startswith("Immediate AAC moves:")
+    assert "Reply with one word" in content
+
+
 def test_telegram_notify_interval_defaults_to_early_first_update(monkeypatch):
     import gateway.run as gateway_run
 
