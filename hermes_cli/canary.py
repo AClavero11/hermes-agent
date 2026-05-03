@@ -4726,10 +4726,10 @@ def options_from_args(args: argparse.Namespace) -> CanaryOptions:
     env_wrapper = args.env_wrapper
     if env_wrapper is None:
         env_wrapper = _default_env_wrapper(hermes_home)
-    if not explicit_hermes_home:
-        wrapper_home = _home_from_env_wrapper_path(env_wrapper)
-        if wrapper_home:
-            hermes_home = wrapper_home
+    wrapper_home = _home_from_env_wrapper_path(env_wrapper)
+    default_home = Path.home() / ".hermes"
+    if wrapper_home and (not explicit_hermes_home or hermes_home == default_home):
+        hermes_home = wrapper_home
     return CanaryOptions(
         repo_root=Path(args.repo_root).expanduser(),
         hermes_home=hermes_home,

@@ -143,6 +143,15 @@ def _first_existing(paths: list[Path]) -> Path | None:
     return None
 
 
+def _home_from_env_wrapper_path(path: Path | None) -> Path | None:
+    if not path:
+        return None
+    expanded = Path(path).expanduser()
+    if expanded.name == "hermes-env.sh" and expanded.parent.name == "bin":
+        return expanded.parent.parent
+    return None
+
+
 def _source_wrapper_snapshot(path: Path, *, timeout: float) -> dict[str, Any]:
     py = (
         "import json, os\n"
@@ -458,8 +467,12 @@ def collect_runtime_status(
         hermes_home=hermes_home,
         timeout=timeout,
     )
+    wrapper_home = _home_from_env_wrapper_path(wrapper_path)
     runtime_home = env.get("HERMES_HOME") or env.get("AAC_HERMES_DEEPSEEK_HOME")
-    if runtime_home and not explicit_hermes_home:
+    default_home = Path.home() / ".hermes"
+    if wrapper_home and (not explicit_hermes_home or hermes_home == default_home):
+        hermes_home = wrapper_home
+    elif runtime_home and not explicit_hermes_home:
         hermes_home = Path(str(runtime_home)).expanduser()
     selected_repo = (
         env.get("AAC_HERMES_DEEPSEEK_REPO")
