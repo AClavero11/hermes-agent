@@ -275,6 +275,25 @@ def _bare_file_command_error(command: str) -> str | None:
     )
 
 
+_MODEL_ROUTE_COMMAND_RE = re.compile(
+    r"^\s*(?:gemini|openai|anthropic|kimi|deepseek):[A-Za-z0-9._/@:+-]+\s*$",
+    re.IGNORECASE,
+)
+
+
+def _model_route_command_error(command: str) -> str | None:
+    """Reject model/provider route labels accidentally sent to terminal."""
+    candidate = (command or "").strip()
+    if not candidate:
+        return None
+    if not _MODEL_ROUTE_COMMAND_RE.match(candidate):
+        return None
+    return (
+        f"Blocked: `{candidate}` looks like a model/provider route, not a shell command. "
+        "Treat it as configuration text instead of executing it in terminal."
+    )
+
+
 def _handle_sudo_failure(output: str, env_type: str) -> str:
     """
     Check for sudo failure and add helpful message for messaging contexts.
@@ -1479,6 +1498,16 @@ def terminal_tool(
                 "output": "",
                 "exit_code": -1,
                 "error": f"Invalid command: expected string, got {type(command).__name__}",
+                "status": "error",
+            }, ensure_ascii=False)
+
+        model_route_error = _model_route_command_error(command)
+        if model_route_error:
+            logger.info("Rejected model/provider route terminal command: %s", command)
+            return json.dumps({
+                "output": "",
+                "exit_code": -1,
+                "error": model_route_error,
                 "status": "error",
             }, ensure_ascii=False)
 

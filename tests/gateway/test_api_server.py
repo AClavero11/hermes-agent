@@ -582,6 +582,90 @@ class TestChatCompletionsEndpoint:
         mock_run.assert_not_called()
 
     @pytest.mark.asyncio
+    async def test_rfq_prompt_bypasses_agent_and_runs_read_only_tools(self, adapter):
+        tool_calls = []
+
+        def _fake_tool(name, args):
+            tool_calls.append((name, args))
+            if name == "mcp_v11_v11_customer_lookup":
+                return json.dumps({
+                    "result": json.dumps({
+                        "customers": [
+                            {"name": "TURKISH TECHNIC, INC.", "email": "rfq@example.test", "credit": 1}
+                        ]
+                    })
+                })
+            if name == "mcp_v11_v11_get_inventory":
+                return json.dumps({
+                    "result": json.dumps({
+                        "found": True,
+                        "total_qty": 3,
+                        "lines": [{"quantity": 1, "condition": "SV"}],
+                    })
+                })
+            if name == "mcp_v11_v11_search_sales":
+                return json.dumps({
+                    "result": json.dumps({
+                        "orders": [
+                            {
+                                "order": "SO/1",
+                                "date": "2026-05-01",
+                                "customer": "MEL AVIATION",
+                                "matching_lines": [{"unit_price": 30000}],
+                            }
+                        ]
+                    })
+                })
+            raise AssertionError(f"unexpected tool {name}")
+
+        app = _create_app(adapter)
+        async with TestClient(TestServer(app)) as cli:
+            with (
+                patch("gateway.rfq_fast_path._available_tool_names", return_value={
+                    "mcp_v11_v11_customer_lookup",
+                    "mcp_v11_v11_get_inventory",
+                    "mcp_v11_v11_search_sales",
+                }),
+                patch(
+                    "gateway.rfq_fast_path._call_read_only_tool",
+                    side_effect=lambda name, args, task_id: _fake_tool(name, args),
+                ),
+                patch.object(adapter, "_run_agent", new_callable=AsyncMock) as mock_run,
+            ):
+                started = time.perf_counter()
+                resp = await cli.post(
+                    "/v1/chat/completions",
+                    json={
+                        "model": "hermes-agent",
+                        "messages": [
+                            {"role": "user", "content": "Turkish pn 767870 qty 1 SV condition"}
+                        ],
+                        "stream": False,
+                    },
+                )
+                elapsed = time.perf_counter() - started
+                data = await resp.json()
+
+        text = data["choices"][0]["message"]["content"]
+        names = [name for name, _args in tool_calls]
+        assert resp.status == 200
+        assert elapsed < 1.0
+        assert "RFQ fast path" in text
+        assert "Parsed RFQ:" in text
+        assert "Customer match:" in text
+        assert "Inventory result:" in text
+        assert "Pricing evidence:" in text
+        assert "Approval required before customer send, V11 write, or Atlas write." in text
+        assert "No actions executed." not in text
+        assert names == [
+            "mcp_v11_v11_customer_lookup",
+            "mcp_v11_v11_get_inventory",
+            "mcp_v11_v11_search_sales",
+        ]
+        assert not any("send" in name or "write" in name or "atlas" in name.lower() for name in names)
+        mock_run.assert_not_called()
+
+    @pytest.mark.asyncio
     async def test_stream_true_returns_sse(self, adapter):
         """stream=true returns SSE format with the full response."""
         app = _create_app(adapter)

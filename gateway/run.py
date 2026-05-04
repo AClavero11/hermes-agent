@@ -949,6 +949,21 @@ def _build_planning_mode_answer(message: str) -> str:
         )
 
 
+async def _run_rfq_fast_path(message: str) -> str:
+    text = (message or "").strip()
+    if not text:
+        return ""
+    try:
+        from gateway.rfq_fast_path import build_rfq_fast_path_response
+
+        loop = asyncio.get_running_loop()
+        result = await loop.run_in_executor(None, build_rfq_fast_path_response, text)
+        return result.response if result is not None else ""
+    except Exception as exc:
+        logger.debug("RFQ fast path failed: %s", exc)
+        return ""
+
+
 def _extract_gemini_text(payload: dict[str, Any]) -> str:
     candidates = payload.get("candidates") if isinstance(payload, dict) else None
     if not isinstance(candidates, list) or not candidates:
@@ -2890,6 +2905,17 @@ class GatewayRunner:
             return False  # let default path handle it
 
         if event.message_type == MessageType.TEXT and not event.get_command():
+            rfq_answer = await _run_rfq_fast_path(event.text or "")
+            if rfq_answer:
+                thread_meta = {"thread_id": event.source.thread_id} if event.source.thread_id else None
+                await adapter._send_with_retry(
+                    chat_id=event.source.chat_id,
+                    content=rfq_answer,
+                    reply_to=event.message_id,
+                    metadata=thread_meta,
+                )
+                return True
+
             if _is_planning_mode_prompt(event.text or ""):
                 thread_meta = {"thread_id": event.source.thread_id} if event.source.thread_id else None
                 await adapter._send_with_retry(
@@ -5246,6 +5272,11 @@ class GatewayRunner:
                 self._release_running_agent_state(_quick_key)
 
         if _quick_key in self._running_agents:
+            if not event.get_command():
+                _rfq_answer = await _run_rfq_fast_path(event.text or "")
+                if _rfq_answer:
+                    return _rfq_answer
+
             if not event.get_command() and _is_planning_mode_prompt(event.text or ""):
                 return _build_planning_mode_answer(event.text or "")
 
@@ -5903,6 +5934,10 @@ class GatewayRunner:
         # No bare text matching — "yes" in normal conversation must not trigger
         # execution of a dangerous command.
         if not command:
+            rfq_answer = await _run_rfq_fast_path(event.text or "")
+            if rfq_answer:
+                return rfq_answer
+
             if _is_planning_mode_prompt(event.text or ""):
                 return _build_planning_mode_answer(event.text or "")
 

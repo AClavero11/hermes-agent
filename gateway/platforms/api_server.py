@@ -317,6 +317,22 @@ def _planning_mode_reply_text(content: Any) -> str:
         return ""
 
 
+async def _rfq_fast_path_reply_text(content: Any) -> str:
+    """Return deterministic RFQ packet text before the model/tool loop."""
+    text = _normalize_chat_content(content).strip()
+    if not text:
+        return ""
+    try:
+        from gateway.rfq_fast_path import build_rfq_fast_path_response
+
+        loop = asyncio.get_running_loop()
+        result = await loop.run_in_executor(None, build_rfq_fast_path_response, text)
+        return result.response if result is not None else ""
+    except Exception as exc:
+        logger.debug("RFQ fast path probe failed: %s", exc)
+        return ""
+
+
 async def _gateway_operator_capability_reply_text(content: Any) -> str:
     """Return model-backed operator capability text without entering the agent loop."""
     text = _normalize_chat_content(content).strip()
@@ -1057,6 +1073,31 @@ class APIServerAdapter(BasePlatformAdapter):
                         "message": {
                             "role": "assistant",
                             "content": exact_reply,
+                        },
+                        "finish_reason": "stop",
+                    }
+                ],
+                "usage": {
+                    "prompt_tokens": 0,
+                    "completion_tokens": 0,
+                    "total_tokens": 0,
+                },
+            }
+            return web.json_response(response_data, headers={"X-Hermes-Session-Id": session_id})
+
+        rfq_reply = await _rfq_fast_path_reply_text(user_message)
+        if rfq_reply:
+            response_data = {
+                "id": completion_id,
+                "object": "chat.completion",
+                "created": created,
+                "model": model_name,
+                "choices": [
+                    {
+                        "index": 0,
+                        "message": {
+                            "role": "assistant",
+                            "content": rfq_reply,
                         },
                         "finish_reason": "stop",
                     }
@@ -1958,6 +1999,45 @@ class APIServerAdapter(BasePlatformAdapter):
                 full_history = list(conversation_history)
                 full_history.append({"role": "user", "content": user_message})
                 full_history.append({"role": "assistant", "content": exact_reply})
+                self._response_store.put(response_id, {
+                    "response": response_data,
+                    "conversation_history": full_history,
+                    "instructions": instructions,
+                    "session_id": session_id,
+                })
+                if conversation:
+                    self._response_store.set_conversation(conversation, response_id)
+            return web.json_response(response_data)
+
+        rfq_reply = await _rfq_fast_path_reply_text(user_message)
+        if rfq_reply:
+            response_id = f"resp_{uuid.uuid4().hex[:28]}"
+            created_at = int(time.time())
+            response_data = {
+                "id": response_id,
+                "object": "response",
+                "status": "completed",
+                "created_at": created_at,
+                "model": body.get("model", self._model_name),
+                "output": [
+                    {
+                        "type": "message",
+                        "role": "assistant",
+                        "content": [
+                            {"type": "output_text", "text": rfq_reply}
+                        ],
+                    }
+                ],
+                "usage": {
+                    "input_tokens": 0,
+                    "output_tokens": 0,
+                    "total_tokens": 0,
+                },
+            }
+            if store:
+                full_history = list(conversation_history)
+                full_history.append({"role": "user", "content": user_message})
+                full_history.append({"role": "assistant", "content": rfq_reply})
                 self._response_store.put(response_id, {
                     "response": response_data,
                     "conversation_history": full_history,
