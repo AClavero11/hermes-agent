@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 from dataclasses import dataclass
+from datetime import date, datetime
 import json
 import logging
 import re
@@ -76,6 +77,37 @@ class RFQFastPathResult:
     parsed: ParsedRFQ
     tool_calls: tuple[str, ...]
     elapsed_seconds: float
+
+
+@dataclass(frozen=True)
+class InventoryEvidence:
+    summary: str
+    covers: bool
+    total_qty: float
+    condition_qty: float
+
+
+@dataclass(frozen=True)
+class SaleEvidence:
+    price: float
+    order: str
+    date: str
+    customer: str
+    recency: str
+    weight: float
+
+
+@dataclass(frozen=True)
+class PricingEvidence:
+    summary: str
+    sales: tuple[SaleEvidence, ...]
+
+
+@dataclass(frozen=True)
+class PricingDecision:
+    recommended_price: str
+    confidence: str
+    reasons: tuple[str, ...]
 
 
 def _clean_token(value: str) -> str:
@@ -291,13 +323,13 @@ def _summarize_customer(data: Any, query: str) -> tuple[str, str]:
     return (line, str(best.get("name") or ""))
 
 
-def _summarize_inventory(data: Any, requested_condition: str, requested_qty: str) -> tuple[str, bool]:
+def _summarize_inventory(data: Any, requested_condition: str, requested_qty: str) -> InventoryEvidence:
     if not isinstance(data, dict):
-        return ("Lookup returned non-JSON output.", False)
+        return InventoryEvidence("Lookup returned non-JSON output.", False, 0.0, 0.0)
     if data.get("error"):
-        return (f"Lookup failed: {data.get('error')}", False)
+        return InventoryEvidence(f"Lookup failed: {data.get('error')}", False, 0.0, 0.0)
     if not data.get("found", True):
-        return (str(data.get("message") or "Part not found in V11."), False)
+        return InventoryEvidence(str(data.get("message") or "Part not found in V11."), False, 0.0, 0.0)
     lines = data.get("lines") if isinstance(data.get("lines"), list) else []
     total_qty = float(data.get("total_qty") or 0)
     condition_qty = 0.0
@@ -312,22 +344,57 @@ def _summarize_inventory(data: Any, requested_condition: str, requested_qty: str
     except Exception:
         needed = 0.0
     covers = condition_qty >= needed if needed else condition_qty > 0
-    return (
+    return InventoryEvidence(
         f"V11 total {total_qty:g}; {requested_condition.upper()} available {condition_qty:g}; requested qty {requested_qty}: {'covered' if covers else 'not covered'}",
         covers,
+        total_qty,
+        condition_qty,
     )
 
 
-def _summarize_pricing(data: Any) -> tuple[str, str]:
+def _sale_recency(order_date: str) -> tuple[str, float]:
+    try:
+        parsed = datetime.fromisoformat(order_date[:10]).date()
+    except Exception:
+        return ("unknown date", 0.4)
+    age_days = max((date.today() - parsed).days, 0)
+    if age_days < 30:
+        return ("recent", 1.0)
+    if age_days <= 90:
+        return ("30-90 days", 0.65)
+    return (">90 days", 0.35)
+
+
+def _as_float(value: Any) -> float | None:
+    if value is None:
+        return None
+    try:
+        return float(str(value).replace(",", "").strip())
+    except Exception:
+        return None
+
+
+def _format_money(value: float) -> str:
+    rounded = int(round(value))
+    if rounded >= 5000:
+        rounded = int(round(rounded / 500.0) * 500)
+    elif rounded >= 1000:
+        rounded = int(round(rounded / 100.0) * 100)
+    elif rounded >= 100:
+        rounded = int(round(rounded / 50.0) * 50)
+    return f"${rounded:,.0f}"
+
+
+def _summarize_pricing(data: Any) -> PricingEvidence:
     if not isinstance(data, dict):
-        return ("Lookup returned non-JSON output.", "")
+        return PricingEvidence("Lookup returned non-JSON output.", ())
     if data.get("error"):
-        return (f"Lookup failed: {data.get('error')}", "")
+        return PricingEvidence(f"Lookup failed: {data.get('error')}", ())
     orders = data.get("orders") if isinstance(data.get("orders"), list) else []
     if not orders:
-        return ("No same-part V11 sales evidence found.", "")
+        return PricingEvidence("No same-part V11 sales evidence found.", ())
     snippets: list[str] = []
-    first_price = ""
+    sales: list[SaleEvidence] = []
     for order in orders[:3]:
         order_name = str(order.get("order") or "")
         customer = str(order.get("customer") or "")
@@ -335,14 +402,100 @@ def _summarize_pricing(data: Any) -> tuple[str, str]:
         lines = order.get("matching_lines") if isinstance(order.get("matching_lines"), list) else []
         prices = []
         for line in lines:
-            price = line.get("unit_price")
+            price = _as_float(line.get("unit_price"))
             if price is not None:
-                prices.append(str(price))
-                if not first_price:
-                    first_price = str(price)
+                prices.append(f"{price:g}")
+                recency, weight = _sale_recency(date)
+                sales.append(SaleEvidence(price, order_name, date, customer, recency, weight))
         price_text = ", ".join(prices) if prices else f"order total {order.get('total')}"
         snippets.append(f"{order_name} {date} {customer}: {price_text}")
-    return ("; ".join(snippets), first_price)
+    return PricingEvidence("; ".join(snippets), tuple(sales))
+
+
+def _parse_qty(value: str) -> float:
+    try:
+        return max(float(value or 0), 0.0)
+    except Exception:
+        return 0.0
+
+
+def _condition_adjustment(condition: str) -> tuple[float, str]:
+    condition = condition.upper()
+    adjustments = {
+        "OH": (0.15, "OH condition carries a premium over serviceable sales."),
+        "NE": (0.20, "NE condition carries the highest condition premium."),
+        "FN": (0.18, "FN condition carries a new/unused premium."),
+        "SV": (0.08, "SV condition supports a moderate premium."),
+        "NS": (0.05, "NS condition supports a small premium."),
+        "AR": (-0.08, "AR condition needs a discount against serviceable/OH evidence."),
+    }
+    return adjustments.get(condition, (0.0, f"{condition} condition has no configured adjustment."))
+
+
+def _inventory_adjustment(inventory: InventoryEvidence, qty: float) -> tuple[float, str]:
+    if not inventory.covers:
+        return (0.0, "inventory does not cover the requested condition/qty.")
+    if inventory.condition_qty <= max(qty * 1.5, qty + 1):
+        return (0.10, "low condition stock increases price pressure.")
+    if inventory.condition_qty <= max(qty * 3, 3):
+        return (0.05, "limited condition stock supports a firmer price.")
+    if inventory.total_qty >= 10 or inventory.condition_qty >= max(qty * 5, 5):
+        return (-0.02, "inventory is available enough to stay competitive.")
+    return (0.0, "inventory is available without strong stock pressure.")
+
+
+def _qty_adjustment(qty: float) -> tuple[float, str]:
+    if qty <= 1:
+        return (0.03, "single unit order supports higher margin.")
+    if qty >= 5:
+        return (-0.07, "multi-unit order warrants a volume discount.")
+    if qty >= 2:
+        return (-0.03, "small multi-unit order gets a modest discount.")
+    return (0.0, "quantity has no price adjustment.")
+
+
+def _make_pricing_decision(
+    parsed: ParsedRFQ,
+    *,
+    inventory: InventoryEvidence,
+    pricing: PricingEvidence,
+) -> PricingDecision:
+    qty = _parse_qty(parsed.qty)
+    if not pricing.sales:
+        reasons = [
+            "no same-part sales price was available.",
+            inventory.summary,
+            f"{parsed.condition} condition requested.",
+        ]
+        return PricingDecision("manual pricing required", "low", tuple(reasons))
+
+    weighted_total = sum(sale.price * sale.weight for sale in pricing.sales)
+    weight = sum(sale.weight for sale in pricing.sales) or 1.0
+    baseline = weighted_total / weight
+    most_recent = max(pricing.sales, key=lambda sale: sale.weight)
+
+    condition_delta, condition_reason = _condition_adjustment(parsed.condition)
+    inventory_delta, inventory_reason = _inventory_adjustment(inventory, qty)
+    qty_delta, qty_reason = _qty_adjustment(qty)
+    adjustment = condition_delta + inventory_delta + qty_delta
+    recommended = baseline * (1 + adjustment)
+
+    has_recent = any(sale.recency == "recent" for sale in pricing.sales)
+    has_medium = any(sale.recency == "30-90 days" for sale in pricing.sales)
+    if has_recent and inventory.covers:
+        confidence = "high"
+    elif (has_recent or has_medium) and pricing.sales:
+        confidence = "medium"
+    else:
+        confidence = "low"
+
+    reasons = [
+        f"last sale {most_recent.price:g} ({most_recent.recency} signal).",
+        condition_reason,
+        inventory_reason,
+        qty_reason,
+    ]
+    return PricingDecision(_format_money(recommended), confidence, tuple(reasons))
 
 
 def _missing_response(parsed: ParsedRFQ) -> str:
@@ -376,7 +529,7 @@ def _tools_missing_response(parsed: ParsedRFQ, missing_tools: list[str]) -> str:
         "",
         "Lookup tools unavailable: " + ", ".join(missing_tools),
         "No lookup tools executed.",
-        "Recommended quote action: retry when read-only V11 lookup tools are available.",
+        "Next available action: retry when read-only V11 lookup tools are available.",
         "Approval required before customer send, V11 write, or Atlas write.",
     ])
 
@@ -386,28 +539,18 @@ def _format_quote_packet(
     *,
     customer_summary: str,
     customer_name: str,
-    inventory_summary: str,
-    inventory_covers: bool,
-    pricing_summary: str,
-    suggested_price: str,
+    inventory: InventoryEvidence,
+    pricing: PricingEvidence,
+    decision: PricingDecision,
     tool_errors: list[str],
 ) -> str:
     draft = "Not enough evidence for a customer-ready draft."
-    if customer_name and inventory_covers:
-        price_phrase = f" at ${suggested_price}" if suggested_price else ""
+    if customer_name and inventory.covers and decision.recommended_price.startswith("$"):
         draft = (
             f"{customer_name},\n"
             f"We can support PN {parsed.part_number}, qty {parsed.qty}, {parsed.condition} condition"
-            f"{price_phrase}, subject to final availability and AC approval."
+            f" at {decision.recommended_price}, subject to final availability."
         )
-
-    action = "Confirm customer match and quote from verified stock."
-    if not customer_name:
-        action = "Confirm the customer before drafting a send-ready quote."
-    elif not inventory_covers:
-        action = "Do not quote until requested condition availability is confirmed."
-    elif not suggested_price:
-        action = "Price manually from stock condition and customer context; same-part price evidence was missing."
 
     lines = [
         "RFQ fast path",
@@ -423,13 +566,17 @@ def _format_quote_packet(
         f"- {customer_summary}",
         "",
         "Inventory result:",
-        f"- {inventory_summary}",
+        f"- {inventory.summary}",
         "",
         "Pricing evidence:",
-        f"- {pricing_summary}",
+        f"- {pricing.summary}",
         "",
-        "Recommended quote action:",
-        f"- {action}",
+        "Recommended price:",
+        f"- {decision.recommended_price}",
+        "Confidence:",
+        f"- {decision.confidence}",
+        "Reason:",
+        *[f"- {reason}" for reason in decision.reasons],
         "",
         "Customer-ready draft:",
         draft,
@@ -490,43 +637,42 @@ def build_rfq_fast_path_response(
             errors.append(f"customer lookup failed: {exc}")
             customer_summary = f"Lookup failed: {exc}"
 
-    inventory_summary = "Inventory lookup tool unavailable."
-    inventory_covers = False
+    inventory = InventoryEvidence("Inventory lookup tool unavailable.", False, 0.0, 0.0)
     if READ_ONLY_RFQ_TOOLS["inventory"] in tools:
         tool_name = READ_ONLY_RFQ_TOOLS["inventory"]
         called.append(tool_name)
         try:
-            inventory_summary, inventory_covers = _summarize_inventory(
+            inventory = _summarize_inventory(
                 _load_json_payload(caller(tool_name, {"part_number": parsed.part_number})),
                 parsed.condition,
                 parsed.qty,
             )
         except Exception as exc:
             errors.append(f"inventory lookup failed: {exc}")
-            inventory_summary = f"Lookup failed: {exc}"
+            inventory = InventoryEvidence(f"Lookup failed: {exc}", False, 0.0, 0.0)
 
-    pricing_summary = "Pricing lookup tool unavailable."
-    suggested_price = ""
+    pricing = PricingEvidence("Pricing lookup tool unavailable.", ())
     if READ_ONLY_RFQ_TOOLS["pricing"] in tools:
         tool_name = READ_ONLY_RFQ_TOOLS["pricing"]
         called.append(tool_name)
         try:
-            pricing_summary, suggested_price = _summarize_pricing(
+            pricing = _summarize_pricing(
                 _load_json_payload(caller(tool_name, {"part_number": parsed.part_number, "limit": 8}))
             )
         except Exception as exc:
             errors.append(f"pricing lookup failed: {exc}")
-            pricing_summary = f"Lookup failed: {exc}"
+            pricing = PricingEvidence(f"Lookup failed: {exc}", ())
+
+    decision = _make_pricing_decision(parsed, inventory=inventory, pricing=pricing)
 
     return RFQFastPathResult(
         response=_format_quote_packet(
             parsed,
             customer_summary=customer_summary,
             customer_name=customer_name,
-            inventory_summary=inventory_summary,
-            inventory_covers=inventory_covers,
-            pricing_summary=pricing_summary,
-            suggested_price=suggested_price,
+            inventory=inventory,
+            pricing=pricing,
+            decision=decision,
             tool_errors=errors,
         ),
         parsed=parsed,

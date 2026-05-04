@@ -1,4 +1,5 @@
 import json
+from datetime import date
 
 from gateway.rfq_fast_path import (
     READ_ONLY_RFQ_TOOLS,
@@ -69,3 +70,48 @@ def test_rfq_fast_path_missing_tools_does_not_enter_planning():
     assert "No lookup tools executed." in result.response
     assert "Prioritized tasks:" not in result.response
 
+
+def test_pricing_engine_not_equal_last_sale():
+    def caller(name, args):
+        if name == "mcp_v11_v11_customer_lookup":
+            return json.dumps({"result": json.dumps({"customers": [{"name": "TURKISH TECHNIC, INC."}]})})
+        if name == "mcp_v11_v11_get_inventory":
+            return json.dumps({
+                "result": json.dumps({
+                    "found": True,
+                    "total_qty": 23,
+                    "lines": [{"quantity": 8, "condition": "SV"}],
+                })
+            })
+        if name == "mcp_v11_v11_search_sales":
+            return json.dumps({
+                "result": json.dumps({
+                    "orders": [
+                        {
+                            "order": "SO/016849",
+                            "date": date.today().isoformat(),
+                            "customer": "MEL AVIATION COMPONENTS LTD",
+                            "matching_lines": [{"unit_price": 30000}],
+                        }
+                    ]
+                })
+            })
+        raise AssertionError(name)
+
+    result = build_rfq_fast_path_response(
+        "Turkish pn 767870 qty 1 SV condition",
+        available_tools=set(READ_ONLY_RFQ_TOOLS.values()),
+        tool_caller=caller,
+    )
+
+    assert result is not None
+    assert "Recommended price:" in result.response
+    assert "- $32,500" in result.response
+    assert "Confidence:" in result.response
+    assert "- high" in result.response
+    assert "Reason:" in result.response
+    assert "last sale 30000" in result.response
+    assert "single unit order supports higher margin" in result.response
+    assert "Recommended price:\n- $30,000" not in result.response
+    draft = result.response.split("Customer-ready draft:", 1)[1].split("Approval required", 1)[0]
+    assert "AC approval" not in draft

@@ -655,6 +655,10 @@ class TestChatCompletionsEndpoint:
         assert "Customer match:" in text
         assert "Inventory result:" in text
         assert "Pricing evidence:" in text
+        assert "Recommended price:" in text
+        assert "Confidence:" in text
+        assert "Reason:" in text
+        assert "Recommended quote action:" not in text
         assert "Approval required before customer send, V11 write, or Atlas write." in text
         assert "No actions executed." not in text
         assert names == [
