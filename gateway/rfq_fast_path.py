@@ -2,10 +2,12 @@
 
 from __future__ import annotations
 
+import csv
 from dataclasses import dataclass
 from datetime import date, datetime
 import json
 import logging
+from pathlib import Path
 import re
 import time
 from typing import Any, Callable
@@ -31,6 +33,10 @@ _TARGET_PRICE_RE = re.compile(
     re.IGNORECASE,
 )
 _RFQ_WORD_RE = re.compile(r"\b(?:rfq|quote|quoted|pricing)\b", re.IGNORECASE)
+_CONTEXTUAL_RFQ_RE = re.compile(
+    r"\b(?:we\s+sold\s+before|same\s+config|that\s+[a-z0-9._/-]+|again|previous|like\s+last\s+time|last\s+time)\b",
+    re.IGNORECASE,
+)
 
 _CUSTOMER_STOP_WORDS = {
     "quote",
@@ -43,6 +49,21 @@ _CUSTOMER_STOP_WORDS = {
     "pn",
     "part",
     "number",
+    "wants",
+    "want",
+    "needs",
+    "need",
+}
+
+_CONTEXT_CATEGORY_STOP_WORDS = {
+    "one",
+    "same",
+    "config",
+    "condition",
+    "again",
+    "previous",
+    "last",
+    "time",
 }
 
 
@@ -110,6 +131,42 @@ class PricingDecision:
     reasons: tuple[str, ...]
 
 
+@dataclass(frozen=True)
+class ContextualRFQ:
+    customer: str
+    category: str
+    qty: str
+    condition: str
+    target_price: str
+    free_text: str
+
+    @property
+    def missing_fields(self) -> list[str]:
+        missing: list[str] = []
+        if not self.customer:
+            missing.append("customer")
+        if not self.category:
+            missing.append("part_category")
+        if not self.qty:
+            missing.append("qty")
+        if not self.condition:
+            missing.append("condition")
+        return missing
+
+
+@dataclass(frozen=True)
+class ContextualSalesMatch:
+    part_number: str
+    config: str
+    price: float | None
+    qty: float | None
+    condition: str
+    order: str
+    date: str
+    customer: str
+    score: float
+
+
 def _clean_token(value: str) -> str:
     return re.sub(r"^[^\w]+|[^\w]+$", "", value or "").strip()
 
@@ -168,6 +225,21 @@ def _extract_qty(text: str) -> str:
         return match.group(1)
     x_match = re.search(r"\bx\s*(\d+(?:\.\d+)?)\b", text, re.IGNORECASE)
     return x_match.group(1) if x_match else ""
+
+
+def _extract_contextual_qty(text: str) -> str:
+    qty = _extract_qty(text)
+    if qty:
+        return qty
+    condition_qty = re.search(
+        r"\b(?:SV|OH|AR|NE|FN|NS)\b(?:\s+condition)?\s+(\d+(?:\.\d+)?)\b",
+        text,
+        re.IGNORECASE,
+    )
+    if condition_qty:
+        return condition_qty.group(1)
+    trailing_qty = re.search(r"\b(\d+(?:\.\d+)?)\s*$", text)
+    return trailing_qty.group(1) if trailing_qty else ""
 
 
 def _extract_condition(text: str) -> str:
@@ -234,6 +306,58 @@ def parse_rfq_prompt(text: str) -> ParsedRFQ | None:
         qty=qty,
         condition=condition,
         target_price=target_price,
+        free_text=raw,
+    )
+
+
+def _extract_contextual_customer(text: str) -> str:
+    patterns = [
+        r"^\s*(.+?)\s+\b(?:wants?|needs?|asked|asks|requested|looking)\b",
+        r"\b(?:for|from|customer)\s+(.+?)\s+\b(?:that|same|previous|last|again)\b",
+    ]
+    for pattern in patterns:
+        match = re.search(pattern, text, re.IGNORECASE)
+        if match:
+            customer = _clean_customer(match.group(1))
+            if customer:
+                return customer
+    prefix = re.split(r"\b(?:that|same|previous|last|again|we\s+sold)\b", text, maxsplit=1, flags=re.IGNORECASE)[0]
+    return _clean_customer(prefix)
+
+
+def _extract_contextual_category(text: str) -> str:
+    patterns = [
+        r"\bthat\s+([a-z0-9._/-]+)\b",
+        r"\b(?:same|previous|last)\s+([a-z0-9._/-]+)\b",
+    ]
+    for pattern in patterns:
+        match = re.search(pattern, text, re.IGNORECASE)
+        if not match:
+            continue
+        candidate = _clean_token(match.group(1)).lower()
+        if candidate and candidate not in _CONTEXT_CATEGORY_STOP_WORDS and candidate.upper() not in CONDITION_CODES:
+            return candidate
+    tokens = [
+        _clean_token(token).lower()
+        for token in re.findall(r"\b[a-z][a-z0-9._/-]{2,}\b", text, re.IGNORECASE)
+    ]
+    for token in tokens:
+        if token and token not in _CUSTOMER_STOP_WORDS and token not in _CONTEXT_CATEGORY_STOP_WORDS:
+            if token not in {"turkish", "delta", "customer", "sold", "before", "wants", "needs"}:
+                return token
+    return ""
+
+
+def parse_contextual_rfq_prompt(text: str) -> ContextualRFQ | None:
+    raw = (text or "").strip()
+    if not raw or not _CONTEXTUAL_RFQ_RE.search(raw):
+        return None
+    return ContextualRFQ(
+        customer=_extract_contextual_customer(raw),
+        category=_extract_contextual_category(raw),
+        qty=_extract_contextual_qty(raw),
+        condition=_extract_condition(raw),
+        target_price=_extract_target_price(raw),
         free_text=raw,
     )
 
@@ -412,6 +536,304 @@ def _summarize_pricing(data: Any) -> PricingEvidence:
     return PricingEvidence("; ".join(snippets), tuple(sales))
 
 
+def _normalize_match_text(value: str) -> str:
+    return re.sub(r"[^a-z0-9]+", " ", value.lower()).strip()
+
+
+def _line_part_number(line: dict[str, Any]) -> str:
+    for key in ("product", "part_number", "name", "default_code", "part"):
+        value = str(line.get(key) or "").strip()
+        if value:
+            return _clean_token(value).upper()
+    return ""
+
+
+def _line_config(line: dict[str, Any]) -> str:
+    fields = [
+        str(line.get("description") or ""),
+        str(line.get("name") or ""),
+        str(line.get("product") or ""),
+        str(line.get("condition") or ""),
+    ]
+    return " ".join(field for field in fields if field).strip()
+
+
+def _order_lines(order: dict[str, Any]) -> list[dict[str, Any]]:
+    for key in ("matching_lines", "lines", "order_lines"):
+        value = order.get(key)
+        if isinstance(value, list):
+            return [item for item in value if isinstance(item, dict)]
+    return []
+
+
+def _score_contextual_match(
+    context: ContextualRFQ,
+    *,
+    order: dict[str, Any],
+    line: dict[str, Any],
+    part_number: str,
+    config: str,
+) -> float:
+    category = _normalize_match_text(context.category)
+    searchable = _normalize_match_text(f"{part_number} {config}")
+    score = 0.0
+    if category and category in searchable:
+        score += 5.0
+    if context.condition:
+        condition = str(line.get("condition") or "")
+        if condition.upper() == context.condition.upper():
+            score += 2.0
+        elif context.condition.lower() in searchable:
+            score += 1.0
+    if context.customer:
+        customer = _normalize_match_text(str(order.get("customer") or ""))
+        query_customer = _normalize_match_text(context.customer)
+        if query_customer and query_customer in customer:
+            score += 1.0
+    recency, weight = _sale_recency(str(order.get("date") or "")[:10])
+    if recency == "recent":
+        score += 2.0
+    elif recency == "30-90 days":
+        score += 1.0
+    if _as_float(line.get("unit_price")) is not None:
+        score += 1.0
+    requested_qty = _parse_qty(context.qty)
+    line_qty = _as_float(line.get("qty") or line.get("quantity") or line.get("product_uom_qty"))
+    if requested_qty and line_qty == requested_qty:
+        score += 0.5
+    if weight <= 0.35:
+        score -= 0.5
+    return score
+
+
+def _find_contextual_sales_matches(data: Any, context: ContextualRFQ) -> list[ContextualSalesMatch]:
+    if not isinstance(data, dict):
+        return []
+    orders = data.get("orders") if isinstance(data.get("orders"), list) else []
+    matches: dict[str, ContextualSalesMatch] = {}
+    for order in orders:
+        if not isinstance(order, dict):
+            continue
+        for line in _order_lines(order):
+            part_number = _line_part_number(line)
+            if not part_number:
+                continue
+            config = _line_config(line)
+            category = _normalize_match_text(context.category)
+            searchable = _normalize_match_text(f"{part_number} {config}")
+            if category and category not in searchable:
+                continue
+            score = _score_contextual_match(context, order=order, line=line, part_number=part_number, config=config)
+            if score < 4.0:
+                continue
+            price = _as_float(line.get("unit_price") or line.get("price_unit"))
+            qty = _as_float(line.get("qty") or line.get("quantity") or line.get("product_uom_qty"))
+            candidate = ContextualSalesMatch(
+                part_number=part_number,
+                config=config or part_number,
+                price=price,
+                qty=qty,
+                condition=str(line.get("condition") or context.condition or "").upper(),
+                order=str(order.get("order") or ""),
+                date=str(order.get("date") or "")[:10],
+                customer=str(order.get("customer") or ""),
+                score=score,
+            )
+            previous = matches.get(part_number)
+            if previous is None or candidate.score > previous.score:
+                matches[part_number] = candidate
+    return sorted(matches.values(), key=lambda item: (item.score, item.date), reverse=True)
+
+
+def _sales_payload_has_line_details(data: Any) -> bool:
+    if not isinstance(data, dict):
+        return False
+    orders = data.get("orders") if isinstance(data.get("orders"), list) else []
+    for order in orders:
+        if isinstance(order, dict) and _order_lines(order):
+            return True
+    return False
+
+
+def _pricing_root() -> Path:
+    return Path.home() / "alexandria" / "advanced" / "pricing"
+
+
+def _category_part_numbers(category: str) -> set[str]:
+    normalized = _normalize_match_text(category)
+    if not normalized:
+        return set()
+    root = _pricing_root()
+    parts: set[str] = set()
+    if normalized == "idg":
+        for path in [root / "PRICING_SERVICE.md", root / "IDG_PIECE_PARTS_HOT_LIST.md"]:
+            try:
+                content = path.read_text(encoding="utf-8", errors="ignore")
+            except OSError:
+                continue
+            for token in re.findall(r"\b[A-Z0-9][A-Z0-9-]{4,}\b", content.upper()):
+                if any(ch.isdigit() for ch in token):
+                    parts.add(token.strip("-"))
+
+    oem_path = root / "oem_master_2026.csv"
+    try:
+        with oem_path.open("r", encoding="utf-8-sig", newline="") as handle:
+            for row in csv.DictReader(handle):
+                haystack = _normalize_match_text(" ".join(str(value or "") for value in row.values()))
+                part = _clean_token(str(row.get("PN") or row.get("part_number") or "")).upper()
+                if part and normalized in haystack:
+                    parts.add(part)
+    except OSError:
+        pass
+    return parts
+
+
+def _contextual_sales_matches_from_pricing_export(context: ContextualRFQ) -> list[ContextualSalesMatch]:
+    parts = _category_part_numbers(context.category)
+    if not parts:
+        return []
+    sales_path = _pricing_root() / "data" / "v11_completed_sales.csv"
+    matches: dict[str, ContextualSalesMatch] = {}
+    customer_query = _normalize_match_text(context.customer)
+    requested_qty = _parse_qty(context.qty)
+    try:
+        with sales_path.open("r", encoding="utf-8-sig", newline="") as handle:
+            for row in csv.DictReader(handle):
+                customer = str(row.get("customer_name") or "")
+                if customer_query and customer_query not in _normalize_match_text(customer):
+                    continue
+                part_number = _clean_token(str(row.get("part_number") or "")).upper()
+                if part_number not in parts:
+                    continue
+                date_text = str(row.get("date_order") or "")[:10]
+                recency, weight = _sale_recency(date_text)
+                price = _as_float(row.get("unit_price"))
+                qty = _as_float(row.get("quantity"))
+                score = 5.0
+                if customer_query:
+                    score += 1.0
+                if requested_qty and qty == requested_qty:
+                    score += 0.5
+                if price is not None:
+                    score += 1.0
+                if recency == "recent":
+                    score += 2.0
+                elif recency == "30-90 days":
+                    score += 1.0
+                elif weight <= 0.35:
+                    score -= 0.5
+                candidate = ContextualSalesMatch(
+                    part_number=part_number,
+                    config=f"{context.category.upper()} category from V11 completed sales export",
+                    price=price,
+                    qty=qty,
+                    condition=context.condition,
+                    order=str(row.get("order_number") or ""),
+                    date=date_text,
+                    customer=customer,
+                    score=score,
+                )
+                previous = matches.get(part_number)
+                if previous is None or (candidate.date, candidate.score) > (previous.date, previous.score):
+                    matches[part_number] = candidate
+    except OSError:
+        return []
+
+    ranked = sorted(matches.values(), key=lambda item: (item.date, item.score), reverse=True)
+    if ranked:
+        newest = ranked[0]
+        ranked[0] = ContextualSalesMatch(
+            part_number=newest.part_number,
+            config=newest.config,
+            price=newest.price,
+            qty=newest.qty,
+            condition=newest.condition,
+            order=newest.order,
+            date=newest.date,
+            customer=newest.customer,
+            score=newest.score + 2.0,
+        )
+    return sorted(ranked, key=lambda item: (item.score, item.date), reverse=True)
+
+
+def _sales_match_line(match: ContextualSalesMatch) -> str:
+    price = f", last sale {_format_money(match.price)}" if match.price is not None else ""
+    qty = f", qty {match.qty:g}" if match.qty is not None else ""
+    condition = f", {match.condition}" if match.condition else ""
+    order = f"{match.order} " if match.order else ""
+    date_text = f"{match.date} " if match.date else ""
+    return f"{match.part_number} ({order}{date_text}{match.customer}{qty}{condition}{price}; {match.config})"
+
+
+def _context_missing_response(context: ContextualRFQ) -> str:
+    return "\n".join([
+        "Contextual RFQ fast path",
+        "",
+        "Parsed context:",
+        f"- Customer: {context.customer or 'missing'}",
+        f"- Part category: {context.category or 'missing'}",
+        f"- Qty: {context.qty or 'missing'}",
+        f"- Condition: {context.condition or 'missing'}",
+        "",
+        "Missing fields: " + ", ".join(context.missing_fields),
+        "Next available action: send the missing RFQ detail or the PN.",
+        "No customer send, V11 write, Atlas write, or destructive shell action was performed.",
+    ])
+
+
+def _context_tools_missing_response(context: ContextualRFQ, missing_tool: str) -> str:
+    return "\n".join([
+        "Contextual RFQ fast path",
+        "",
+        "Parsed context:",
+        f"- Customer: {context.customer or 'missing'}",
+        f"- Part category: {context.category or 'missing'}",
+        f"- Qty: {context.qty or 'missing'}",
+        f"- Condition: {context.condition or 'missing'}",
+        "",
+        f"Sales lookup unavailable: {missing_tool}",
+        "Next available action: retry when read-only sales lookup is available, or send the PN.",
+        "No customer send, V11 write, Atlas write, or destructive shell action was performed.",
+    ])
+
+
+def _context_no_match_response(context: ContextualRFQ) -> str:
+    return "\n".join([
+        "Contextual RFQ fast path",
+        "",
+        "Parsed context:",
+        f"- Customer: {context.customer}",
+        f"- Part category: {context.category}",
+        f"- Qty: {context.qty}",
+        f"- Condition: {context.condition}",
+        "",
+        "Prior sales match: none strong enough to identify a PN.",
+        "Next available action: send the PN, or add aircraft/config detail.",
+        "No customer send, V11 write, Atlas write, or destructive shell action was performed.",
+    ])
+
+
+def _context_ambiguous_response(context: ContextualRFQ, matches: list[ContextualSalesMatch]) -> str:
+    lines = [
+        "Contextual RFQ fast path",
+        "",
+        "Parsed context:",
+        f"- Customer: {context.customer}",
+        f"- Part category: {context.category}",
+        f"- Qty: {context.qty}",
+        f"- Condition: {context.condition}",
+        "",
+        "Multiple plausible prior-sale matches:",
+    ]
+    lines.extend(f"- {item}" for item in (_sales_match_line(match) for match in matches[:2]))
+    lines.extend([
+        "",
+        "Next available action: reply with the PN or choose option 1 or 2.",
+        "No customer send, V11 write, Atlas write, or destructive shell action was performed.",
+    ])
+    return "\n".join(lines)
+
+
 def _parse_qty(value: str) -> float:
     try:
         return max(float(value or 0), 0.0)
@@ -543,6 +965,7 @@ def _format_quote_packet(
     pricing: PricingEvidence,
     decision: PricingDecision,
     tool_errors: list[str],
+    context_summary: str = "",
 ) -> str:
     draft = "Not enough evidence for a customer-ready draft."
     if customer_name and inventory.covers and decision.recommended_price.startswith("$"):
@@ -562,6 +985,10 @@ def _format_quote_packet(
         f"- Condition: {parsed.condition}",
         f"- Target price: {('$' + parsed.target_price) if parsed.target_price else 'not provided'}",
         "",
+    ]
+    if context_summary:
+        lines.extend(["Context resolution:", f"- {context_summary}", ""])
+    lines.extend([
         "Customer match:",
         f"- {customer_summary}",
         "",
@@ -582,47 +1009,24 @@ def _format_quote_packet(
         draft,
         "",
         "Approval required before customer send, V11 write, or Atlas write.",
-    ]
+    ])
     if tool_errors:
         lines.extend(["", "Lookup issues:"])
         lines.extend(f"- {item}" for item in tool_errors)
     return "\n".join(lines)
 
 
-def build_rfq_fast_path_response(
-    text: str,
+def _run_standard_rfq_lookup(
+    parsed: ParsedRFQ,
     *,
-    task_id: str = "rfq-fast-path",
-    available_tools: set[str] | None = None,
-    tool_caller: Callable[[str, dict[str, Any]], str] | None = None,
-) -> RFQFastPathResult | None:
-    started = time.perf_counter()
-    parsed = parse_rfq_prompt(text)
-    if parsed is None:
-        return None
-    if not parsed.sufficient_for_lookup:
-        return RFQFastPathResult(
-            response=_missing_response(parsed),
-            parsed=parsed,
-            tool_calls=(),
-            elapsed_seconds=time.perf_counter() - started,
-        )
-
-    tools = available_tools if available_tools is not None else _available_tool_names()
-    required_tool_names = list(READ_ONLY_RFQ_TOOLS.values())
-    missing_tools = [name for name in required_tool_names if name not in tools]
-    if len(missing_tools) == len(required_tool_names):
-        return RFQFastPathResult(
-            response=_tools_missing_response(parsed, missing_tools),
-            parsed=parsed,
-            tool_calls=(),
-            elapsed_seconds=time.perf_counter() - started,
-        )
-
-    caller = tool_caller or (lambda name, args: _call_read_only_tool(name, args, task_id=task_id))
-    called: list[str] = []
-    errors: list[str] = []
-
+    tools: set[str],
+    caller: Callable[[str, dict[str, Any]], str],
+    called: list[str],
+    errors: list[str],
+    started: float,
+    context_summary: str = "",
+    context_sale: ContextualSalesMatch | None = None,
+) -> RFQFastPathResult:
     customer_summary = "Customer not provided."
     customer_name = ""
     if parsed.customer and READ_ONLY_RFQ_TOOLS["customer"] in tools:
@@ -662,6 +1066,21 @@ def build_rfq_fast_path_response(
         except Exception as exc:
             errors.append(f"pricing lookup failed: {exc}")
             pricing = PricingEvidence(f"Lookup failed: {exc}", ())
+    if not pricing.sales and context_sale and context_sale.price is not None:
+        recency, weight = _sale_recency(context_sale.date)
+        pricing = PricingEvidence(
+            f"Context prior sale {context_sale.order} {context_sale.date} {context_sale.customer}: {context_sale.price:g}",
+            (
+                SaleEvidence(
+                    context_sale.price,
+                    context_sale.order,
+                    context_sale.date,
+                    context_sale.customer,
+                    recency,
+                    weight,
+                ),
+            ),
+        )
 
     decision = _make_pricing_decision(parsed, inventory=inventory, pricing=pricing)
 
@@ -674,8 +1093,160 @@ def build_rfq_fast_path_response(
             pricing=pricing,
             decision=decision,
             tool_errors=errors,
+            context_summary=context_summary,
         ),
         parsed=parsed,
         tool_calls=tuple(called),
         elapsed_seconds=time.perf_counter() - started,
+    )
+
+
+def _build_contextual_rfq_response(
+    context: ContextualRFQ,
+    *,
+    tools: set[str],
+    caller: Callable[[str, dict[str, Any]], str],
+    called: list[str],
+    errors: list[str],
+    started: float,
+) -> RFQFastPathResult:
+    placeholder = ParsedRFQ(
+        customer=context.customer,
+        part_number="",
+        qty=context.qty,
+        condition=context.condition,
+        target_price=context.target_price,
+        free_text=context.free_text,
+    )
+    if context.missing_fields:
+        return RFQFastPathResult(
+            response=_context_missing_response(context),
+            parsed=placeholder,
+            tool_calls=tuple(called),
+            elapsed_seconds=time.perf_counter() - started,
+        )
+
+    sales_tool = READ_ONLY_RFQ_TOOLS["pricing"]
+    if sales_tool not in tools:
+        return RFQFastPathResult(
+            response=_context_tools_missing_response(context, sales_tool),
+            parsed=placeholder,
+            tool_calls=tuple(called),
+            elapsed_seconds=time.perf_counter() - started,
+        )
+
+    called.append(sales_tool)
+    try:
+        sales_payload = _load_json_payload(caller(sales_tool, {"customer": context.customer, "limit": 12}))
+    except Exception as exc:
+        errors.append(f"context sales lookup failed: {exc}")
+        return RFQFastPathResult(
+            response="\n".join([
+                "Contextual RFQ fast path",
+                "",
+                f"Sales lookup failed: {exc}",
+                "Next available action: send the PN, or retry after sales lookup is healthy.",
+                "No customer send, V11 write, Atlas write, or destructive shell action was performed.",
+            ]),
+            parsed=placeholder,
+            tool_calls=tuple(called),
+            elapsed_seconds=time.perf_counter() - started,
+        )
+
+    matches = _find_contextual_sales_matches(sales_payload, context)
+    if not matches and not _sales_payload_has_line_details(sales_payload):
+        matches = _contextual_sales_matches_from_pricing_export(context)
+    if not matches:
+        return RFQFastPathResult(
+            response=_context_no_match_response(context),
+            parsed=placeholder,
+            tool_calls=tuple(called),
+            elapsed_seconds=time.perf_counter() - started,
+        )
+    if len(matches) > 1 and matches[0].score - matches[1].score < 2.0:
+        return RFQFastPathResult(
+            response=_context_ambiguous_response(context, matches),
+            parsed=placeholder,
+            tool_calls=tuple(called),
+            elapsed_seconds=time.perf_counter() - started,
+        )
+
+    match = matches[0]
+    resolved = ParsedRFQ(
+        customer=context.customer,
+        part_number=match.part_number,
+        qty=context.qty,
+        condition=context.condition or match.condition,
+        target_price=context.target_price,
+        free_text=context.free_text,
+    )
+    context_summary = f"Matched prior sale {_sales_match_line(match)}"
+    return _run_standard_rfq_lookup(
+        resolved,
+        tools=tools,
+        caller=caller,
+        called=called,
+        errors=errors,
+        started=started,
+        context_summary=context_summary,
+        context_sale=match,
+    )
+
+
+def build_rfq_fast_path_response(
+    text: str,
+    *,
+    task_id: str = "rfq-fast-path",
+    available_tools: set[str] | None = None,
+    tool_caller: Callable[[str, dict[str, Any]], str] | None = None,
+) -> RFQFastPathResult | None:
+    started = time.perf_counter()
+    parsed = parse_rfq_prompt(text)
+    contextual = parse_contextual_rfq_prompt(text)
+    tools = available_tools if available_tools is not None else None
+    caller = tool_caller or (lambda name, args: _call_read_only_tool(name, args, task_id=task_id))
+    called: list[str] = []
+    errors: list[str] = []
+
+    if contextual is not None and (parsed is None or "part_number" in parsed.missing_fields):
+        if tools is None:
+            tools = _available_tool_names()
+        return _build_contextual_rfq_response(
+            contextual,
+            tools=tools,
+            caller=caller,
+            called=called,
+            errors=errors,
+            started=started,
+        )
+
+    if parsed is None:
+        return None
+    if not parsed.sufficient_for_lookup:
+        return RFQFastPathResult(
+            response=_missing_response(parsed),
+            parsed=parsed,
+            tool_calls=(),
+            elapsed_seconds=time.perf_counter() - started,
+        )
+
+    if tools is None:
+        tools = _available_tool_names()
+    required_tool_names = list(READ_ONLY_RFQ_TOOLS.values())
+    missing_tools = [name for name in required_tool_names if name not in tools]
+    if len(missing_tools) == len(required_tool_names):
+        return RFQFastPathResult(
+            response=_tools_missing_response(parsed, missing_tools),
+            parsed=parsed,
+            tool_calls=(),
+            elapsed_seconds=time.perf_counter() - started,
+        )
+
+    return _run_standard_rfq_lookup(
+        parsed,
+        tools=tools,
+        caller=caller,
+        called=called,
+        errors=errors,
+        started=started,
     )
