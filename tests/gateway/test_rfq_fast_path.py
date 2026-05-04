@@ -333,3 +333,125 @@ def test_contextual_rfq_uses_pricing_export_when_sales_tool_has_no_lines(tmp_pat
     assert "manual pricing required" not in result.response
     assert "Context prior sale" in result.response
     assert calls[0] == ("mcp_v11_v11_search_sales", {"customer": "turkish", "limit": 12})
+
+
+def test_contextual_rfq_infers_missing_fields():
+    calls = []
+
+    def caller(name, args):
+        calls.append((name, args))
+        if name == "mcp_v11_v11_search_sales" and args.get("customer") == "turkish":
+            return json.dumps({
+                "result": json.dumps({
+                    "orders": [
+                        {
+                            "order": "SO/IDG1",
+                            "date": date.today().isoformat(),
+                            "customer": "TURKISH TECHNIC, INC.",
+                            "matching_lines": [
+                                {
+                                    "product": "767870",
+                                    "description": "IDG same config",
+                                    "condition": "SV",
+                                    "qty": 2,
+                                    "unit_price": 30000,
+                                }
+                            ],
+                        }
+                    ]
+                })
+            })
+        if name == "mcp_v11_v11_customer_lookup":
+            return json.dumps({"result": json.dumps({"customers": [{"name": "TURKISH TECHNIC, INC."}]})})
+        if name == "mcp_v11_v11_get_inventory":
+            return json.dumps({
+                "result": json.dumps({
+                    "found": True,
+                    "total_qty": 23,
+                    "lines": [{"quantity": 8, "condition": "SV"}],
+                })
+            })
+        if name == "mcp_v11_v11_search_sales" and args.get("part_number") == "767870":
+            return json.dumps({"result": json.dumps({"orders": []})})
+        raise AssertionError((name, args))
+
+    result = build_rfq_fast_path_response(
+        "turkish wants that same idg again",
+        available_tools=set(READ_ONLY_RFQ_TOOLS.values()),
+        tool_caller=caller,
+    )
+
+    assert result is not None
+    assert result.parsed.part_number == "767870"
+    assert result.parsed.qty == "1"
+    assert result.parsed.condition == "SV"
+    assert "Missing fields:" not in result.response
+    assert "Inferred fields:" in result.response
+    assert "- part_number: 767870 (from prior sale)" in result.response
+    assert "- qty: 1 (default)" in result.response
+    assert "- condition: SV (from last sale)" in result.response
+    assert "Prioritized tasks" not in result.response
+    assert "Execution blocked" not in result.response
+    assert "No actions executed" not in result.response
+    assert not any("send" in name or "write" in name or "atlas" in name.lower() for name, _ in calls)
+
+
+def test_pricing_modifier_push_price():
+    def make_caller():
+        def caller(name, args):
+            if name == "mcp_v11_v11_search_sales" and args.get("customer") == "turkish":
+                return json.dumps({
+                    "result": json.dumps({
+                        "orders": [
+                            {
+                                "order": "SO/IDG1",
+                                "date": date.today().isoformat(),
+                                "customer": "TURKISH TECHNIC, INC.",
+                                "matching_lines": [
+                                    {
+                                        "product": "767870",
+                                        "description": "IDG same config",
+                                        "condition": "SV",
+                                        "qty": 1,
+                                        "unit_price": 30000,
+                                    }
+                                ],
+                            }
+                        ]
+                    })
+                })
+            if name == "mcp_v11_v11_customer_lookup":
+                return json.dumps({"result": json.dumps({"customers": [{"name": "TURKISH TECHNIC, INC."}]})})
+            if name == "mcp_v11_v11_get_inventory":
+                return json.dumps({
+                    "result": json.dumps({
+                        "found": True,
+                        "total_qty": 23,
+                        "lines": [{"quantity": 8, "condition": "SV"}],
+                    })
+                })
+            if name == "mcp_v11_v11_search_sales" and args.get("part_number") == "767870":
+                return json.dumps({"result": json.dumps({"orders": []})})
+            raise AssertionError((name, args))
+        return caller
+
+    baseline = build_rfq_fast_path_response(
+        "turkish wants that same idg again",
+        available_tools=set(READ_ONLY_RFQ_TOOLS.values()),
+        tool_caller=make_caller(),
+    )
+    pushed = build_rfq_fast_path_response(
+        "turkish wants that same idg again but push price",
+        available_tools=set(READ_ONLY_RFQ_TOOLS.values()),
+        tool_caller=make_caller(),
+    )
+
+    assert baseline is not None
+    assert pushed is not None
+    assert "Recommended price:\n- $32,500" in baseline.response
+    assert "Recommended price:\n- $33,000" in pushed.response
+    assert "price increased due to push price request" in pushed.response
+    assert "Inferred fields:" in pushed.response
+    assert "- qty: 1 (default)" in pushed.response
+    assert "- condition: SV (from last sale)" in pushed.response
+    assert "Missing fields:" not in pushed.response

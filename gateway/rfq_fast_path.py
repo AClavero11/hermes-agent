@@ -37,6 +37,9 @@ _CONTEXTUAL_RFQ_RE = re.compile(
     r"\b(?:we\s+sold\s+before|same\s+config|that\s+[a-z0-9._/-]+|again|previous|like\s+last\s+time|last\s+time)\b",
     re.IGNORECASE,
 )
+_PUSH_PRICE_RE = re.compile(r"\b(?:push(?:\s+the)?\s+price|aggressive)\b", re.IGNORECASE)
+_HOLD_PRICE_RE = re.compile(r"\bhold\s+price\b", re.IGNORECASE)
+_BEST_PRICE_RE = re.compile(r"\b(?:best\s+price|cheap|move\s+it)\b", re.IGNORECASE)
 
 _CUSTOMER_STOP_WORDS = {
     "quote",
@@ -138,6 +141,7 @@ class ContextualRFQ:
     qty: str
     condition: str
     target_price: str
+    pricing_modifier: str
     free_text: str
 
     @property
@@ -165,6 +169,13 @@ class ContextualSalesMatch:
     date: str
     customer: str
     score: float
+
+
+@dataclass(frozen=True)
+class InferredField:
+    name: str
+    value: str
+    source: str
 
 
 def _clean_token(value: str) -> str:
@@ -348,6 +359,16 @@ def _extract_contextual_category(text: str) -> str:
     return ""
 
 
+def _extract_pricing_modifier(text: str) -> str:
+    if _PUSH_PRICE_RE.search(text):
+        return "push"
+    if _HOLD_PRICE_RE.search(text):
+        return "hold"
+    if _BEST_PRICE_RE.search(text):
+        return "competitive"
+    return ""
+
+
 def parse_contextual_rfq_prompt(text: str) -> ContextualRFQ | None:
     raw = (text or "").strip()
     if not raw or not _CONTEXTUAL_RFQ_RE.search(raw):
@@ -358,6 +379,7 @@ def parse_contextual_rfq_prompt(text: str) -> ContextualRFQ | None:
         qty=_extract_contextual_qty(raw),
         condition=_extract_condition(raw),
         target_price=_extract_target_price(raw),
+        pricing_modifier=_extract_pricing_modifier(raw),
         free_text=raw,
     )
 
@@ -614,6 +636,11 @@ def _find_contextual_sales_matches(data: Any, context: ContextualRFQ) -> list[Co
     for order in orders:
         if not isinstance(order, dict):
             continue
+        if context.customer:
+            customer = _normalize_match_text(str(order.get("customer") or ""))
+            query_customer = _normalize_match_text(context.customer)
+            if query_customer and query_customer not in customer:
+                continue
         for line in _order_lines(order):
             part_number = _line_part_number(line)
             if not part_number:
@@ -727,7 +754,7 @@ def _contextual_sales_matches_from_pricing_export(context: ContextualRFQ) -> lis
                     config=f"{context.category.upper()} category from V11 completed sales export",
                     price=price,
                     qty=qty,
-                    condition=context.condition,
+                    condition=context.condition or "SV",
                     order=str(row.get("order_number") or ""),
                     date=date_text,
                     customer=customer,
@@ -740,7 +767,7 @@ def _contextual_sales_matches_from_pricing_export(context: ContextualRFQ) -> lis
         return []
 
     ranked = sorted(matches.values(), key=lambda item: (item.date, item.score), reverse=True)
-    if ranked:
+    if ranked and (len(ranked) == 1 or ranked[0].date > ranked[1].date):
         newest = ranked[0]
         ranked[0] = ContextualSalesMatch(
             part_number=newest.part_number,
@@ -834,6 +861,15 @@ def _context_ambiguous_response(context: ContextualRFQ, matches: list[Contextual
     return "\n".join(lines)
 
 
+def _inferred_field_lines(fields: tuple[InferredField, ...]) -> list[str]:
+    if not fields:
+        return []
+    lines = ["Inferred fields:"]
+    lines.extend(f"- {field.name}: {field.value} ({field.source})" for field in fields)
+    lines.append("")
+    return lines
+
+
 def _parse_qty(value: str) -> float:
     try:
         return max(float(value or 0), 0.0)
@@ -881,6 +917,7 @@ def _make_pricing_decision(
     *,
     inventory: InventoryEvidence,
     pricing: PricingEvidence,
+    pricing_modifier: str = "",
 ) -> PricingDecision:
     qty = _parse_qty(parsed.qty)
     if not pricing.sales:
@@ -901,6 +938,22 @@ def _make_pricing_decision(
     qty_delta, qty_reason = _qty_adjustment(qty)
     adjustment = condition_delta + inventory_delta + qty_delta
     recommended = baseline * (1 + adjustment)
+    modifier_reason = ""
+    if pricing_modifier == "push":
+        pushed = baseline * 1.10
+        if pushed > recommended:
+            recommended = pushed
+        formatted_base = _format_money(baseline * (1 + adjustment))
+        formatted_pushed = _format_money(recommended)
+        if formatted_pushed == formatted_base and recommended > baseline:
+            recommended += 500 if recommended >= 5000 else max(recommended * 0.03, 50)
+        modifier_reason = "price increased due to push price request."
+    elif pricing_modifier == "hold":
+        recommended = baseline
+        modifier_reason = "price held at prior-sale baseline by request."
+    elif pricing_modifier == "competitive":
+        recommended = min(recommended, baseline * 0.95)
+        modifier_reason = "price decreased for best-price/competitive request."
 
     has_recent = any(sale.recency == "recent" for sale in pricing.sales)
     has_medium = any(sale.recency == "30-90 days" for sale in pricing.sales)
@@ -917,6 +970,8 @@ def _make_pricing_decision(
         inventory_reason,
         qty_reason,
     ]
+    if modifier_reason:
+        reasons.append(modifier_reason)
     return PricingDecision(_format_money(recommended), confidence, tuple(reasons))
 
 
@@ -966,6 +1021,7 @@ def _format_quote_packet(
     decision: PricingDecision,
     tool_errors: list[str],
     context_summary: str = "",
+    inferred_fields: tuple[InferredField, ...] = (),
 ) -> str:
     draft = "Not enough evidence for a customer-ready draft."
     if customer_name and inventory.covers and decision.recommended_price.startswith("$"):
@@ -988,6 +1044,7 @@ def _format_quote_packet(
     ]
     if context_summary:
         lines.extend(["Context resolution:", f"- {context_summary}", ""])
+    lines.extend(_inferred_field_lines(inferred_fields))
     lines.extend([
         "Customer match:",
         f"- {customer_summary}",
@@ -1026,6 +1083,8 @@ def _run_standard_rfq_lookup(
     started: float,
     context_summary: str = "",
     context_sale: ContextualSalesMatch | None = None,
+    inferred_fields: tuple[InferredField, ...] = (),
+    pricing_modifier: str = "",
 ) -> RFQFastPathResult:
     customer_summary = "Customer not provided."
     customer_name = ""
@@ -1082,7 +1141,12 @@ def _run_standard_rfq_lookup(
             ),
         )
 
-    decision = _make_pricing_decision(parsed, inventory=inventory, pricing=pricing)
+    decision = _make_pricing_decision(
+        parsed,
+        inventory=inventory,
+        pricing=pricing,
+        pricing_modifier=pricing_modifier,
+    )
 
     return RFQFastPathResult(
         response=_format_quote_packet(
@@ -1094,6 +1158,7 @@ def _run_standard_rfq_lookup(
             decision=decision,
             tool_errors=errors,
             context_summary=context_summary,
+            inferred_fields=inferred_fields,
         ),
         parsed=parsed,
         tool_calls=tuple(called),
@@ -1118,7 +1183,8 @@ def _build_contextual_rfq_response(
         target_price=context.target_price,
         free_text=context.free_text,
     )
-    if context.missing_fields:
+    required_missing = [field for field in context.missing_fields if field in {"customer", "part_category"}]
+    if required_missing:
         return RFQFastPathResult(
             response=_context_missing_response(context),
             parsed=placeholder,
@@ -1172,11 +1238,25 @@ def _build_contextual_rfq_response(
         )
 
     match = matches[0]
+    resolved_qty = context.qty or "1"
+    resolved_condition = context.condition or match.condition
+    inferred_fields = [InferredField("part_number", match.part_number, "from prior sale")]
+    if not context.qty:
+        inferred_fields.append(InferredField("qty", resolved_qty, "default"))
+    if not context.condition:
+        if not resolved_condition:
+            return RFQFastPathResult(
+                response=_context_missing_response(context),
+                parsed=placeholder,
+                tool_calls=tuple(called),
+                elapsed_seconds=time.perf_counter() - started,
+            )
+        inferred_fields.append(InferredField("condition", resolved_condition, "from last sale"))
     resolved = ParsedRFQ(
         customer=context.customer,
         part_number=match.part_number,
-        qty=context.qty,
-        condition=context.condition or match.condition,
+        qty=resolved_qty,
+        condition=resolved_condition,
         target_price=context.target_price,
         free_text=context.free_text,
     )
@@ -1190,6 +1270,8 @@ def _build_contextual_rfq_response(
         started=started,
         context_summary=context_summary,
         context_sale=match,
+        inferred_fields=tuple(inferred_fields),
+        pricing_modifier=context.pricing_modifier,
     )
 
 
@@ -1249,4 +1331,5 @@ def build_rfq_fast_path_response(
         called=called,
         errors=errors,
         started=started,
+        pricing_modifier=contextual.pricing_modifier if contextual is not None else "",
     )
