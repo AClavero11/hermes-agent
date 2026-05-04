@@ -281,6 +281,99 @@ _DESTRUCTIVE_PATTERNS = re.compile(
 _REDIRECT_OVERWRITE = re.compile(r'[^>]>[^>]|^>[^>]')
 
 
+_PLANNING_MODE_NORMALIZED = {
+    "whatcanyoudo",
+    "whatcanyouworkon",
+    "whatcanyouworkonforme",
+    "whatcanyouworkonformerightnow",
+    "whatshouldwedo",
+    "helpmeprioritize",
+    "whatnow",
+}
+
+_EXECUTION_INTENT_RE = re.compile(
+    r"\b(?:run|execute|check|update|fix)\b|\bdo\s+this\b",
+    re.IGNORECASE,
+)
+
+
+class _StopExecutionChain(RuntimeError):
+    """Raised after a fatal tool failure that must stop the current turn."""
+
+
+def _normalize_planning_text(text: str) -> str:
+    return re.sub(r"[^a-z0-9]+", "", (text or "").lower())
+
+
+def is_planning_mode_prompt(text: str) -> bool:
+    """Return True for broad planning/prioritization prompts."""
+    normalized = _normalize_planning_text(text)
+    if normalized in _PLANNING_MODE_NORMALIZED:
+        return True
+    return any(
+        normalized.startswith(prefix)
+        for prefix in (
+            "whatcanyoudo",
+            "whatcanyouworkon",
+            "whatshouldwedo",
+            "helpmeprioritize",
+        )
+    )
+
+
+def has_explicit_execution_intent(text: str) -> bool:
+    """Return True only when the user explicitly asked Hermes to execute."""
+    return bool(_EXECUTION_INTENT_RE.search(text or ""))
+
+
+def build_planning_mode_response(text: str, attempted_tools: list[str] | None = None) -> str:
+    """Return a plan-only response that does not imply execution has started."""
+    attempted_line = ""
+    if attempted_tools:
+        tool_names = ", ".join(sorted(set(str(name) for name in attempted_tools if name)))
+        if tool_names:
+            attempted_line = f"\nExecution blocked: {tool_names} not run without explicit execution intent."
+    return (
+        "Prioritized tasks:\n"
+        "1. Clarify the target outcome, constraints, and approval boundaries.\n"
+        "2. Pick the highest-impact safe task that can be verified quickly.\n"
+        "3. Define the evidence needed before any write, send, or workflow step.\n"
+        f"{attempted_line}\n\n"
+        "No actions executed.\n"
+        "Next available action: choose one task and say run, execute, check, update, fix, or do this.\n"
+        "Execute? (yes/no)"
+    )
+
+
+def _memory_failure_reason(function_name: str, function_args: dict, function_result: str) -> str:
+    if function_name != "memory" and not str(function_name or "").lower().startswith(
+        ("honcho_", "hindsight_", "mem0_", "supermemory_", "byterover_", "retaindb_", "openviking_")
+    ):
+        return ""
+    if function_name == "memory":
+        action = str((function_args or {}).get("action") or "").lower()
+        if action not in {"add", "replace", "remove"}:
+            return ""
+    raw = function_result or ""
+    try:
+        payload = json.loads(raw)
+    except Exception:
+        lowered = raw.lower()
+        if "error" in lowered or "failed" in lowered:
+            return raw.strip()[:500] or "unknown error"
+        return ""
+    if not isinstance(payload, dict):
+        return ""
+    if payload.get("success") is False or payload.get("error"):
+        return str(payload.get("error") or payload.get("message") or "unknown error")
+    return ""
+
+
+def _format_memory_write_failure(reason: str) -> str:
+    clean = re.sub(r"\s+", " ", str(reason or "unknown error")).strip()
+    return f"Memory write failed: {clean}\nNo further actions executed"
+
+
 def _is_destructive_command(cmd: str) -> bool:
     """Heuristic: does this terminal command look like it modifies/deletes files?"""
     if not cmd:
@@ -8808,6 +8901,10 @@ class AIAgent:
             }
             messages.append(tool_msg)
 
+            _memory_failure = _memory_failure_reason(function_name, function_args, function_result)
+            if _memory_failure:
+                raise _StopExecutionChain(_format_memory_write_failure(_memory_failure))
+
             # ── Per-tool /steer drain ───────────────────────────────────
             # Drain pending steer BETWEEN individual tool calls so the
             # injection lands as soon as a tool finishes — not after the
@@ -9155,6 +9252,44 @@ class AIAgent:
 
         # Preserve the original user message (no nudge injection).
         original_user_message = persist_user_message if persist_user_message is not None else user_message
+        planning_mode = is_planning_mode_prompt(
+            original_user_message if isinstance(original_user_message, str) else ""
+        )
+
+        if planning_mode:
+            final_response = build_planning_mode_response(str(original_user_message or ""))
+            messages.append({"role": "user", "content": user_message})
+            messages.append({"role": "assistant", "content": final_response})
+            self._save_trajectory(messages, _summarize_user_message_for_log(user_message), True)
+            self._persist_session(messages, conversation_history)
+            logger.info(
+                "planning mode turn: session=%s no_tools=true no_memory_review=true",
+                self.session_id or "none",
+            )
+            return {
+                "final_response": final_response,
+                "last_reasoning": None,
+                "messages": messages,
+                "api_calls": 0,
+                "completed": True,
+                "partial": False,
+                "interrupted": False,
+                "response_previewed": False,
+                "model": self.model,
+                "provider": self.provider,
+                "base_url": self.base_url,
+                "input_tokens": self.session_input_tokens,
+                "output_tokens": self.session_output_tokens,
+                "cache_read_tokens": self.session_cache_read_tokens,
+                "cache_write_tokens": self.session_cache_write_tokens,
+                "reasoning_tokens": self.session_reasoning_tokens,
+                "prompt_tokens": self.session_prompt_tokens,
+                "completion_tokens": self.session_completion_tokens,
+                "total_tokens": self.session_total_tokens,
+                "last_prompt_tokens": getattr(self.context_compressor, "last_prompt_tokens", 0) or 0,
+                "execution_blocked": True,
+                "planning_mode": True,
+            }
 
         # Track memory nudge trigger (turn-based, checked here).
         # Skill trigger is checked AFTER the agent loop completes, based on
@@ -11501,6 +11636,28 @@ class AIAgent:
                 
                 # Check for tool calls
                 if assistant_message.tool_calls:
+                    _execution_text = original_user_message if isinstance(original_user_message, str) else ""
+                    if (
+                        is_planning_mode_prompt(_execution_text)
+                        or not has_explicit_execution_intent(_execution_text)
+                    ):
+                        _attempted_tools = [
+                            str(getattr(getattr(tc, "function", None), "name", "") or "")
+                            for tc in assistant_message.tool_calls
+                        ]
+                        final_response = build_planning_mode_response(
+                            _execution_text,
+                            attempted_tools=_attempted_tools,
+                        )
+                        messages.append({"role": "assistant", "content": final_response})
+                        _turn_exit_reason = "tool_execution_blocked_no_explicit_intent"
+                        logger.info(
+                            "Blocked tool execution without explicit intent: session=%s tools=%s",
+                            self.session_id or "none",
+                            ",".join(sorted(set(_attempted_tools))),
+                        )
+                        break
+
                     if not self.quiet_mode:
                         self._vprint(f"{self.log_prefix}🔧 Processing {len(assistant_message.tool_calls)} tool call(s)...")
                     
@@ -11729,7 +11886,17 @@ class AIAgent:
                         except Exception:
                             pass
 
-                    self._execute_tool_calls(assistant_message, messages, effective_task_id, api_call_count)
+                    try:
+                        self._execute_tool_calls(assistant_message, messages, effective_task_id, api_call_count)
+                    except _StopExecutionChain as stop_exc:
+                        final_response = str(stop_exc)
+                        messages.append({"role": "assistant", "content": final_response})
+                        _turn_exit_reason = "fatal_tool_failure"
+                        logger.warning(
+                            "Stopping execution chain after fatal tool failure: %s",
+                            final_response.replace("\n", " | "),
+                        )
+                        break
 
                     # Reset per-turn retry counters after successful tool
                     # execution so a single truncation doesn't poison the

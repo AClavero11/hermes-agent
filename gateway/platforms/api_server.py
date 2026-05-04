@@ -301,6 +301,22 @@ def _gateway_direct_reply_text(content: Any) -> str:
         return ""
 
 
+def _planning_mode_reply_text(content: Any) -> str:
+    """Return planning-mode text without entering the agent/model loop."""
+    text = _normalize_chat_content(content).strip()
+    if not text:
+        return ""
+    try:
+        from run_agent import build_planning_mode_response, is_planning_mode_prompt
+
+        if not is_planning_mode_prompt(text):
+            return ""
+        return str(build_planning_mode_response(text) or "").strip()
+    except Exception as exc:
+        logger.debug("Planning-mode direct reply probe failed: %s", exc)
+        return ""
+
+
 async def _gateway_operator_capability_reply_text(content: Any) -> str:
     """Return model-backed operator capability text without entering the agent loop."""
     text = _normalize_chat_content(content).strip()
@@ -1041,6 +1057,31 @@ class APIServerAdapter(BasePlatformAdapter):
                         "message": {
                             "role": "assistant",
                             "content": exact_reply,
+                        },
+                        "finish_reason": "stop",
+                    }
+                ],
+                "usage": {
+                    "prompt_tokens": 0,
+                    "completion_tokens": 0,
+                    "total_tokens": 0,
+                },
+            }
+            return web.json_response(response_data, headers={"X-Hermes-Session-Id": session_id})
+
+        planning_reply = _planning_mode_reply_text(user_message)
+        if planning_reply:
+            response_data = {
+                "id": completion_id,
+                "object": "chat.completion",
+                "created": created,
+                "model": model_name,
+                "choices": [
+                    {
+                        "index": 0,
+                        "message": {
+                            "role": "assistant",
+                            "content": planning_reply,
                         },
                         "finish_reason": "stop",
                     }
@@ -1917,6 +1958,45 @@ class APIServerAdapter(BasePlatformAdapter):
                 full_history = list(conversation_history)
                 full_history.append({"role": "user", "content": user_message})
                 full_history.append({"role": "assistant", "content": exact_reply})
+                self._response_store.put(response_id, {
+                    "response": response_data,
+                    "conversation_history": full_history,
+                    "instructions": instructions,
+                    "session_id": session_id,
+                })
+                if conversation:
+                    self._response_store.set_conversation(conversation, response_id)
+            return web.json_response(response_data)
+
+        planning_reply = _planning_mode_reply_text(user_message)
+        if planning_reply:
+            response_id = f"resp_{uuid.uuid4().hex[:28]}"
+            created_at = int(time.time())
+            response_data = {
+                "id": response_id,
+                "object": "response",
+                "status": "completed",
+                "created_at": created_at,
+                "model": body.get("model", self._model_name),
+                "output": [
+                    {
+                        "type": "message",
+                        "role": "assistant",
+                        "content": [
+                            {"type": "output_text", "text": planning_reply}
+                        ],
+                    }
+                ],
+                "usage": {
+                    "input_tokens": 0,
+                    "output_tokens": 0,
+                    "total_tokens": 0,
+                },
+            }
+            if store:
+                full_history = list(conversation_history)
+                full_history.append({"role": "user", "content": user_message})
+                full_history.append({"role": "assistant", "content": planning_reply})
                 self._response_store.put(response_id, {
                     "response": response_data,
                     "conversation_history": full_history,

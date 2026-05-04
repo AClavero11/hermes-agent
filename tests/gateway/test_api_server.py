@@ -553,6 +553,35 @@ class TestChatCompletionsEndpoint:
             assert resp.status == 400
 
     @pytest.mark.asyncio
+    async def test_planning_prompt_bypasses_agent_under_timeout(self, adapter):
+        app = _create_app(adapter)
+        async with TestClient(TestServer(app)) as cli:
+            with patch.object(adapter, "_run_agent", new_callable=AsyncMock) as mock_run:
+                started = time.perf_counter()
+                resp = await cli.post(
+                    "/v1/chat/completions",
+                    json={
+                        "model": "hermes-agent",
+                        "messages": [
+                            {"role": "user", "content": "what can you work on for me right now"}
+                        ],
+                        "stream": False,
+                    },
+                )
+                elapsed = time.perf_counter() - started
+                data = await resp.json()
+
+        text = data["choices"][0]["message"]["content"]
+        assert resp.status == 200
+        assert elapsed < 1.0
+        assert "Prioritized tasks:" in text
+        assert "No actions executed." in text
+        assert "Received. Working on it." not in text
+        assert "Still working..." not in text
+        assert "Processing..." not in text
+        mock_run.assert_not_called()
+
+    @pytest.mark.asyncio
     async def test_stream_true_returns_sse(self, adapter):
         """stream=true returns SSE format with the full response."""
         app = _create_app(adapter)

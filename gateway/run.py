@@ -917,6 +917,38 @@ def _is_operator_capability_prompt(message: str) -> bool:
     return False
 
 
+def _is_planning_mode_prompt(message: str) -> bool:
+    try:
+        from run_agent import is_planning_mode_prompt
+        return is_planning_mode_prompt(message)
+    except Exception:
+        normalized = re.sub(r"[^a-z0-9]+", "", (message or "").lower())
+        return normalized in {
+            "whatcanyoudo",
+            "whatcanyouworkon",
+            "whatcanyouworkonforme",
+            "whatcanyouworkonformerightnow",
+            "whatshouldwedo",
+            "helpmeprioritize",
+            "whatnow",
+        } or normalized.startswith(("whatcanyoudo", "whatcanyouworkon", "whatshouldwedo", "helpmeprioritize"))
+
+
+def _build_planning_mode_answer(message: str) -> str:
+    try:
+        from run_agent import build_planning_mode_response
+        return build_planning_mode_response(message)
+    except Exception:
+        return (
+            "Prioritized tasks:\n"
+            "1. Clarify the target outcome, constraints, and approval boundaries.\n"
+            "2. Pick the highest-impact safe task that can be verified quickly.\n"
+            "3. Define the evidence needed before any write, send, or workflow step.\n\n"
+            "Next available action: choose one task and say run, execute, check, update, fix, or do this.\n"
+            "Execute? (yes/no)"
+        )
+
+
 def _extract_gemini_text(payload: dict[str, Any]) -> str:
     candidates = payload.get("candidates") if isinstance(payload, dict) else None
     if not isinstance(candidates, list) or not candidates:
@@ -1639,7 +1671,19 @@ _FAST_RECEIPT_SKIP_NORMALIZED = {
 
 
 def _telegram_receipts_enabled() -> bool:
-    return is_truthy_value(os.getenv("HERMES_TELEGRAM_FAST_RECEIPT", "1"), default=True)
+    return is_truthy_value(os.getenv("HERMES_TELEGRAM_FAST_RECEIPT", "0"), default=False)
+
+
+def _strip_filler_status_text(text: str) -> str:
+    banned = (
+        "Received. " + "Working on it.",
+        "Still " + "working",
+        "Processing" + "...",
+    )
+    cleaned = str(text or "")
+    for marker in banned:
+        cleaned = cleaned.replace(marker, "").strip()
+    return cleaned or "Task accepted."
 
 
 def _should_send_telegram_turn_receipt(event: MessageEvent) -> bool:
@@ -1680,7 +1724,9 @@ async def _send_telegram_turn_receipt(adapter: BasePlatformAdapter, event: Messa
     try:
         await adapter.send(
             source.chat_id,
-            os.getenv("HERMES_TELEGRAM_FAST_RECEIPT_TEXT", "Received. Working on it."),
+            _strip_filler_status_text(
+                os.getenv("HERMES_TELEGRAM_FAST_RECEIPT_TEXT", "Task accepted.")
+            ),
             reply_to=event.message_id,
             metadata=metadata,
         )
@@ -2844,6 +2890,16 @@ class GatewayRunner:
             return False  # let default path handle it
 
         if event.message_type == MessageType.TEXT and not event.get_command():
+            if _is_planning_mode_prompt(event.text or ""):
+                thread_meta = {"thread_id": event.source.thread_id} if event.source.thread_id else None
+                await adapter._send_with_retry(
+                    chat_id=event.source.chat_id,
+                    content=_build_planning_mode_answer(event.text or ""),
+                    reply_to=event.message_id,
+                    metadata=thread_meta,
+                )
+                return True
+
             if _is_operator_capability_prompt(event.text or ""):
                 await self._interrupt_and_clear_session(
                     session_key,
@@ -5190,6 +5246,9 @@ class GatewayRunner:
                 self._release_running_agent_state(_quick_key)
 
         if _quick_key in self._running_agents:
+            if not event.get_command() and _is_planning_mode_prompt(event.text or ""):
+                return _build_planning_mode_answer(event.text or "")
+
             if not event.get_command() and _is_operator_capability_prompt(event.text or ""):
                 await self._interrupt_and_clear_session(
                     _quick_key,
@@ -5844,6 +5903,9 @@ class GatewayRunner:
         # No bare text matching — "yes" in normal conversation must not trigger
         # execution of a dangerous command.
         if not command:
+            if _is_planning_mode_prompt(event.text or ""):
+                return _build_planning_mode_answer(event.text or "")
+
             if _is_operator_capability_prompt(event.text or ""):
                 return await _run_operator_capability_fast_path(event.text or "")
 
@@ -12608,7 +12670,7 @@ class GatewayRunner:
                 try:
                     await _notify_adapter.send(
                         source.chat_id,
-                        f"⏳ Still working... ({_elapsed_label}{_status_detail})",
+                        f"Task update: {_elapsed_label}{_status_detail}",
                         metadata=_status_thread_metadata,
                     )
                 except Exception as _ne:
