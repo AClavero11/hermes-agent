@@ -3651,6 +3651,12 @@ class GatewayRunner:
         # Start background session expiry watcher for proactive memory flushing
         asyncio.create_task(self._session_expiry_watcher())
 
+        # Kanban turns Hermes into a durable multi-agent work queue. The
+        # dispatcher claims ready tasks; the notifier reports task outcomes
+        # back to subscribed gateway chats.
+        asyncio.create_task(self._kanban_notifier_watcher())
+        asyncio.create_task(self._kanban_dispatcher_watcher())
+
         # Start background reconnection watcher for platforms that failed at startup
         if self._failed_platforms:
             logger.info(
@@ -3816,6 +3822,206 @@ class GatewayRunner:
                 if not self._running:
                     break
                 await asyncio.sleep(1)
+
+    async def _kanban_notifier_watcher(self, interval: float = 5.0) -> None:
+        """Deliver Kanban terminal-event notifications to subscribed chats."""
+        try:
+            from hermes_cli import kanban_db as kb
+        except Exception:
+            logger.warning("Kanban notifier disabled: kanban_db not importable")
+            return
+
+        terminal_kinds = ("completed", "blocked", "gave_up", "crashed", "timed_out")
+        await asyncio.sleep(5)
+
+        while self._running:
+            try:
+                def _collect() -> list[dict[str, Any]]:
+                    try:
+                        kb.init_db()
+                    except Exception:
+                        pass
+                    conn = kb.connect()
+                    try:
+                        deliveries: list[dict[str, Any]] = []
+                        for sub in kb.list_notify_subs(conn):
+                            cursor, events = kb.unseen_events_for_sub(
+                                conn,
+                                task_id=sub["task_id"],
+                                platform=sub["platform"],
+                                chat_id=sub["chat_id"],
+                                thread_id=sub.get("thread_id") or "",
+                                kinds=terminal_kinds,
+                            )
+                            if events:
+                                deliveries.append({
+                                    "sub": sub,
+                                    "cursor": cursor,
+                                    "events": events,
+                                    "task": kb.get_task(conn, sub["task_id"]),
+                                })
+                        return deliveries
+                    finally:
+                        conn.close()
+
+                deliveries = await asyncio.to_thread(_collect)
+                for item in deliveries:
+                    sub = item["sub"]
+                    platform_str = str(sub.get("platform") or "").lower()
+                    try:
+                        platform = Platform(platform_str)
+                    except ValueError:
+                        await asyncio.to_thread(self._kanban_advance, sub, item["cursor"])
+                        continue
+
+                    adapter = self.adapters.get(platform)
+                    if adapter is None:
+                        continue
+
+                    task = item.get("task")
+                    title = ((task.title if task else sub["task_id"]) or "")[:120]
+                    metadata = {"thread_id": sub["thread_id"]} if sub.get("thread_id") else None
+                    sent_all = True
+                    for event in item["events"]:
+                        kind = event.kind
+                        payload = event.payload or {}
+                        if kind == "completed":
+                            handoff = str(payload.get("summary") or getattr(task, "result", "") or "")
+                            detail = f"\n{handoff.strip().splitlines()[0][:200]}" if handoff.strip() else ""
+                            message = f"Kanban {sub['task_id']} done - {title}{detail}"
+                        elif kind == "blocked":
+                            reason = str(payload.get("reason") or "").strip()
+                            message = f"Kanban {sub['task_id']} blocked" + (f": {reason[:180]}" if reason else "")
+                        elif kind == "gave_up":
+                            error = str(payload.get("error") or "").strip()
+                            message = f"Kanban {sub['task_id']} gave up after repeated spawn failures" + (f"\n{error[:200]}" if error else "")
+                        elif kind == "crashed":
+                            message = f"Kanban {sub['task_id']} worker crashed; dispatcher will retry."
+                        elif kind == "timed_out":
+                            limit = payload.get("limit_seconds") or "unknown"
+                            message = f"Kanban {sub['task_id']} timed out at {limit}s; dispatcher will retry."
+                        else:
+                            continue
+                        try:
+                            await adapter.send(sub["chat_id"], message, metadata=metadata)
+                        except Exception as exc:
+                            sent_all = False
+                            logger.warning(
+                                "Kanban notifier send failed for %s on %s: %s",
+                                sub["task_id"], platform_str, exc,
+                            )
+                            break
+
+                    if sent_all:
+                        await asyncio.to_thread(self._kanban_advance, sub, item["cursor"])
+                        last_kind = item["events"][-1].kind if item["events"] else ""
+                        if last_kind in terminal_kinds or (task and task.status in ("done", "archived")):
+                            await asyncio.to_thread(self._kanban_unsub, sub)
+            except asyncio.CancelledError:
+                raise
+            except Exception as exc:
+                logger.warning("Kanban notifier tick failed: %s", exc)
+
+            slept = 0.0
+            while slept < max(1.0, interval) and self._running:
+                delay = min(1.0, max(1.0, interval) - slept)
+                await asyncio.sleep(delay)
+                slept += delay
+
+    def _kanban_advance(self, sub: dict, cursor: int) -> None:
+        from hermes_cli import kanban_db as kb
+        conn = kb.connect()
+        try:
+            kb.advance_notify_cursor(
+                conn,
+                task_id=sub["task_id"],
+                platform=sub["platform"],
+                chat_id=sub["chat_id"],
+                thread_id=sub.get("thread_id") or "",
+                new_cursor=cursor,
+            )
+        finally:
+            conn.close()
+
+    def _kanban_unsub(self, sub: dict) -> None:
+        from hermes_cli import kanban_db as kb
+        conn = kb.connect()
+        try:
+            kb.remove_notify_sub(
+                conn,
+                task_id=sub["task_id"],
+                platform=sub["platform"],
+                chat_id=sub["chat_id"],
+                thread_id=sub.get("thread_id") or "",
+            )
+        finally:
+            conn.close()
+
+    async def _kanban_dispatcher_watcher(self) -> None:
+        """Embedded Kanban dispatcher; claims ready tasks and spawns workers."""
+        env_override = os.environ.get("HERMES_KANBAN_DISPATCH_IN_GATEWAY", "").strip().lower()
+        if env_override in {"0", "false", "no", "off"}:
+            logger.info("Kanban dispatcher disabled via HERMES_KANBAN_DISPATCH_IN_GATEWAY")
+            return
+
+        try:
+            from hermes_cli.config import load_config
+            from hermes_cli import kanban_db as kb
+        except Exception:
+            logger.warning("Kanban dispatcher disabled: required modules not importable")
+            return
+
+        try:
+            cfg = load_config()
+        except Exception as exc:
+            logger.warning("Kanban dispatcher disabled: cannot load config (%s)", exc)
+            return
+
+        kanban_cfg = cfg.get("kanban", {}) if isinstance(cfg, dict) else {}
+        if not kanban_cfg.get("dispatch_in_gateway", True):
+            logger.info("Kanban dispatcher disabled by config")
+            return
+
+        try:
+            interval = float(kanban_cfg.get("dispatch_interval_seconds", 60) or 60)
+        except (TypeError, ValueError):
+            interval = 60.0
+        interval = max(1.0, interval)
+
+        await asyncio.sleep(5)
+        logger.info("Kanban dispatcher embedded in gateway (interval=%.1fs)", interval)
+
+        while self._running:
+            try:
+                def _tick_once():
+                    try:
+                        kb.init_db()
+                    except Exception:
+                        pass
+                    conn = kb.connect()
+                    try:
+                        return kb.dispatch_once(conn)
+                    finally:
+                        conn.close()
+
+                result = await asyncio.to_thread(_tick_once)
+                if result and getattr(result, "spawned", None):
+                    logger.info(
+                        "Kanban dispatcher spawned=%d reclaimed=%d promoted=%d",
+                        len(result.spawned),
+                        getattr(result, "reclaimed", 0),
+                        getattr(result, "promoted", 0),
+                    )
+            except asyncio.CancelledError:
+                raise
+            except Exception:
+                logger.exception("Kanban dispatcher tick failed")
+
+            slept = 0.0
+            while slept < interval and self._running:
+                delay = min(1.0, interval - slept)
+                await asyncio.sleep(delay)
+                slept += delay
 
     async def _platform_reconnect_watcher(self) -> None:
         """Background task that periodically retries connecting failed platforms.
@@ -5120,6 +5326,53 @@ class GatewayRunner:
             )
         except Exception as exc:
             return f"Workspace error: {exc}"
+
+    async def _handle_kanban_command(self, event: MessageEvent) -> str:
+        """Handle /kanban by delegating to the shared Kanban CLI parser."""
+        from hermes_cli.kanban import run_slash
+
+        text = event.get_command_args().strip()
+        is_create = text.split(None, 1)[:1] == ["create"]
+
+        try:
+            output = await asyncio.to_thread(run_slash, text)
+        except Exception as exc:
+            return f"Kanban error: {exc}"
+
+        if is_create and output:
+            match = re.search(r"Created\s+(t_[0-9a-f]+)\b", output)
+            if match:
+                task_id = match.group(1)
+                try:
+                    source = event.source
+                    platform = source.platform.value if source and source.platform else ""
+                    chat_id = str(getattr(source, "chat_id", "") or "")
+                    thread_id = str(getattr(source, "thread_id", "") or "")
+                    user_id = str(getattr(source, "user_id", "") or "") or None
+                    if platform and chat_id:
+                        def _subscribe() -> None:
+                            from hermes_cli import kanban_db as kb
+                            conn = kb.connect()
+                            try:
+                                kb.add_notify_sub(
+                                    conn,
+                                    task_id=task_id,
+                                    platform=platform,
+                                    chat_id=chat_id,
+                                    thread_id=thread_id,
+                                    user_id=user_id,
+                                )
+                            finally:
+                                conn.close()
+
+                        await asyncio.to_thread(_subscribe)
+                        output += f"\n(subscribed for terminal updates on {task_id})"
+                except Exception as exc:
+                    logger.warning("Kanban create auto-subscribe failed: %s", exc)
+
+        if len(output) > 3500:
+            return output[:3500] + "\n...[truncated]"
+        return output or "Kanban command completed."
     
     async def _handle_message(self, event: MessageEvent) -> Optional[str]:
         """
@@ -5332,6 +5585,9 @@ class GatewayRunner:
             )
             _evt_cmd = event.get_command()
             _cmd_def_inner = _resolve_cmd_inner(_evt_cmd) if _evt_cmd else None
+
+            if _cmd_def_inner and _cmd_def_inner.name == "kanban":
+                return await self._handle_kanban_command(event)
 
             if _cmd_def_inner and _cmd_def_inner.name == "goal":
                 goal_args = event.get_command_args().strip().lower()
@@ -5800,6 +6056,9 @@ class GatewayRunner:
 
         if canonical == "workspace":
             return await self._handle_workspace_command(event)
+
+        if canonical == "kanban":
+            return await self._handle_kanban_command(event)
 
         if canonical == "voice":
             return await self._handle_voice_command(event)
@@ -12294,14 +12553,21 @@ class GatewayRunner:
                 # false positives from MagicMock auto-attribute creation in tests.
                 if getattr(type(_status_adapter), "send_exec_approval", None) is not None:
                     try:
+                        import inspect as _inspect
+                        _send_approval_kwargs = {
+                            "chat_id": _status_chat_id,
+                            "command": cmd,
+                            "session_key": _approval_session_key,
+                            "description": desc,
+                            "metadata": _status_thread_metadata,
+                        }
+                        _approval_sig = _inspect.signature(
+                            type(_status_adapter).send_exec_approval
+                        )
+                        if "approval_data" in _approval_sig.parameters:
+                            _send_approval_kwargs["approval_data"] = approval_data
                         _approval_result = asyncio.run_coroutine_threadsafe(
-                            _status_adapter.send_exec_approval(
-                                chat_id=_status_chat_id,
-                                command=cmd,
-                                session_key=_approval_session_key,
-                                description=desc,
-                                metadata=_status_thread_metadata,
-                            ),
+                            _status_adapter.send_exec_approval(**_send_approval_kwargs),
                             _loop_for_step,
                         ).result(timeout=15)
                         if _approval_result.success:
@@ -12317,13 +12583,21 @@ class GatewayRunner:
 
                 # Fallback: plain text approval prompt
                 cmd_preview = cmd[:200] + "..." if len(cmd) > 200 else cmd
-                msg = (
-                    f"⚠️ **Dangerous command requires approval:**\n"
-                    f"```\n{cmd_preview}\n```\n"
-                    f"Reason: {desc}\n\n"
-                    f"Reply `/approve` to execute, `/approve session` to approve this pattern "
-                    f"for the session, `/approve always` to approve permanently, or `/deny` to cancel."
-                )
+                if approval_data.get("external_action"):
+                    msg = (
+                        f"⚠️ **External action requires approval:**\n"
+                        f"```\n{cmd_preview}\n```\n"
+                        f"Reason: {desc}\n\n"
+                        f"Reply `/approve` to approve this action or `/deny` to cancel."
+                    )
+                else:
+                    msg = (
+                        f"⚠️ **Dangerous command requires approval:**\n"
+                        f"```\n{cmd_preview}\n```\n"
+                        f"Reason: {desc}\n\n"
+                        f"Reply `/approve` to execute, `/approve session` to approve this pattern "
+                        f"for the session, `/approve always` to approve permanently, or `/deny` to cancel."
+                    )
                 try:
                     asyncio.run_coroutine_threadsafe(
                         _status_adapter.send(

@@ -60,6 +60,10 @@ _HERMES_CORE_TOOLS = [
     "send_message",
     # Home Assistant smart home control (gated on HASS_TOKEN via check_fn)
     "ha_list_entities", "ha_get_state", "ha_list_services", "ha_call_service",
+    # Kanban multi-agent coordination. These tools are only visible when
+    # HERMES_KANBAN_TASK is set by the dispatcher.
+    "kanban_show", "kanban_complete", "kanban_block", "kanban_heartbeat",
+    "kanban_comment", "kanban_create", "kanban_create_workflow", "kanban_link",
 ]
 
 
@@ -205,6 +209,20 @@ TOOLSETS = {
         "description": "Home Assistant smart home control and monitoring",
         "tools": ["ha_list_entities", "ha_get_state", "ha_list_services", "ha_call_service"],
         "includes": []
+    },
+
+    "kanban": {
+        "description": (
+            "Durable multi-agent coordination board. Tools are gated to "
+            "dispatcher-spawned workers and let them show, complete, block, "
+            "heartbeat, comment, create, and link tasks."
+        ),
+        "tools": [
+            "kanban_show", "kanban_complete", "kanban_block",
+            "kanban_heartbeat", "kanban_comment",
+            "kanban_create", "kanban_create_workflow", "kanban_link",
+        ],
+        "includes": [],
     },
 
     "feishu_doc": {

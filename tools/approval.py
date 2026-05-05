@@ -20,6 +20,7 @@ import contextvars
 import logging
 import os
 import re
+import secrets
 import sys
 import threading
 import time
@@ -234,11 +235,13 @@ _permanent_approved: set = set()
 
 class _ApprovalEntry:
     """One pending dangerous-command approval inside a gateway session."""
-    __slots__ = ("event", "data", "result")
+    __slots__ = ("id", "event", "data", "result")
 
-    def __init__(self, data: dict):
+    def __init__(self, data: dict, approval_id: Optional[str] = None):
+        self.id = approval_id or f"ga_{secrets.token_urlsafe(9)}"
         self.event = threading.Event()
         self.data = data          # command, description, pattern_keys, …
+        self.data.setdefault("gateway_approval_id", self.id)
         self.result: Optional[str] = None  # "once"|"session"|"always"|"deny"
 
 
@@ -300,6 +303,36 @@ def resolve_gateway_approval(session_key: str, choice: str,
         entry.result = choice
         entry.event.set()
     return len(targets)
+
+
+def resolve_gateway_approval_by_id(gateway_approval_id: str, choice: str) -> int:
+    """Resolve one pending gateway approval by its stable entry id.
+
+    Button-based approvals use this so clicking the second of two pending
+    Telegram cards resolves that exact card instead of the oldest FIFO item.
+    Text fallback commands keep using :func:`resolve_gateway_approval`.
+    """
+    if not gateway_approval_id:
+        return 0
+    target = None
+    with _lock:
+        for session_key, queue in list(_gateway_queues.items()):
+            for entry in list(queue):
+                if getattr(entry, "id", None) != gateway_approval_id:
+                    continue
+                queue.remove(entry)
+                if not queue:
+                    _gateway_queues.pop(session_key, None)
+                target = entry
+                break
+            if target is not None:
+                break
+
+    if target is None:
+        return 0
+    target.result = choice
+    target.event.set()
+    return 1
 
 
 def has_blocking_approval(session_key: str) -> bool:

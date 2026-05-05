@@ -88,6 +88,7 @@ from agent.prompt_builder import (
     DEFAULT_AGENT_IDENTITY, PLATFORM_HINTS,
     DETERMINISTIC_OUTPUT_GUIDANCE, OPERATOR_SAFETY_GUIDANCE,
     MEMORY_GUIDANCE, SESSION_SEARCH_GUIDANCE, SKILLS_GUIDANCE,
+    KANBAN_GUIDANCE, KANBAN_ORCHESTRATOR_GUIDANCE,
     build_nous_subscription_prompt,
 )
 from agent.model_metadata import (
@@ -4590,6 +4591,10 @@ class AIAgent:
             tool_guidance.append(SESSION_SEARCH_GUIDANCE)
         if "skill_manage" in self.valid_tool_names:
             tool_guidance.append(SKILLS_GUIDANCE)
+        if os.environ.get("HERMES_KANBAN_TASK") and "kanban_show" in self.valid_tool_names:
+            tool_guidance.append(KANBAN_GUIDANCE)
+        elif "kanban_create" in self.valid_tool_names:
+            tool_guidance.append(KANBAN_ORCHESTRATOR_GUIDANCE)
         if tool_guidance:
             prompt_parts.append(" ".join(tool_guidance))
 

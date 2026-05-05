@@ -250,8 +250,8 @@ class TelegramAdapter(BasePlatformAdapter):
         self._dm_topics_config: List[Dict[str, Any]] = self.config.extra.get("dm_topics", [])
         # Interactive model picker state per chat
         self._model_picker_state: Dict[str, dict] = {}
-        # Approval button state: message_id → session_key
-        self._approval_state: Dict[int, str] = {}
+        # Approval button state: local callback id -> session/id metadata.
+        self._approval_state: Dict[int, Any] = {}
 
     @staticmethod
     def _is_callback_user_authorized(user_id: str) -> bool:
@@ -1484,22 +1484,43 @@ class TelegramAdapter(BasePlatformAdapter):
         self, chat_id: str, command: str, session_key: str,
         description: str = "dangerous command",
         metadata: Optional[Dict[str, Any]] = None,
+        approval_data: Optional[Dict[str, Any]] = None,
     ) -> SendResult:
         """Send an inline-keyboard approval prompt with interactive buttons.
 
-        The buttons call ``resolve_gateway_approval()`` to unblock the waiting
-        agent thread — same mechanism as the text ``/approve`` flow.
+        New approvals carry ``gateway_approval_id`` and resolve that exact
+        queue entry. Older callers without approval_data still fall back to
+        FIFO resolution through ``resolve_gateway_approval()``.
         """
         if not self._bot:
             return SendResult(success=False, error="Not connected")
 
         try:
-            cmd_preview = command[:3800] + "..." if len(command) > 3800 else command
-            text = (
-                f"⚠️ <b>Command Approval Required</b>\n\n"
-                f"<pre>{_html.escape(cmd_preview)}</pre>\n\n"
-                f"Reason: {_html.escape(description)}"
-            )
+            data = approval_data or {}
+            is_external = bool(data.get("external_action"))
+            if is_external:
+                action_type = str(data.get("action_type") or "external action")
+                channel = str(data.get("channel") or "")
+                target = str(data.get("target") or "")
+                target_label = f"{channel}:{target}" if target else channel
+                payload_hash = str(data.get("payload_hash") or "")
+                preview = str(data.get("payload_preview") or "")
+                preview = preview[:2600] + "..." if len(preview) > 2600 else preview
+                text = (
+                    f"⚠️ <b>External Action Approval Required</b>\n\n"
+                    f"Action: {_html.escape(action_type)}\n"
+                    f"Target: {_html.escape(target_label or '-')}\n"
+                    f"Payload hash: <code>{_html.escape(payload_hash or '-')}</code>\n\n"
+                    f"<pre>{_html.escape(preview or '(no preview)')}</pre>\n\n"
+                    f"Reason: {_html.escape(description)}"
+                )
+            else:
+                cmd_preview = command[:3800] + "..." if len(command) > 3800 else command
+                text = (
+                    f"⚠️ <b>Command Approval Required</b>\n\n"
+                    f"<pre>{_html.escape(cmd_preview)}</pre>\n\n"
+                    f"Reason: {_html.escape(description)}"
+                )
 
             # Resolve thread context for thread replies
             thread_id = self._metadata_thread_id(metadata)
@@ -1512,16 +1533,21 @@ class TelegramAdapter(BasePlatformAdapter):
                 self._approval_counter = itertools.count(1)
             approval_id = next(self._approval_counter)
 
-            keyboard = InlineKeyboardMarkup([
-                [
-                    InlineKeyboardButton("✅ Allow Once", callback_data=f"ea:once:{approval_id}"),
-                    InlineKeyboardButton("✅ Session", callback_data=f"ea:session:{approval_id}"),
-                ],
-                [
-                    InlineKeyboardButton("✅ Always", callback_data=f"ea:always:{approval_id}"),
-                    InlineKeyboardButton("❌ Deny", callback_data=f"ea:deny:{approval_id}"),
-                ],
-            ])
+            callback_prefix = "ga" if data.get("gateway_approval_id") else "ea"
+            rows = [[
+                InlineKeyboardButton("✅ Allow Once", callback_data=f"{callback_prefix}:once:{approval_id}"),
+                InlineKeyboardButton("✅ Session", callback_data=f"{callback_prefix}:session:{approval_id}"),
+            ]]
+            if is_external:
+                rows.append([
+                    InlineKeyboardButton("❌ Deny", callback_data=f"{callback_prefix}:deny:{approval_id}"),
+                ])
+            else:
+                rows.append([
+                    InlineKeyboardButton("✅ Always", callback_data=f"{callback_prefix}:always:{approval_id}"),
+                    InlineKeyboardButton("❌ Deny", callback_data=f"{callback_prefix}:deny:{approval_id}"),
+                ])
+            keyboard = InlineKeyboardMarkup(rows)
 
             kwargs: Dict[str, Any] = {
                 "chat_id": int(chat_id),
@@ -1536,8 +1562,13 @@ class TelegramAdapter(BasePlatformAdapter):
 
             msg = await self._bot.send_message(**kwargs)
 
-            # Store session_key keyed by approval_id for the callback handler
-            self._approval_state[approval_id] = session_key
+            # Store enough metadata to resolve exactly the clicked approval.
+            self._approval_state[approval_id] = {
+                "session_key": session_key,
+                "gateway_approval_id": data.get("gateway_approval_id"),
+                "durable_approval_id": data.get("approval_id"),
+                "kind": "external_action" if is_external else "command",
+            }
 
             return SendResult(success=True, message_id=str(msg.message_id))
         except Exception as e:
@@ -1856,8 +1887,8 @@ class TelegramAdapter(BasePlatformAdapter):
                 await self._handle_model_picker_callback(query, data, chat_id)
             return
 
-        # --- Exec approval callbacks (ea:choice:id) ---
-        if data.startswith("ea:"):
+        # --- Exec/gateway approval callbacks (ea|ga:choice:id) ---
+        if data.startswith(("ea:", "ga:")):
             parts = data.split(":", 2)
             if len(parts) == 3:
                 choice = parts[1]  # once, session, always, deny
@@ -1873,10 +1904,17 @@ class TelegramAdapter(BasePlatformAdapter):
                     await query.answer(text="⛔ You are not authorized to approve commands.")
                     return
 
-                session_key = self._approval_state.pop(approval_id, None)
-                if not session_key:
+                state = self._approval_state.pop(approval_id, None)
+                if not state:
                     await query.answer(text="This approval has already been resolved.")
                     return
+                if isinstance(state, dict):
+                    session_key = str(state.get("session_key") or "")
+                    gateway_approval_id = state.get("gateway_approval_id")
+                else:
+                    # Backwards compatibility for pre-migration in-memory state.
+                    session_key = str(state)
+                    gateway_approval_id = None
 
                 # Map choice to human-readable label
                 label_map = {
@@ -1902,8 +1940,14 @@ class TelegramAdapter(BasePlatformAdapter):
 
                 # Resolve the approval — unblocks the agent thread
                 try:
-                    from tools.approval import resolve_gateway_approval
-                    count = resolve_gateway_approval(session_key, choice)
+                    if gateway_approval_id:
+                        from tools.approval import resolve_gateway_approval_by_id
+                        count = resolve_gateway_approval_by_id(
+                            str(gateway_approval_id), choice
+                        )
+                    else:
+                        from tools.approval import resolve_gateway_approval
+                        count = resolve_gateway_approval(session_key, choice)
                     logger.info(
                         "Telegram button resolved %d approval(s) for session %s (choice=%s, user=%s)",
                         count, session_key, choice, user_display,

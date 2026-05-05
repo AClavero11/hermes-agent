@@ -900,6 +900,13 @@ DEFAULT_CONFIG = {
         "max_parallel_jobs": None,
     },
 
+    # Kanban multi-agent coordination. The gateway owns the default dispatcher
+    # so tasks created from Telegram/CLI are picked up without a separate daemon.
+    "kanban": {
+        "dispatch_in_gateway": True,
+        "dispatch_interval_seconds": 60,
+    },
+
     # execute_code settings — controls the tool used for programmatic tool calls.
     "code_execution": {
         # Execution mode:

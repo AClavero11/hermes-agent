@@ -158,6 +158,24 @@ class TestBlockingGatewayApproval:
         assert not e2.event.is_set()
         assert len(_gateway_queues[session_key]) == 1
 
+    def test_resolve_by_id_ignores_fifo_order(self):
+        """Button callbacks resolve the clicked approval, not the oldest one."""
+        from tools.approval import (
+            resolve_gateway_approval_by_id,
+            _ApprovalEntry, _gateway_queues,
+        )
+        session_key = "test-by-id"
+        e1 = _ApprovalEntry({"command": "first"}, approval_id="ga_first")
+        e2 = _ApprovalEntry({"command": "second"}, approval_id="ga_second")
+        _gateway_queues[session_key] = [e1, e2]
+
+        count = resolve_gateway_approval_by_id("ga_second", "deny")
+        assert count == 1
+        assert not e1.event.is_set()
+        assert e2.event.is_set()
+        assert e2.result == "deny"
+        assert _gateway_queues[session_key] == [e1]
+
     def test_unregister_signals_all_entries(self):
         """unregister_gateway_notify signals all waiting entries to prevent hangs."""
         from tools.approval import (
