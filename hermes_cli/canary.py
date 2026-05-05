@@ -1690,6 +1690,13 @@ def _canary_live_behavior(options: CanaryOptions) -> CanaryResult:
             "latency_budget_ms": 1000,
         },
         {
+            "name": "rfq_field_followup_no_task_triage",
+            "input": "qty 1",
+            "required": ["Received: qty 1"],
+            "forbidden": ["Prioritized tasks", "Execution blocked", "No actions executed"],
+            "latency_budget_ms": 1000,
+        },
+        {
             "name": "operator_menu_inventory_choice_direct",
             "input": "inventory",
             "required": ["Inventory mode", "V11", "read-only"],

@@ -1,10 +1,17 @@
 import json
 from datetime import date
 from pathlib import Path
+from types import SimpleNamespace
+
+import pytest
 
 from gateway.rfq_fast_path import (
     READ_ONLY_RFQ_TOOLS,
+    RFQFastPathResult,
+    ParsedRFQ,
+    build_rfq_followup_without_context_response,
     build_rfq_fast_path_response,
+    merge_rfq_followup_prompt,
     parse_contextual_rfq_prompt,
     parse_rfq_prompt,
 )
@@ -19,6 +26,96 @@ def test_parse_turkish_rfq_prompt():
     assert parsed.qty == "1"
     assert parsed.condition == "SV"
     assert parsed.sufficient_for_lookup is True
+
+
+def test_rfq_followup_merges_missing_qty():
+    merged = merge_rfq_followup_prompt(
+        "quote aero accessories 5909891 AR condition",
+        "qty 1",
+    )
+
+    assert merged == "quote aero accessories pn 5909891 qty 1 AR condition"
+    parsed = parse_rfq_prompt(merged)
+    assert parsed is not None
+    assert parsed.customer == "aero accessories"
+    assert parsed.part_number == "5909891"
+    assert parsed.qty == "1"
+    assert parsed.condition == "AR"
+    assert parsed.sufficient_for_lookup is True
+
+
+def test_rfq_field_followup_without_context_is_concise():
+    response = build_rfq_followup_without_context_response("qty 1")
+
+    assert "Received: qty 1." in response
+    assert "Prioritized tasks" not in response
+    assert "Execution blocked" not in response
+    assert "No actions executed" not in response
+
+
+@pytest.mark.asyncio
+async def test_gateway_rfq_followup_uses_pending_prompt(monkeypatch):
+    from gateway import run as gateway_run
+    from gateway.run import GatewayRunner
+
+    calls = []
+
+    async def fake_rfq_result(message):
+        calls.append(message)
+        if message == "quote aero accessories 5909891 AR condition":
+            return RFQFastPathResult(
+                response="RFQ fast path\n\nMissing fields: qty",
+                parsed=ParsedRFQ(
+                    customer="aero accessories",
+                    part_number="5909891",
+                    qty="",
+                    condition="AR",
+                    target_price="",
+                    free_text=message,
+                ),
+                tool_calls=(),
+                elapsed_seconds=0.0,
+            )
+        if message == "quote aero accessories pn 5909891 qty 1 AR condition":
+            return RFQFastPathResult(
+                response="RFQ fast path\n\nParsed RFQ:\n- Qty: 1",
+                parsed=ParsedRFQ(
+                    customer="aero accessories",
+                    part_number="5909891",
+                    qty="1",
+                    condition="AR",
+                    target_price="",
+                    free_text=message,
+                ),
+                tool_calls=(),
+                elapsed_seconds=0.0,
+            )
+        raise AssertionError(message)
+
+    monkeypatch.setattr(gateway_run, "_run_rfq_fast_path_result", fake_rfq_result)
+    runner = object.__new__(GatewayRunner)
+    runner._pending_rfq_prompts = {}
+
+    first = await GatewayRunner._run_session_rfq_fast_path(
+        runner,
+        SimpleNamespace(text="quote aero accessories 5909891 AR condition"),
+        session_key="telegram:ac",
+    )
+    second = await GatewayRunner._run_session_rfq_fast_path(
+        runner,
+        SimpleNamespace(text="qty 1"),
+        session_key="telegram:ac",
+    )
+
+    assert "Missing fields: qty" in first
+    assert "RFQ fast path" in second
+    assert "Prioritized tasks" not in second
+    assert "Execution blocked" not in second
+    assert calls == [
+        "quote aero accessories 5909891 AR condition",
+        "quote aero accessories pn 5909891 qty 1 AR condition",
+    ]
+    assert runner._pending_rfq_prompts == {}
 
 
 def test_rfq_fast_path_allows_read_only_tools_without_explicit_execution_words():

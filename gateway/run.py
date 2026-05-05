@@ -41,6 +41,7 @@ from agent.account_usage import fetch_account_usage, render_account_usage_lines
 # from _enforce_agent_cache_cap() and _session_expiry_watcher() below.
 _AGENT_CACHE_MAX_SIZE = 128
 _AGENT_CACHE_IDLE_TTL_SECS = 3600.0  # evict agents idle for >1h
+_PENDING_RFQ_TTL_SECONDS = 15 * 60
 
 # ---------------------------------------------------------------------------
 # SSL certificate auto-detection for NixOS and other non-standard systems.
@@ -949,18 +950,30 @@ def _build_planning_mode_answer(message: str) -> str:
         )
 
 
-async def _run_rfq_fast_path(message: str) -> str:
+async def _run_rfq_fast_path_result(message: str) -> Any:
     text = (message or "").strip()
     if not text:
-        return ""
+        return None
     try:
         from gateway.rfq_fast_path import build_rfq_fast_path_response
 
         loop = asyncio.get_running_loop()
-        result = await loop.run_in_executor(None, build_rfq_fast_path_response, text)
-        return result.response if result is not None else ""
+        return await loop.run_in_executor(None, build_rfq_fast_path_response, text)
     except Exception as exc:
         logger.debug("RFQ fast path failed: %s", exc)
+        return None
+
+
+async def _run_rfq_fast_path(message: str) -> str:
+    result = await _run_rfq_fast_path_result(message)
+    if result is not None:
+        return result.response
+    try:
+        from gateway.rfq_fast_path import build_rfq_followup_without_context_response
+
+        return build_rfq_followup_without_context_response(message)
+    except Exception as exc:
+        logger.debug("RFQ follow-up fallback failed: %s", exc)
         return ""
 
 
@@ -1985,6 +1998,7 @@ class GatewayRunner:
         self._running_agents: Dict[str, Any] = {}
         self._running_agents_ts: Dict[str, float] = {}  # start timestamp per session
         self._pending_messages: Dict[str, str] = {}  # Queued messages during interrupt
+        self._pending_rfq_prompts: Dict[str, Dict[str, Any]] = {}
         self._busy_ack_ts: Dict[str, float] = {}  # last busy-ack timestamp per session (debounce)
         self._session_run_generation: Dict[str, int] = {}
         self._goal_continuation_inflight: set[str] = set()
@@ -2374,6 +2388,71 @@ class GatewayRunner:
             group_sessions_per_user=getattr(config, "group_sessions_per_user", True),
             thread_sessions_per_user=getattr(config, "thread_sessions_per_user", False),
         )
+
+    def _get_pending_rfq_prompt(self, session_key: str) -> str:
+        pending = getattr(self, "_pending_rfq_prompts", {}).get(session_key)
+        if not isinstance(pending, dict):
+            return ""
+        if time.monotonic() - float(pending.get("timestamp") or 0.0) > _PENDING_RFQ_TTL_SECONDS:
+            self._pending_rfq_prompts.pop(session_key, None)
+            return ""
+        return str(pending.get("text") or "").strip()
+
+    def _remember_pending_rfq_prompt(self, session_key: str, prompt: str) -> None:
+        if not hasattr(self, "_pending_rfq_prompts"):
+            self._pending_rfq_prompts = {}
+        self._pending_rfq_prompts[session_key] = {
+            "text": prompt,
+            "timestamp": time.monotonic(),
+        }
+
+    def _clear_pending_rfq_prompt(self, session_key: str) -> None:
+        if hasattr(self, "_pending_rfq_prompts"):
+            self._pending_rfq_prompts.pop(session_key, None)
+
+    async def _run_session_rfq_fast_path(
+        self,
+        event: MessageEvent,
+        *,
+        session_key: str | None = None,
+    ) -> str:
+        text = (event.text or "").strip()
+        if not text:
+            return ""
+        resolved_session_key = session_key or self._session_key_for_source(event.source)
+        try:
+            from gateway.rfq_fast_path import (
+                build_rfq_followup_without_context_response,
+                merge_rfq_followup_prompt,
+            )
+        except Exception as exc:
+            logger.debug("RFQ follow-up helpers unavailable: %s", exc)
+            return await _run_rfq_fast_path(text)
+
+        pending_prompt = self._get_pending_rfq_prompt(resolved_session_key)
+        if pending_prompt:
+            merged_prompt = merge_rfq_followup_prompt(pending_prompt, text)
+            if merged_prompt:
+                result = await _run_rfq_fast_path_result(merged_prompt)
+                if result is not None:
+                    if getattr(getattr(result, "parsed", None), "missing_fields", []):
+                        self._remember_pending_rfq_prompt(resolved_session_key, merged_prompt)
+                    else:
+                        self._clear_pending_rfq_prompt(resolved_session_key)
+                    return str(result.response or "")
+
+        result = await _run_rfq_fast_path_result(text)
+        if result is not None:
+            if getattr(getattr(result, "parsed", None), "missing_fields", []):
+                self._remember_pending_rfq_prompt(resolved_session_key, text)
+            else:
+                self._clear_pending_rfq_prompt(resolved_session_key)
+            return str(result.response or "")
+
+        followup_response = build_rfq_followup_without_context_response(text)
+        if followup_response:
+            return followup_response
+        return ""
 
     def _resolve_session_agent_runtime(
         self,
@@ -2905,7 +2984,7 @@ class GatewayRunner:
             return False  # let default path handle it
 
         if event.message_type == MessageType.TEXT and not event.get_command():
-            rfq_answer = await _run_rfq_fast_path(event.text or "")
+            rfq_answer = await self._run_session_rfq_fast_path(event, session_key=session_key)
             if rfq_answer:
                 thread_meta = {"thread_id": event.source.thread_id} if event.source.thread_id else None
                 await adapter._send_with_retry(
@@ -5632,7 +5711,7 @@ class GatewayRunner:
 
         if _quick_key in self._running_agents:
             if not event.get_command():
-                _rfq_answer = await _run_rfq_fast_path(event.text or "")
+                _rfq_answer = await self._run_session_rfq_fast_path(event, session_key=_quick_key)
                 if _rfq_answer:
                     return _rfq_answer
 
@@ -6315,7 +6394,7 @@ class GatewayRunner:
         # No bare text matching — "yes" in normal conversation must not trigger
         # execution of a dangerous command.
         if not command:
-            rfq_answer = await _run_rfq_fast_path(event.text or "")
+            rfq_answer = await self._run_session_rfq_fast_path(event)
             if rfq_answer:
                 return rfq_answer
 

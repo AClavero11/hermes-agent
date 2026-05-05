@@ -40,6 +40,8 @@ _CONTEXTUAL_RFQ_RE = re.compile(
 _PUSH_PRICE_RE = re.compile(r"\b(?:push(?:\s+the)?\s+price|aggressive)\b", re.IGNORECASE)
 _HOLD_PRICE_RE = re.compile(r"\bhold\s+price\b", re.IGNORECASE)
 _BEST_PRICE_RE = re.compile(r"\b(?:best\s+price|cheap|move\s+it)\b", re.IGNORECASE)
+_BARE_NUMBER_RE = re.compile(r"^\s*(\d+(?:\.\d+)?)\s*$")
+_FOLLOWUP_FILLER_RE = re.compile(r"\b(?:please|pls|thx|thanks)\b", re.IGNORECASE)
 
 _CUSTOMER_STOP_WORDS = {
     "quote",
@@ -293,6 +295,112 @@ def _extract_customer(text: str, part_number: str) -> str:
                 return customer
 
     return ""
+
+
+def _scrub_followup_text(text: str) -> str:
+    scrubbed = text or ""
+    scrubbed = _PART_LABEL_RE.sub(" ", scrubbed)
+    scrubbed = _QTY_RE.sub(" ", scrubbed)
+    scrubbed = _CONDITION_RE.sub(" ", scrubbed)
+    scrubbed = _TARGET_PRICE_RE.sub(" ", scrubbed)
+    scrubbed = _FOLLOWUP_FILLER_RE.sub(" ", scrubbed)
+    return re.sub(r"[\s:#,$-]+", "", scrubbed).strip()
+
+
+def _extract_rfq_followup_fields(text: str, previous: ParsedRFQ | None = None) -> dict[str, str]:
+    raw = (text or "").strip()
+    if not raw:
+        return {}
+
+    fields: dict[str, str] = {}
+    labeled_part = _PART_LABEL_RE.search(raw)
+    if labeled_part:
+        fields["part_number"] = _clean_token(labeled_part.group(1)).upper()
+
+    qty = _extract_qty(raw)
+    condition = _extract_condition(raw)
+    target_price = _extract_target_price(raw)
+    if qty:
+        fields["qty"] = qty
+    if condition:
+        fields["condition"] = condition
+    if target_price:
+        fields["target_price"] = target_price
+
+    bare_number = _BARE_NUMBER_RE.fullmatch(raw)
+    if bare_number and previous is not None:
+        number = bare_number.group(1)
+        if "qty" in previous.missing_fields:
+            fields["qty"] = number
+        elif "part_number" in previous.missing_fields and len(number.replace(".", "")) >= 3:
+            fields["part_number"] = number.upper()
+
+    if not fields:
+        return {}
+
+    if not bare_number and _scrub_followup_text(raw):
+        return {}
+    return fields
+
+
+def is_rfq_field_followup(text: str) -> bool:
+    """Return True for short RFQ field-only replies such as ``qty 1``."""
+    raw = (text or "").strip()
+    if len(raw.split()) > 6:
+        return False
+    fields = _extract_rfq_followup_fields(raw)
+    return bool(fields) and not _RFQ_WORD_RE.search(raw)
+
+
+def merge_rfq_followup_prompt(previous_text: str, followup_text: str) -> str:
+    """Merge a short field-only reply into the previous incomplete RFQ prompt."""
+    previous = parse_rfq_prompt(previous_text)
+    if previous is None:
+        return ""
+    fields = _extract_rfq_followup_fields(followup_text, previous)
+    if not fields:
+        return ""
+
+    customer = previous.customer
+    part_number = fields.get("part_number") or previous.part_number
+    qty = fields.get("qty") or previous.qty
+    condition = fields.get("condition") or previous.condition
+    target_price = fields.get("target_price") or previous.target_price
+
+    parts = ["quote"]
+    if customer:
+        parts.append(customer)
+    if part_number:
+        parts.extend(["pn", part_number])
+    if qty:
+        parts.extend(["qty", qty])
+    if condition:
+        parts.extend([condition, "condition"])
+    if target_price:
+        parts.extend(["target", target_price])
+    return " ".join(parts).strip()
+
+
+def build_rfq_followup_without_context_response(text: str) -> str:
+    """Return a concise reply for RFQ field-only text without active RFQ context."""
+    fields = _extract_rfq_followup_fields(text)
+    if not fields:
+        return ""
+    parsed_fields: list[str] = []
+    if fields.get("part_number"):
+        parsed_fields.append(f"PN {fields['part_number']}")
+    if fields.get("qty"):
+        parsed_fields.append(f"qty {fields['qty']}")
+    if fields.get("condition"):
+        parsed_fields.append(f"{fields['condition']} condition")
+    if fields.get("target_price"):
+        parsed_fields.append(f"target ${fields['target_price']}")
+    received = ", ".join(parsed_fields) if parsed_fields else "RFQ field"
+    return "\n".join([
+        f"Received: {received}.",
+        "No active incomplete RFQ found in this chat.",
+        "Send customer, PN, condition, and qty in one message.",
+    ])
 
 
 def parse_rfq_prompt(text: str) -> ParsedRFQ | None:

@@ -324,14 +324,19 @@ async def _rfq_fast_path_reply_text(content: Any) -> str:
         return ""
     try:
         from gateway import run as gateway_run
-        from gateway.rfq_fast_path import build_rfq_fast_path_response
+        from gateway.rfq_fast_path import (
+            build_rfq_fast_path_response,
+            build_rfq_followup_without_context_response,
+        )
 
         lane_choice = getattr(gateway_run, "_classify_operator_lane_choice", None)
         if callable(lane_choice) and lane_choice(text):
             return ""
         loop = asyncio.get_running_loop()
         result = await loop.run_in_executor(None, build_rfq_fast_path_response, text)
-        return result.response if result is not None else ""
+        if result is not None:
+            return result.response
+        return build_rfq_followup_without_context_response(text)
     except Exception as exc:
         logger.debug("RFQ fast path probe failed: %s", exc)
         return ""
