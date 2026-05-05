@@ -105,5 +105,25 @@ def test_direct_context_paths_for_pricing_keyword():
     )
 
 
+def test_direct_context_paths_for_non_rfq_business_lanes():
+    finance_paths = context_router.direct_alexandria_context_paths(
+        "cash receivables payables invoice exposure"
+    )
+    assert "advanced/financials/CONTEXT.md" in finance_paths
+    assert "advanced/operations/CONTEXT.md" in finance_paths
+
+    purchasing_paths = context_router.direct_alexandria_context_paths(
+        "vendor followups and open purchase order blockers"
+    )
+    assert "advanced/operations/CONTEXT.md" in purchasing_paths
+    assert "advanced/vendor-pricing/CONTEXT.md" in purchasing_paths
+
+    repair_paths = context_router.direct_alexandria_context_paths(
+        "stuck repair teardown cert blocker"
+    )
+    assert "advanced/operations/CONTEXT.md" in repair_paths
+    assert "advanced/teardown/CONTEXT.md" in repair_paths
+
+
 def test_direct_context_paths_routing_md_always_first():
     assert context_router.direct_alexandria_context_paths("pricing strategy")[0] == "_system/ROUTING.md"

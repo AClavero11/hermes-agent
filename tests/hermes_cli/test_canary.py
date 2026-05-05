@@ -44,6 +44,14 @@ def test_canary_suite_runs_without_live_gateway(tmp_path):
         for result in report.results
     )
     assert any(
+        result.name == "contract.memory_grounding" and result.status in {PASS, WARN}
+        for result in report.results
+    )
+    assert any(
+        result.name == "contract.business_os_brief" and result.status == PASS
+        for result in report.results
+    )
+    assert any(
         result.name == "live.gateway_health" and result.status == SKIP
         for result in report.results
     )
@@ -395,6 +403,8 @@ def _quality_foundation_results() -> list[CanaryResult]:
         CanaryResult("live.gateway_health", PASS, 15, 15, "gateway health passed"),
         CanaryResult("contract.scorecard_trend", PASS, 10, 10, "trend installed"),
         CanaryResult("contract.aac_workflows", PASS, 15, 15, "AAC workflows passed"),
+        CanaryResult("contract.memory_grounding", PASS, 20, 20, "memory grounding passed"),
+        CanaryResult("contract.business_os_brief", PASS, 20, 20, "business OS brief passed"),
         CanaryResult("contract.x_scrape", PASS, 10, 10, "X scrape contract passed"),
         CanaryResult("contract.workspace_store", PASS, 10, 10, "Workspace store passed"),
         CanaryResult("contract.workflow_registry", PASS, 15, 15, "Workflow registry passed"),
@@ -515,8 +525,7 @@ def test_quality_score_9_requires_telegram_e2e():
     readiness = readiness_summary(report)
 
     assert summary["score"] == 8.5
-    assert summary["increments"][4]["target"] == "9.0/10"
-    assert summary["increments"][4]["status"] == "open"
+    assert next(item for item in summary["increments"] if item["target"] == "9.0/10")["status"] == "open"
     assert readiness["status"] == "not_frontier_ready"
     assert {gate["name"] for gate in readiness["open_gates"]} >= {
         "local_deepseek_executor",

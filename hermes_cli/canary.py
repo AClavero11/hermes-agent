@@ -914,6 +914,11 @@ def _canary_command_registry() -> CanaryResult:
             "subcommands": {"status", "list", "kill", "resume", "report"},
         },
         "workflows": {"gateway_only": True},
+        "ops": {
+            "gateway_only": True,
+            "subcommands": {"brief", "score", "workflows"},
+        },
+        "business": {"gateway_only": True},
         "kill": {"gateway_only": True},
         "approve": {"gateway_only": True},
         "deny": {"gateway_only": True},
@@ -950,7 +955,7 @@ def _canary_command_registry() -> CanaryResult:
         PASS,
         10,
         10,
-        "Goal, Workspace, approval commands registered",
+        "Goal, Workspace, Workflow, Ops, and approval commands registered",
         details,
     )
 
@@ -1069,14 +1074,22 @@ def _canary_workflow_registry() -> CanaryResult:
     with tempfile.TemporaryDirectory(prefix="hermes-canary-workflow-") as tmp:
         store = WorkflowRegistry(Path(tmp) / "workflow_registry.json")
         seeded = {workflow["id"]: workflow for workflow in store.list_workflows()}
-        if "rfq-intake" not in seeded:
+        required_seeded = {
+            "rfq-intake",
+            "finance-admin-daily-brief",
+            "purchasing-vendor-followup",
+            "repair-stuck-units",
+            "inventory-hot-parts-review",
+        }
+        missing_seeded = sorted(required_seeded - set(seeded))
+        if missing_seeded:
             return _result(
                 "contract.workflow_registry",
                 FAIL,
                 0,
                 15,
-                "Default RFQ intake workflow missing from registry seed",
-                {"seeded": sorted(seeded)},
+                "Default workflow registry seed is missing required AAC lanes",
+                {"missing": missing_seeded, "seeded": sorted(seeded)},
             )
         killed = store.kill_workflow(
             "rfq-intake",
@@ -3284,6 +3297,195 @@ def _canary_aac_workflow_goldens(options: CanaryOptions) -> CanaryResult:
     )
 
 
+def _canary_memory_grounding(options: CanaryOptions) -> CanaryResult:
+    from gateway import context_router
+
+    scenarios = [
+        {
+            "name": "finance_admin_context",
+            "message": "Give me AAC cash, receivables, payables, deposits, and invoice exposure from financials and V11.",
+            "paths": {
+                "_system/ROUTING.md",
+                "advanced/financials/CONTEXT.md",
+                "advanced/operations/CONTEXT.md",
+            },
+        },
+        {
+            "name": "purchasing_context",
+            "message": "Review purchasing vendor followups, supplier quotes, and open purchase order blockers.",
+            "paths": {
+                "_system/ROUTING.md",
+                "advanced/operations/CONTEXT.md",
+                "advanced/vendor-pricing/CONTEXT.md",
+            },
+        },
+        {
+            "name": "repair_context",
+            "message": "Find stuck repair and teardown work with cert or 8130 blockers.",
+            "paths": {
+                "_system/ROUTING.md",
+                "advanced/operations/CONTEXT.md",
+                "advanced/teardown/CONTEXT.md",
+            },
+        },
+        {
+            "name": "hermes_context",
+            "message": "Where is Hermes running and what is the global score?",
+            "paths": {
+                "_system/ROUTING.md",
+                "advanced/czar/CONTEXT.md",
+            },
+        },
+    ]
+
+    failed: dict[str, Any] = {}
+    passed: list[str] = []
+    for scenario in scenarios:
+        name = scenario["name"]
+        message = scenario["message"]
+        if not context_router._message_requests_alexandria_context(message):
+            failed[name] = "message did not request Alexandria/V11 context"
+            continue
+        paths = set(context_router._direct_alexandria_context_paths(message))
+        missing_paths = sorted(scenario["paths"] - paths)
+        if missing_paths:
+            failed[name] = {"missing_paths": missing_paths, "paths": sorted(paths)}
+            continue
+        passed.append(name)
+
+    source_paths = [
+        Path.home() / "alexandria" / "_system" / "ROUTING.md",
+        Path.home() / "alexandria" / "advanced" / "czar" / "CONTEXT.md",
+        Path.home() / "alexandria" / "advanced" / "operations" / "CONTEXT.md",
+        Path.home() / "alexandria" / "advanced" / "financials" / "CONTEXT.md",
+    ]
+    source_status: dict[str, str] = {}
+    for path in source_paths:
+        try:
+            source_status[str(path)] = "present" if path.is_file() else "missing"
+        except OSError as exc:
+            source_status[str(path)] = f"inaccessible: {exc}"
+    missing_sources = [path for path, status in source_status.items() if status != "present"]
+    if missing_sources:
+        failed["source_files"] = {"missing_or_inaccessible": missing_sources, "status": source_status}
+    else:
+        passed.append("source_files")
+
+    total_checks = len(scenarios) + 1
+    score = round(20.0 * len(passed) / total_checks, 1)
+    status = PASS if not failed else WARN if passed else FAIL
+    return _result(
+        "contract.memory_grounding",
+        status,
+        score,
+        20,
+        f"{len(passed)}/{total_checks} memory/V11 grounding checks passed",
+        {"passed": passed, "failed": failed},
+    )
+
+
+def _canary_business_os_brief(options: CanaryOptions) -> CanaryResult:
+    from hermes_cli.business_ops import (
+        BUSINESS_OS_WORKFLOW_IDS,
+        build_business_ops_brief,
+    )
+    from hermes_cli.commands import resolve_command
+    from hermes_cli.workspace import WorkspaceStore
+    from hermes_cli.workflows import WorkflowRegistry
+
+    failed: dict[str, Any] = {}
+    passed: list[str] = []
+
+    with tempfile.TemporaryDirectory(prefix="hermes-business-os-") as tmp:
+        root = Path(tmp)
+        latest_dir = root / "canary" / "reports"
+        latest_dir.mkdir(parents=True)
+        (latest_dir / "latest.json").write_text(
+            json.dumps({
+                "status": "warn",
+                "percent": 100.0,
+                "overall_quality": {"score": 8.8},
+                "readiness": {"status": "not_frontier_ready"},
+            }),
+            encoding="utf-8",
+        )
+        workspace = WorkspaceStore(root / "workspace" / "control_plane.json")
+        workspace.create_task(
+            "Stuck repair blocker review",
+            owner="operator",
+            project="repairs",
+            status="blocked",
+            next_action="Identify missing cert package and owner.",
+            note="Business OS canary blocked work.",
+        )
+        registry = WorkflowRegistry(root / "workflows" / "registry.json")
+        brief = build_business_ops_brief(
+            hermes_home=root,
+            workspace_store=workspace,
+            workflow_registry=registry,
+            include_kanban=False,
+        )
+
+        required_text = [
+            "Hermes Business OS Brief",
+            "Score:",
+            "Workspace:",
+            "Workflow coverage:",
+            "Catch-up lanes:",
+            "finance-admin",
+            "purchasing",
+            "repairs",
+            "inventory",
+            "Memory/V11 grounding:",
+            "approval-gated",
+        ]
+        missing_text = [item for item in required_text if item not in brief]
+        if missing_text:
+            failed["brief_text"] = {"missing": missing_text, "brief": brief}
+        else:
+            passed.append("brief_text")
+
+        workflows = {workflow["id"]: workflow for workflow in registry.list_workflows(include_disabled=True)}
+        missing_workflows = [workflow_id for workflow_id in BUSINESS_OS_WORKFLOW_IDS if workflow_id not in workflows]
+        if missing_workflows:
+            failed["non_rfq_workflows"] = missing_workflows
+        else:
+            passed.append("non_rfq_workflows")
+
+    command = resolve_command("ops")
+    business_alias = resolve_command("business")
+    if command and command.gateway_only and business_alias and business_alias.name == "ops":
+        passed.append("ops_command")
+    else:
+        failed["ops_command"] = {
+            "ops": None if command is None else command.name,
+            "business": None if business_alias is None else business_alias.name,
+        }
+
+    source_paths = [
+        options.repo_root / "hermes_cli" / "business_ops.py",
+        options.repo_root / "gateway" / "run.py",
+        options.repo_root / "hermes_cli" / "commands.py",
+    ]
+    missing_sources = [str(path) for path in source_paths if not path.is_file()]
+    if missing_sources:
+        failed["source_files"] = missing_sources
+    else:
+        passed.append("source_files")
+
+    total_checks = 4
+    score = round(20.0 * len(passed) / total_checks, 1)
+    status = PASS if not failed else WARN if passed else FAIL
+    return _result(
+        "contract.business_os_brief",
+        status,
+        score,
+        20,
+        f"{len(passed)}/{total_checks} Business OS brief checks passed",
+        {"passed": passed, "failed": failed},
+    )
+
+
 def _env_file_has_any_key(path: Path, keys: set[str]) -> bool:
     try:
         lines = path.read_text(encoding="utf-8").splitlines()
@@ -4740,6 +4942,8 @@ def run_canary_suite(options: CanaryOptions) -> CanaryReport:
         ("live.x_scrape", 10, lambda: _canary_live_x_scrape(options)),
         ("contract.scorecard_trend", 10, lambda: _canary_scorecard_trend(options)),
         ("contract.aac_workflows", 15, lambda: _canary_aac_workflow_goldens(options)),
+        ("contract.memory_grounding", 20, lambda: _canary_memory_grounding(options)),
+        ("contract.business_os_brief", 20, lambda: _canary_business_os_brief(options)),
         ("contract.quote_ops_runtime", 20, lambda: _canary_quote_ops_runtime(options)),
         ("live.rfq_dry_run_quote_package", 25, lambda: _canary_rfq_dry_run_quote_package(options)),
         ("live.approved_rfq_draft_quote", 30, lambda: _canary_approved_rfq_draft_quote(options)),
@@ -4854,10 +5058,20 @@ def _quality_dimensions(report: CanaryReport) -> list[QualityDimension]:
         and workflow_result.status == PASS
     ):
         autonomy_score = 7.9
+    business_os_result = _result_by_name(report, "contract.business_os_brief")
+    if business_os_result and business_os_result.status == PASS:
+        autonomy_score = max(autonomy_score, 8.4)
+    elif business_os_result and business_os_result.status == WARN:
+        autonomy_score = max(autonomy_score, 8.0)
 
     memory_score = 6.8
     if behavior_result and "sonnet_continuity" in behavior_result.details.get("passed", []):
         memory_score = 7.2
+    memory_grounding_result = _result_by_name(report, "contract.memory_grounding")
+    if memory_grounding_result and memory_grounding_result.status == PASS:
+        memory_score = max(memory_score, 8.4)
+    elif memory_grounding_result and memory_grounding_result.status == WARN:
+        memory_score = max(memory_score, 7.6)
 
     x_result = _result_by_name(report, "live.x_scrape")
     ux_score = 6.7
@@ -4890,6 +5104,16 @@ def _quality_dimensions(report: CanaryReport) -> list[QualityDimension]:
     elif aac_workflows_result and aac_workflows_result.status == WARN:
         aac_workflows_score = 6.5
         aac_workflows_summary = "AAC workflow canaries exist but one or more checks need hardening."
+    if (
+        business_os_result
+        and business_os_result.status == PASS
+        and memory_grounding_result
+        and memory_grounding_result.status == PASS
+    ):
+        aac_workflows_score = max(aac_workflows_score, 8.8)
+        aac_workflows_summary = (
+            "RFQ plus finance/admin, purchasing, repair, inventory, and memory/V11 grounding contracts pass."
+        )
 
     quote_ops_result = _result_by_name(report, "contract.quote_ops_runtime")
     rfq_dry_run_result = _result_by_name(report, "live.rfq_dry_run_quote_package")
@@ -5012,8 +5236,13 @@ def quality_summary(report: CanaryReport) -> dict[str, Any]:
     live_behavior_done = golden_done and passed("live.behavior_golden")
     trend_done = live_behavior_done and passed("contract.scorecard_trend")
     workflows_done = trend_done and passed("contract.aac_workflows")
-    foundation_done = (
+    business_os_done = (
         workflows_done
+        and passed("contract.memory_grounding")
+        and passed("contract.business_os_brief")
+    )
+    foundation_done = (
+        business_os_done
         and passed("contract.planner_self_heal")
         and local_deepseek_done
         and bool(model_routes_result and model_routes_result.status == PASS)
@@ -5046,6 +5275,11 @@ def quality_summary(report: CanaryReport) -> dict[str, Any]:
             "target": "8.5/10",
             "increment": "AAC workflow goldens: RFQ, V11 lookup, quote prep, Workspace report",
             "status": "done" if workflows_done else "open",
+        },
+        {
+            "target": "8.8/10",
+            "increment": "Global Business OS: memory/V11 grounding, non-RFQ workflow lanes, and /ops brief",
+            "status": "done" if business_os_done else "open",
         },
         {
             "target": "9.0/10",
@@ -5149,8 +5383,10 @@ def readiness_summary(report: CanaryReport) -> dict[str, Any]:
     )
     grounding_ok = (
         result_status("contract.aac_workflows") == PASS
+        and result_status("contract.memory_grounding") == PASS
         and result_status("contract.x_scrape") == PASS
     )
+    business_os_ok = result_status("contract.business_os_brief") == PASS
     control_plane_ok = (
         result_status("contract.workspace_store") == PASS
         and result_status("contract.workflow_registry") == PASS
@@ -5211,8 +5447,18 @@ def readiness_summary(report: CanaryReport) -> dict[str, Any]:
         {
             "name": "grounding_and_retrieval",
             "status": PASS if grounding_ok else WARN,
-            "requirement": "AAC workflow facts and X/Twitter retrieval contracts pass from source material.",
-            "evidence": f"{result_summary('contract.aac_workflows')} / {result_summary('contract.x_scrape')}",
+            "requirement": "AAC workflow, memory/V11, and X/Twitter retrieval contracts pass from source material.",
+            "evidence": (
+                f"{result_summary('contract.aac_workflows')} / "
+                f"{result_summary('contract.memory_grounding')} / "
+                f"{result_summary('contract.x_scrape')}"
+            ),
+        },
+        {
+            "name": "business_os_brief",
+            "status": PASS if business_os_ok else WARN,
+            "requirement": "Global /ops brief covers score, Workspace, non-RFQ lanes, and approval boundaries.",
+            "evidence": result_summary("contract.business_os_brief"),
         },
         {
             "name": "control_plane",

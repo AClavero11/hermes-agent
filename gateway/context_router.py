@@ -34,6 +34,26 @@ CONTEXT_TERMS = (
     "inventory",
     "sales order",
     "purchase order",
+    "purchasing",
+    "vendor",
+    "supplier",
+    "repair",
+    "repairs",
+    "teardown",
+    "shipping",
+    "invoice",
+    "invoices",
+    "receivable",
+    "receivables",
+    "payable",
+    "payables",
+    "cash",
+    "bank",
+    "deposit",
+    "finance",
+    "financials",
+    "p&l",
+    "balance sheet",
     "idg",
     "csd",
 )
@@ -67,6 +87,45 @@ HERMES_RELEASE_TERMS = (
     "v0.11.0",
 )
 
+FINANCE_TERMS = (
+    "cash",
+    "bank",
+    "deposit",
+    "payment",
+    "payments",
+    "invoice",
+    "invoices",
+    "receivable",
+    "receivables",
+    "payable",
+    "payables",
+    "finance",
+    "financials",
+    "p&l",
+    "balance sheet",
+)
+
+PURCHASING_TERMS = (
+    "purchase order",
+    "purchasing",
+    "vendor",
+    "supplier",
+    "po ",
+    "po#",
+    "quote from vendor",
+)
+
+REPAIR_TERMS = (
+    "repair",
+    "repairs",
+    "teardown",
+    "blocked unit",
+    "stuck unit",
+    "work order",
+    "cert",
+    "8130",
+)
+
 PART_NUMBER_RE = re.compile(
     r"\b(?:\d{5,}[A-Z]?|\d{4,}-\d+[A-Z0-9-]*|\d{2,}[A-Z]-?\d+[A-Z0-9-]*|[A-Z]{1,4}\d{4,}[A-Z0-9-]*)\b",
     re.IGNORECASE,
@@ -80,6 +139,9 @@ _ALEXANDRIA_CONTEXT_TERMS = CONTEXT_TERMS
 _ALEXANDRIA_V11_TERMS = V11_TERMS
 _ALEXANDRIA_HERMES_TERMS = HERMES_TERMS
 _HERMES_RELEASE_TERMS = HERMES_RELEASE_TERMS
+_ALEXANDRIA_FINANCE_TERMS = FINANCE_TERMS
+_ALEXANDRIA_PURCHASING_TERMS = PURCHASING_TERMS
+_ALEXANDRIA_REPAIR_TERMS = REPAIR_TERMS
 _ALEXANDRIA_PART_NUMBER_RE = PART_NUMBER_RE
 _URL_RE = URL_RE
 
@@ -226,6 +288,15 @@ def _direct_alexandria_context_paths(message: str) -> List[str]:
         paths.append("advanced/customers/CONTEXT.md")
     if "customer" in lowered:
         paths.append("advanced/customers/CONTEXT.md")
+    if any(term in lowered for term in FINANCE_TERMS):
+        paths.append("advanced/financials/CONTEXT.md")
+        paths.append("advanced/operations/CONTEXT.md")
+    if any(term in lowered for term in PURCHASING_TERMS):
+        paths.append("advanced/operations/CONTEXT.md")
+        paths.append("advanced/vendor-pricing/CONTEXT.md")
+    if any(term in lowered for term in REPAIR_TERMS):
+        paths.append("advanced/operations/CONTEXT.md")
+        paths.append("advanced/teardown/CONTEXT.md")
     if any(term in lowered for term in V11_TERMS) or PART_NUMBER_RE.search(routing_text):
         paths.append("advanced/operations/CONTEXT.md")
         paths.append("advanced/products/CONTEXT.md")

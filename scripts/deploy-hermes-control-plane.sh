@@ -26,6 +26,7 @@ REPO_FILES=(
   gateway/platforms/telegram.py
   gateway/rfq_fast_path.py
   gateway/run.py
+  hermes_cli/business_ops.py
   hermes_cli/canary.py
   hermes_cli/commands.py
   hermes_cli/goals.py
@@ -41,12 +42,14 @@ REPO_FILES=(
   tools/workflow_tool.py
   tools/x_scraper_tool.py
   tests/gateway/test_api_server.py
+  tests/gateway/test_context_router.py
   tests/gateway/test_rfq_fast_path.py
   tests/gateway/test_status_command.py
   tests/gateway/test_telegram_e2e_ack.py
   tests/gateway/test_telegram_operator_latency.py
   tests/gateway/test_operator_fast_path.py
   tests/hermes_cli/test_canary.py
+  tests/hermes_cli/test_business_ops.py
   tests/hermes_cli/test_model_routes.py
   tests/hermes_cli/test_runtime_status.py
   tests/hermes_cli/test_workflows.py

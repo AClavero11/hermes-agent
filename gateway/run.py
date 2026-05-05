@@ -5491,6 +5491,62 @@ class GatewayRunner:
         except Exception as exc:
             return f"Workflow error: {exc}"
 
+    async def _handle_ops_command(self, event: MessageEvent) -> str:
+        from hermes_cli.business_ops import (
+            build_business_ops_brief,
+            build_business_ops_score_line,
+        )
+        from hermes_cli.workflows import WorkflowRegistry, format_workflow
+
+        args = event.get_command_args().strip()
+        command, _, rest = args.partition(" ")
+        command = command.lower().strip() or "brief"
+
+        try:
+            if command in {"brief", "status", "summary"}:
+                return build_business_ops_brief()
+
+            if command == "score":
+                return build_business_ops_score_line()
+
+            if command in {"workflows", "workflow", "lanes"}:
+                registry = WorkflowRegistry()
+                workflows = registry.list_workflows(include_disabled=True, limit=100)
+                if not workflows:
+                    return "No workflows registered."
+                return "Business workflows:\n" + "\n".join(
+                    "- " + format_workflow(workflow).replace("\n", "\n  ")
+                    for workflow in workflows
+                    if str(workflow.get("category") or "") in {
+                        "finance",
+                        "purchasing",
+                        "repairs",
+                        "inventory",
+                        "briefing",
+                        "health",
+                        "rfq",
+                    }
+                )
+
+            if command == "report":
+                from hermes_cli.workspace import WorkspaceStore
+
+                store = WorkspaceStore()
+                task = store.create_task(
+                    "Hermes Business OS catch-up brief",
+                    owner="chief-of-staff",
+                    project="hermes-business-os",
+                    source=self._workspace_source_label(event),
+                    next_action="Review /ops brief and pick the next blocked lane.",
+                    note=build_business_ops_brief(include_kanban=False),
+                )
+                report = store.create_report(title=rest.strip() or "Hermes Business OS brief")
+                return f"Business OS report created: `{report['id']}`\n{report['path']}\nWorkspace task: `{task['id']}`"
+
+            return "Usage: /ops [brief|score|workflows|report]"
+        except Exception as exc:
+            return f"Ops error: {exc}"
+
     async def _handle_kill_command(self, event: MessageEvent) -> str:
         from hermes_cli.workflows import WorkflowRegistry, format_workflow
 
@@ -5786,6 +5842,9 @@ class GatewayRunner:
             if _cmd_def_inner and _cmd_def_inner.name == "workflow":
                 return await self._handle_workflow_command(event)
 
+            if _cmd_def_inner and _cmd_def_inner.name == "ops":
+                return await self._handle_ops_command(event)
+
             if _cmd_def_inner and _cmd_def_inner.name == "kill":
                 return await self._handle_kill_command(event)
 
@@ -5940,6 +5999,8 @@ class GatewayRunner:
                     return await self._handle_update_command(event)
                 if _cmd_def_inner.name == "workflow":
                     return await self._handle_workflow_command(event)
+                if _cmd_def_inner.name == "ops":
+                    return await self._handle_ops_command(event)
                 if _cmd_def_inner.name == "kill":
                     return await self._handle_kill_command(event)
 
@@ -6254,6 +6315,9 @@ class GatewayRunner:
 
         if canonical == "workflow":
             return await self._handle_workflow_command(event)
+
+        if canonical == "ops":
+            return await self._handle_ops_command(event)
 
         if canonical == "kill":
             return await self._handle_kill_command(event)
