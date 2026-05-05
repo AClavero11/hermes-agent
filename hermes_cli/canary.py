@@ -17,7 +17,6 @@ import time
 import urllib.error
 import urllib.parse
 import urllib.request
-import xmlrpc.client
 from dataclasses import asdict, dataclass, field
 from datetime import datetime, timezone
 from pathlib import Path
@@ -916,7 +915,7 @@ def _canary_command_registry() -> CanaryResult:
         "workflows": {"gateway_only": True},
         "ops": {
             "gateway_only": True,
-            "subcommands": {"brief", "score", "workflows"},
+            "subcommands": {"brief", "score", "workflows", "report", "run", "daily"},
         },
         "business": {"gateway_only": True},
         "kill": {"gateway_only": True},
@@ -3486,6 +3485,161 @@ def _canary_business_os_brief(options: CanaryOptions) -> CanaryResult:
     )
 
 
+def _canary_business_os_daily_report(options: CanaryOptions) -> CanaryResult:
+    from hermes_cli.business_ops import (
+        build_business_ops_daily_report,
+        render_business_ops_daily_report,
+        run_business_ops_daily_report,
+    )
+    from hermes_cli.workspace import WorkspaceStore
+
+    class FakeReadOnlyV11:
+        def search_read(self, model, domain, *, fields, limit=50, order=""):
+            del fields, limit, order
+            if model == "account.invoice":
+                invoice_type = ""
+                for item in domain:
+                    if isinstance(item, list) and item[:2] == ["type", "="]:
+                        invoice_type = str(item[2])
+                if invoice_type == "out_invoice":
+                    return [
+                        {
+                            "number": "INV/2026/001",
+                            "partner_id": [7, "Aero Accessories"],
+                            "date_due": "2026-01-01",
+                            "amount_total": 2500.0,
+                            "residual": 2500.0,
+                            "state": "open",
+                            "type": "out_invoice",
+                        }
+                    ]
+                if invoice_type == "in_invoice":
+                    return [
+                        {
+                            "number": "BILL/2026/001",
+                            "partner_id": [9, "Vendor Co"],
+                            "date_due": "2026-01-05",
+                            "amount_total": 1200.0,
+                            "residual": 1200.0,
+                            "state": "open",
+                            "type": "in_invoice",
+                        }
+                    ]
+            if model == "purchase.order":
+                return [
+                    {
+                        "name": "PO0001",
+                        "partner_id": [9, "Vendor Co"],
+                        "date_order": "2026-01-02 10:00:00",
+                        "amount_total": 1200.0,
+                        "state": "sent",
+                    }
+                ]
+            if model == "repair.order":
+                return [
+                    {
+                        "name": "RO0001",
+                        "partner_id": [7, "Aero Accessories"],
+                        "product_id": [11, "5909891"],
+                        "state": "under_repair",
+                        "create_date": "2026-01-03 11:00:00",
+                    }
+                ]
+            if model == "stock.quant":
+                return [
+                    {
+                        "product_id": [12, "743502 PUMP LINER"],
+                        "location_id": [3, "WH/Stock"],
+                        "lot_id": [4, "LOT-A"],
+                        "quantity": 3.0,
+                    }
+                ]
+            return []
+
+    failed: dict[str, Any] = {}
+    passed: list[str] = []
+
+    with tempfile.TemporaryDirectory(prefix="hermes-business-os-daily-") as tmp:
+        root = Path(tmp)
+        fake_client = FakeReadOnlyV11()
+        report = build_business_ops_daily_report(
+            hermes_home=root,
+            v11_client=fake_client,
+            collect_live=False,
+        )
+        lane_statuses = {
+            str(lane.get("id")): str(lane.get("status"))
+            for lane in report.get("lanes", [])
+        }
+        if set(lane_statuses) == {"finance-admin", "purchasing", "repairs", "inventory"}:
+            passed.append("lane_collection")
+        else:
+            failed["lane_collection"] = lane_statuses
+
+        if not any(status == "unavailable" for status in lane_statuses.values()):
+            passed.append("read_only_v11_collection")
+        else:
+            failed["read_only_v11_collection"] = lane_statuses
+
+        markdown = render_business_ops_daily_report(report)
+        required_text = [
+            "Hermes Business OS Daily Report",
+            "Mode: read-only",
+            "Finance/Admin",
+            "Purchasing",
+            "Repairs",
+            "Inventory",
+            "No customer sends",
+            "743502 PUMP LINER",
+        ]
+        missing_text = [item for item in required_text if item not in markdown]
+        if missing_text:
+            failed["markdown"] = {"missing": missing_text, "markdown": markdown}
+        else:
+            passed.append("markdown")
+
+        workspace = WorkspaceStore(root / "workspace" / "control_plane.json")
+        result = run_business_ops_daily_report(
+            hermes_home=root,
+            v11_client=fake_client,
+            collect_live=False,
+            workspace_store=workspace,
+            source="canary",
+        )
+        paths = result.get("paths") or {}
+        path_checks = [
+            Path(paths.get("markdown", "")),
+            Path(paths.get("json", "")),
+            root / "business_ops" / "reports" / "latest.md",
+            root / "business_ops" / "reports" / "latest.json",
+        ]
+        missing_paths = [str(path) for path in path_checks if not path.is_file()]
+        if missing_paths:
+            failed["report_files"] = missing_paths
+        else:
+            passed.append("report_files")
+
+        data = workspace.read()
+        evidence = data.get("evidence") or {}
+        tasks = data.get("tasks") or {}
+        if evidence and tasks and all(task.get("status") == "done" for task in tasks.values()):
+            passed.append("workspace_evidence")
+        else:
+            failed["workspace_evidence"] = {"tasks": tasks, "evidence": evidence}
+
+    total_checks = 5
+    score = round(20.0 * len(passed) / total_checks, 1)
+    status = PASS if not failed else WARN if passed else FAIL
+    return _result(
+        "contract.business_os_daily_report",
+        status,
+        score,
+        20,
+        f"{len(passed)}/{total_checks} Business OS daily report checks passed",
+        {"passed": passed, "failed": failed},
+    )
+
+
 def _env_file_has_any_key(path: Path, keys: set[str]) -> bool:
     try:
         lines = path.read_text(encoding="utf-8").splitlines()
@@ -3660,6 +3814,14 @@ def _env_value(name: str, *aliases: str) -> str:
     return ""
 
 
+def _xmlrpc_client_module() -> Any:
+    try:
+        import xmlrpc.client as xmlrpc_client
+    except Exception as exc:
+        raise RuntimeError(f"XML-RPC client unavailable: {exc}") from exc
+    return xmlrpc_client
+
+
 class _V11ReadOnlyClient:
     """Narrow XML-RPC client restricted to read-only V11 methods."""
 
@@ -3673,8 +3835,9 @@ class _V11ReadOnlyClient:
         if not self.password:
             raise RuntimeError("missing V11 credentials: ODOO_PASSWORD or V11_WEB_PASS")
         self.uid: int | bool = False
-        self._common = xmlrpc.client.ServerProxy(f"{self.url}/xmlrpc/2/common", allow_none=True)
-        self._models = xmlrpc.client.ServerProxy(f"{self.url}/xmlrpc/2/object", allow_none=True)
+        xmlrpc_client = _xmlrpc_client_module()
+        self._common = xmlrpc_client.ServerProxy(f"{self.url}/xmlrpc/2/common", allow_none=True)
+        self._models = xmlrpc_client.ServerProxy(f"{self.url}/xmlrpc/2/object", allow_none=True)
 
     def authenticate(self) -> bool:
         self.uid = self._common.authenticate(self.db, self.username, self.password, {})
@@ -4944,6 +5107,7 @@ def run_canary_suite(options: CanaryOptions) -> CanaryReport:
         ("contract.aac_workflows", 15, lambda: _canary_aac_workflow_goldens(options)),
         ("contract.memory_grounding", 20, lambda: _canary_memory_grounding(options)),
         ("contract.business_os_brief", 20, lambda: _canary_business_os_brief(options)),
+        ("contract.business_os_daily_report", 20, lambda: _canary_business_os_daily_report(options)),
         ("contract.quote_ops_runtime", 20, lambda: _canary_quote_ops_runtime(options)),
         ("live.rfq_dry_run_quote_package", 25, lambda: _canary_rfq_dry_run_quote_package(options)),
         ("live.approved_rfq_draft_quote", 30, lambda: _canary_approved_rfq_draft_quote(options)),
@@ -5063,6 +5227,11 @@ def _quality_dimensions(report: CanaryReport) -> list[QualityDimension]:
         autonomy_score = max(autonomy_score, 8.4)
     elif business_os_result and business_os_result.status == WARN:
         autonomy_score = max(autonomy_score, 8.0)
+    business_os_daily_result = _result_by_name(report, "contract.business_os_daily_report")
+    if business_os_daily_result and business_os_daily_result.status == PASS:
+        autonomy_score = max(autonomy_score, 8.6)
+    elif business_os_daily_result and business_os_daily_result.status == WARN:
+        autonomy_score = max(autonomy_score, 8.2)
 
     memory_score = 6.8
     if behavior_result and "sonnet_continuity" in behavior_result.details.get("passed", []):
@@ -5113,6 +5282,18 @@ def _quality_dimensions(report: CanaryReport) -> list[QualityDimension]:
         aac_workflows_score = max(aac_workflows_score, 8.8)
         aac_workflows_summary = (
             "RFQ plus finance/admin, purchasing, repair, inventory, and memory/V11 grounding contracts pass."
+        )
+    if (
+        business_os_result
+        and business_os_result.status == PASS
+        and business_os_daily_result
+        and business_os_daily_result.status == PASS
+        and memory_grounding_result
+        and memory_grounding_result.status == PASS
+    ):
+        aac_workflows_score = max(aac_workflows_score, 8.9)
+        aac_workflows_summary = (
+            "RFQ plus read-only finance/admin, purchasing, repair, inventory daily reports pass."
         )
 
     quote_ops_result = _result_by_name(report, "contract.quote_ops_runtime")
@@ -5241,8 +5422,9 @@ def quality_summary(report: CanaryReport) -> dict[str, Any]:
         and passed("contract.memory_grounding")
         and passed("contract.business_os_brief")
     )
+    business_os_daily_done = business_os_done and passed("contract.business_os_daily_report")
     foundation_done = (
-        business_os_done
+        business_os_daily_done
         and passed("contract.planner_self_heal")
         and local_deepseek_done
         and bool(model_routes_result and model_routes_result.status == PASS)
@@ -5280,6 +5462,11 @@ def quality_summary(report: CanaryReport) -> dict[str, Any]:
             "target": "8.8/10",
             "increment": "Global Business OS: memory/V11 grounding, non-RFQ workflow lanes, and /ops brief",
             "status": "done" if business_os_done else "open",
+        },
+        {
+            "target": "8.9/10",
+            "increment": "Read-only Business OS daily reports create Workspace evidence across finance, purchasing, repairs, and inventory",
+            "status": "done" if business_os_daily_done else "open",
         },
         {
             "target": "9.0/10",
@@ -5386,7 +5573,10 @@ def readiness_summary(report: CanaryReport) -> dict[str, Any]:
         and result_status("contract.memory_grounding") == PASS
         and result_status("contract.x_scrape") == PASS
     )
-    business_os_ok = result_status("contract.business_os_brief") == PASS
+    business_os_ok = (
+        result_status("contract.business_os_brief") == PASS
+        and result_status("contract.business_os_daily_report") == PASS
+    )
     control_plane_ok = (
         result_status("contract.workspace_store") == PASS
         and result_status("contract.workflow_registry") == PASS
@@ -5457,8 +5647,14 @@ def readiness_summary(report: CanaryReport) -> dict[str, Any]:
         {
             "name": "business_os_brief",
             "status": PASS if business_os_ok else WARN,
-            "requirement": "Global /ops brief covers score, Workspace, non-RFQ lanes, and approval boundaries.",
-            "evidence": result_summary("contract.business_os_brief"),
+            "requirement": (
+                "Global /ops brief plus daily read-only Business OS report cover score, "
+                "Workspace, non-RFQ lanes, live data lanes, and approval boundaries."
+            ),
+            "evidence": (
+                f"{result_summary('contract.business_os_brief')} / "
+                f"{result_summary('contract.business_os_daily_report')}"
+            ),
         },
         {
             "name": "control_plane",

@@ -5495,11 +5495,13 @@ class GatewayRunner:
         from hermes_cli.business_ops import (
             build_business_ops_brief,
             build_business_ops_score_line,
+            format_business_ops_daily_run,
+            run_business_ops_daily_report,
         )
         from hermes_cli.workflows import WorkflowRegistry, format_workflow
 
         args = event.get_command_args().strip()
-        command, _, rest = args.partition(" ")
+        command, _, _rest = args.partition(" ")
         command = command.lower().strip() or "brief"
 
         try:
@@ -5528,22 +5530,13 @@ class GatewayRunner:
                     }
                 )
 
-            if command == "report":
-                from hermes_cli.workspace import WorkspaceStore
-
-                store = WorkspaceStore()
-                task = store.create_task(
-                    "Hermes Business OS catch-up brief",
-                    owner="chief-of-staff",
-                    project="hermes-business-os",
+            if command in {"report", "run", "daily"}:
+                result = run_business_ops_daily_report(
                     source=self._workspace_source_label(event),
-                    next_action="Review /ops brief and pick the next blocked lane.",
-                    note=build_business_ops_brief(include_kanban=False),
                 )
-                report = store.create_report(title=rest.strip() or "Hermes Business OS brief")
-                return f"Business OS report created: `{report['id']}`\n{report['path']}\nWorkspace task: `{task['id']}`"
+                return format_business_ops_daily_run(result)
 
-            return "Usage: /ops [brief|score|workflows|report]"
+            return "Usage: /ops [brief|score|workflows|report|run|daily]"
         except Exception as exc:
             return f"Ops error: {exc}"
 

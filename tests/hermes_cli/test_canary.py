@@ -52,6 +52,10 @@ def test_canary_suite_runs_without_live_gateway(tmp_path):
         for result in report.results
     )
     assert any(
+        result.name == "contract.business_os_daily_report" and result.status == PASS
+        for result in report.results
+    )
+    assert any(
         result.name == "live.gateway_health" and result.status == SKIP
         for result in report.results
     )
@@ -405,6 +409,7 @@ def _quality_foundation_results() -> list[CanaryResult]:
         CanaryResult("contract.aac_workflows", PASS, 15, 15, "AAC workflows passed"),
         CanaryResult("contract.memory_grounding", PASS, 20, 20, "memory grounding passed"),
         CanaryResult("contract.business_os_brief", PASS, 20, 20, "business OS brief passed"),
+        CanaryResult("contract.business_os_daily_report", PASS, 20, 20, "business OS daily passed"),
         CanaryResult("contract.x_scrape", PASS, 10, 10, "X scrape contract passed"),
         CanaryResult("contract.workspace_store", PASS, 10, 10, "Workspace store passed"),
         CanaryResult("contract.workflow_registry", PASS, 15, 15, "Workflow registry passed"),
