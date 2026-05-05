@@ -254,8 +254,10 @@ def _canary_imports() -> CanaryResult:
         "hermes_cli.commands",
         "hermes_cli.goals",
         "hermes_cli.workspace",
+        "hermes_cli.workflows",
         "tools.x_scraper_tool",
         "tools.workspace_tool",
+        "tools.workflow_tool",
     ]
     loaded: list[str] = []
     for module_name in modules:
@@ -907,6 +909,12 @@ def _canary_command_registry() -> CanaryResult:
             "subcommands": {"status", "list", "add", "done", "evidence", "report"},
         },
         "ws": {"gateway_only": True},
+        "workflow": {
+            "gateway_only": True,
+            "subcommands": {"status", "list", "kill", "resume", "report"},
+        },
+        "workflows": {"gateway_only": True},
+        "kill": {"gateway_only": True},
         "approve": {"gateway_only": True},
         "deny": {"gateway_only": True},
     }
@@ -1052,6 +1060,79 @@ def _canary_workspace_store() -> CanaryResult:
         10,
         "Workspace task, evidence, status, and report contract passed",
         {"counts": counts},
+    )
+
+
+def _canary_workflow_registry() -> CanaryResult:
+    from hermes_cli.workflows import WorkflowRegistry
+
+    with tempfile.TemporaryDirectory(prefix="hermes-canary-workflow-") as tmp:
+        store = WorkflowRegistry(Path(tmp) / "workflow_registry.json")
+        seeded = {workflow["id"]: workflow for workflow in store.list_workflows()}
+        if "rfq-intake" not in seeded:
+            return _result(
+                "contract.workflow_registry",
+                FAIL,
+                0,
+                15,
+                "Default RFQ intake workflow missing from registry seed",
+                {"seeded": sorted(seeded)},
+            )
+        killed = store.kill_workflow(
+            "rfq-intake",
+            actor="canary",
+            reason="prove operator kill switch",
+        )
+        if killed.get("status") != "disabled" or store.is_enabled("rfq-intake"):
+            return _result(
+                "contract.workflow_registry",
+                FAIL,
+                0,
+                15,
+                "Workflow kill did not disable rfq-intake",
+                {"workflow": killed},
+            )
+        resumed = store.resume_workflow(
+            "rfq-intake",
+            actor="canary",
+            reason="prove operator resume",
+        )
+        if resumed.get("status") != "enabled" or not store.is_enabled("rfq-intake"):
+            return _result(
+                "contract.workflow_registry",
+                FAIL,
+                0,
+                15,
+                "Workflow resume did not enable rfq-intake",
+                {"workflow": resumed},
+            )
+        report = store.create_report(title="Workflow Canary")
+        data = store.read()
+        events = [
+            event for event in data.get("events", {}).values()
+            if event.get("workflow_id") == "rfq-intake"
+        ]
+        actions = {event.get("action") for event in events}
+        if not {"kill", "resume"}.issubset(actions):
+            return _result(
+                "contract.workflow_registry",
+                WARN,
+                10,
+                15,
+                "Workflow kill/resume passed but audit events are incomplete",
+                {"actions": sorted(str(action) for action in actions), "report": report},
+            )
+    return _result(
+        "contract.workflow_registry",
+        PASS,
+        15,
+        15,
+        "Workflow registry seed, kill, resume, report, and audit contract passed",
+        {
+            "workflows": sorted(data.get("workflows", {})),
+            "actions": sorted(str(action) for action in actions),
+            "report": report,
+        },
     )
 
 
@@ -4634,6 +4715,7 @@ def run_canary_suite(options: CanaryOptions) -> CanaryReport:
         ("contract.command_registry", 10, _canary_command_registry),
         ("contract.x_scrape", 10, _canary_x_scrape_contract),
         ("contract.workspace_store", 10, _canary_workspace_store),
+        ("contract.workflow_registry", 15, _canary_workflow_registry),
         ("contract.goal_workspace", 15, _canary_goal_workspace_contract),
         ("contract.operator_safety", 10, lambda: _canary_safety_contract(options)),
         ("contract.behavior_goldens", 20, lambda: _canary_behavior_goldens(options)),
@@ -4752,9 +4834,19 @@ def _quality_dimensions(report: CanaryReport) -> list[QualityDimension]:
 
     goal_result = _result_by_name(report, "contract.goal_workspace")
     workspace_result = _result_by_name(report, "contract.workspace_store")
+    workflow_result = _result_by_name(report, "contract.workflow_registry")
     autonomy_score = 7.0
     if goal_result and goal_result.status == PASS and workspace_result and workspace_result.status == PASS:
         autonomy_score = 7.4
+    if (
+        goal_result
+        and goal_result.status == PASS
+        and workspace_result
+        and workspace_result.status == PASS
+        and workflow_result
+        and workflow_result.status == PASS
+    ):
+        autonomy_score = 7.9
 
     memory_score = 6.8
     if behavior_result and "sonnet_continuity" in behavior_result.details.get("passed", []):
@@ -4844,7 +4936,7 @@ def _quality_dimensions(report: CanaryReport) -> list[QualityDimension]:
         QualityDimension(
             "autonomy",
             autonomy_score,
-            "/goal, Workspace, evidence, and continuation control plane.",
+            "/goal, Workflow registry, Workspace evidence, and continuation control plane.",
             "Add goal budget policy, retries, and blocked-state triage reports.",
         ),
         QualityDimension(
@@ -5054,6 +5146,7 @@ def readiness_summary(report: CanaryReport) -> dict[str, Any]:
     )
     control_plane_ok = (
         result_status("contract.workspace_store") == PASS
+        and result_status("contract.workflow_registry") == PASS
         and result_status("contract.goal_workspace") == PASS
     )
     reliability_ok = (
@@ -5117,8 +5210,12 @@ def readiness_summary(report: CanaryReport) -> dict[str, Any]:
         {
             "name": "control_plane",
             "status": PASS if control_plane_ok else WARN,
-            "requirement": "Workspace and goal state survive as durable control-plane primitives.",
-            "evidence": f"{result_summary('contract.workspace_store')} / {result_summary('contract.goal_workspace')}",
+            "requirement": "Workflow registry, Workspace, and goal state survive as durable control-plane primitives.",
+            "evidence": (
+                f"{result_summary('contract.workflow_registry')} / "
+                f"{result_summary('contract.workspace_store')} / "
+                f"{result_summary('contract.goal_workspace')}"
+            ),
         },
         {
             "name": "operator_safety",

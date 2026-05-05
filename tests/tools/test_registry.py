@@ -305,6 +305,8 @@ class TestBuiltinDiscovery:
             "tools.image_generation_tool",
             "tools.memory_tool",
             "tools.mixture_of_agents_tool",
+            "tools.kanban_tools",
+            "tools.org_task_ledger_tool",
             "tools.process_registry",
             "tools.rl_training_tool",
             "tools.send_message_tool",
@@ -316,6 +318,9 @@ class TestBuiltinDiscovery:
             "tools.tts_tool",
             "tools.vision_tools",
             "tools.web_tools",
+            "tools.workflow_tool",
+            "tools.workspace_tool",
+            "tools.x_scraper_tool",
         }
 
         with patch("tools.registry.importlib.import_module"):

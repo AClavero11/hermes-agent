@@ -323,8 +323,12 @@ async def _rfq_fast_path_reply_text(content: Any) -> str:
     if not text:
         return ""
     try:
+        from gateway import run as gateway_run
         from gateway.rfq_fast_path import build_rfq_fast_path_response
 
+        lane_choice = getattr(gateway_run, "_classify_operator_lane_choice", None)
+        if callable(lane_choice) and lane_choice(text):
+            return ""
         loop = asyncio.get_running_loop()
         result = await loop.run_in_executor(None, build_rfq_fast_path_response, text)
         return result.response if result is not None else ""
@@ -1085,7 +1089,7 @@ class APIServerAdapter(BasePlatformAdapter):
             }
             return web.json_response(response_data, headers={"X-Hermes-Session-Id": session_id})
 
-        rfq_reply = await _rfq_fast_path_reply_text(user_message)
+        rfq_reply = "" if _request_disables_tools(body) else await _rfq_fast_path_reply_text(user_message)
         if rfq_reply:
             response_data = {
                 "id": completion_id,
@@ -2009,7 +2013,7 @@ class APIServerAdapter(BasePlatformAdapter):
                     self._response_store.set_conversation(conversation, response_id)
             return web.json_response(response_data)
 
-        rfq_reply = await _rfq_fast_path_reply_text(user_message)
+        rfq_reply = "" if _request_disables_tools(body) else await _rfq_fast_path_reply_text(user_message)
         if rfq_reply:
             response_id = f"resp_{uuid.uuid4().hex[:28]}"
             created_at = int(time.time())

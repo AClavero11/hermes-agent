@@ -1034,8 +1034,8 @@ def _build_operator_capability_prompt(message: str) -> str:
         "planner/synthesizer routing, bounded fast-path behavior, explicit runtime truth, "
         "and approval-gated business writes. Sound like an operator in the shop, not a product brochure.\n"
         "Generate a fresh operator answer, not a fixed menu. Mention only the lanes that fit "
-        "the user's wording, but keep it useful for AC: RFQ/quotes, V11/inventory context, "
-        "follow-ups, Hermes runtime repair, research links, and code/files are valid examples. "
+        "the user's wording, but keep it useful for AC: RFQ/quotes, V11 context, "
+        "follow-ups, Hermes runtime repair, research links, and Code/files are valid examples. "
         "Use tight paragraphs or short bullets. End with exactly one short approval-gate sentence: "
         "customer sends, V11 writes, Atlas writes, and destructive actions require approval. "
         "Keep under 150 words.\n\n"
@@ -5327,6 +5327,112 @@ class GatewayRunner:
         except Exception as exc:
             return f"Workspace error: {exc}"
 
+    def _workflow_actor_label(self, event: MessageEvent) -> str:
+        return self._workspace_source_label(event) or "gateway"
+
+    async def _handle_workflow_command(self, event: MessageEvent) -> str:
+        from hermes_cli.workflows import (
+            WorkflowRegistry,
+            format_workflow,
+            format_workflow_status,
+        )
+
+        store = WorkflowRegistry()
+        args = event.get_command_args().strip()
+        command, _, rest = args.partition(" ")
+        command = command.lower().strip() or "status"
+        actor = self._workflow_actor_label(event)
+
+        try:
+            if command in {"status", "summary"}:
+                return format_workflow_status(store.read())
+
+            if command in {"list", "ls"}:
+                workflows = store.list_workflows(include_disabled=True, limit=50)
+                if not workflows:
+                    return "No workflows registered."
+                return "Workflows:\n" + "\n".join(
+                    "- " + format_workflow(workflow).replace("\n", "\n  ")
+                    for workflow in workflows
+                )
+
+            if command in {"show", "get"}:
+                if not rest.strip():
+                    return "Usage: /workflow show <workflow>"
+                return format_workflow(store.get_workflow(rest.strip()))
+
+            if command in {"kill", "disable"}:
+                workflow_id, _, reason = rest.partition(" ")
+                if not workflow_id:
+                    return "Usage: /workflow kill <workflow> [reason]"
+                workflow = store.kill_workflow(
+                    workflow_id,
+                    actor=actor,
+                    reason=reason.strip() or "operator kill switch",
+                )
+                return (
+                    f"Workflow disabled: `{workflow['id']}`\n"
+                    + format_workflow(workflow)
+                    + "\n\nVerification required before re-enable."
+                )
+
+            if command in {"resume", "enable"}:
+                workflow_id, _, reason = rest.partition(" ")
+                if not workflow_id:
+                    return "Usage: /workflow resume <workflow> [reason]"
+                workflow = store.resume_workflow(
+                    workflow_id,
+                    actor=actor,
+                    reason=reason.strip() or "operator resume",
+                )
+                return (
+                    f"Workflow enabled: `{workflow['id']}`\n"
+                    + format_workflow(workflow)
+                    + "\n\nRun the workflow health check before trusting scheduled output."
+                )
+
+            if command in {"register", "add"}:
+                workflow_id, _, title = rest.partition(" ")
+                if not workflow_id or not title.strip():
+                    return "Usage: /workflow register <workflow-id> <title>"
+                workflow = store.register_workflow(
+                    title.strip(),
+                    workflow_id=workflow_id,
+                    owner=getattr(event.source, "user_name", None) or getattr(event.source, "user_id", None),
+                    status="unknown",
+                    note=f"registered from {actor}",
+                )
+                return f"Workflow registered: `{workflow['id']}`\n{workflow['title']}"
+
+            if command == "report":
+                report = store.create_report(title=rest.strip() or None)
+                return f"Workflow report created: `{report['id']}`\n{report['path']}"
+
+            return "Usage: /workflow [status|list|show|kill|resume|register|report]"
+        except Exception as exc:
+            return f"Workflow error: {exc}"
+
+    async def _handle_kill_command(self, event: MessageEvent) -> str:
+        from hermes_cli.workflows import WorkflowRegistry, format_workflow
+
+        args = event.get_command_args().strip()
+        workflow_id, _, reason = args.partition(" ")
+        if not workflow_id:
+            return "Usage: /kill <workflow> [reason]"
+        try:
+            workflow = WorkflowRegistry().kill_workflow(
+                workflow_id,
+                actor=self._workflow_actor_label(event),
+                reason=reason.strip() or "operator kill switch",
+            )
+            return (
+                f"Workflow disabled: `{workflow['id']}`\n"
+                + format_workflow(workflow)
+                + "\n\nVerification required before re-enable."
+            )
+        except Exception as exc:
+            return f"Workflow error: {exc}"
+
     async def _handle_kanban_command(self, event: MessageEvent) -> str:
         """Handle /kanban by delegating to the shared Kanban CLI parser."""
         from hermes_cli.kanban import run_slash
@@ -5598,6 +5704,12 @@ class GatewayRunner:
             if _cmd_def_inner and _cmd_def_inner.name == "workspace":
                 return await self._handle_workspace_command(event)
 
+            if _cmd_def_inner and _cmd_def_inner.name == "workflow":
+                return await self._handle_workflow_command(event)
+
+            if _cmd_def_inner and _cmd_def_inner.name == "kill":
+                return await self._handle_kill_command(event)
+
             if _cmd_def_inner and _cmd_def_inner.name == "restart":
                 return await self._handle_restart_command(event)
 
@@ -5747,6 +5859,10 @@ class GatewayRunner:
                     return await self._handle_runtime_command(event)
                 if _cmd_def_inner.name == "update":
                     return await self._handle_update_command(event)
+                if _cmd_def_inner.name == "workflow":
+                    return await self._handle_workflow_command(event)
+                if _cmd_def_inner.name == "kill":
+                    return await self._handle_kill_command(event)
 
             # Catch-all: any other recognized slash command reached the
             # running-agent guard. Reject gracefully rather than falling
@@ -6056,6 +6172,12 @@ class GatewayRunner:
 
         if canonical == "workspace":
             return await self._handle_workspace_command(event)
+
+        if canonical == "workflow":
+            return await self._handle_workflow_command(event)
+
+        if canonical == "kill":
+            return await self._handle_kill_command(event)
 
         if canonical == "kanban":
             return await self._handle_kanban_command(event)
@@ -9703,12 +9825,31 @@ class GatewayRunner:
 
     async def _handle_resume_command(self, event: MessageEvent) -> str:
         """Handle /resume command — switch to a previously-named session."""
+        name = event.get_command_args().strip()
+        if name:
+            try:
+                from hermes_cli.workflows import WorkflowRegistry, format_workflow
+
+                registry = WorkflowRegistry()
+                if registry.has_workflow(name):
+                    workflow = registry.resume_workflow(
+                        name,
+                        actor=self._workflow_actor_label(event),
+                        reason="operator resume via /resume",
+                    )
+                    return (
+                        f"Workflow enabled: `{workflow['id']}`\n"
+                        + format_workflow(workflow)
+                        + "\n\nRun the workflow health check before trusting scheduled output."
+                    )
+            except Exception as exc:
+                logger.debug("Workflow resume probe failed: %s", exc)
+
         if not self._session_db:
             return "Session database not available."
 
         source = event.source
         session_key = self._session_key_for_source(source)
-        name = event.get_command_args().strip()
 
         if not name:
             # List recent titled sessions for this user/platform

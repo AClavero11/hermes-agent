@@ -46,8 +46,8 @@ _HERMES_CORE_TOOLS = [
     "browser_vision", "browser_console", "browser_cdp",
     # Text-to-speech
     "text_to_speech",
-    # Planning, workspace, and memory
-    "todo", "workspace", "memory",
+    # Planning, workflow control, workspace, and memory
+    "todo", "workflow", "workspace", "memory",
     # Session history search
     "session_search",
     # Clarifying questions
@@ -171,6 +171,12 @@ TOOLSETS = {
         "tools": ["workspace"],
         "includes": []
     },
+
+    "workflow": {
+        "description": "Durable workflow registry and operator kill-switch control",
+        "tools": ["workflow"],
+        "includes": []
+    },
     
     "memory": {
         "description": "Persistent memory across sessions (personal notes + user profile)",
@@ -274,7 +280,7 @@ TOOLSETS = {
             "browser_type", "browser_scroll", "browser_back",
             "browser_press", "browser_get_images",
             "browser_vision", "browser_console", "browser_cdp",
-            "todo", "workspace", "memory",
+            "todo", "workflow", "workspace", "memory",
             "session_search",
             "execute_code", "delegate_task",
         ],
@@ -299,8 +305,8 @@ TOOLSETS = {
             "browser_type", "browser_scroll", "browser_back",
             "browser_press", "browser_get_images",
             "browser_vision", "browser_console", "browser_cdp",
-            # Planning & memory
-            "todo", "workspace", "memory",
+            # Planning, workflow control, and memory
+            "todo", "workflow", "workspace", "memory",
             # Session history search
             "session_search",
             # Code execution + delegation

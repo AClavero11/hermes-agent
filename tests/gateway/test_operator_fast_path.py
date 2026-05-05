@@ -255,6 +255,27 @@ def test_workspace_add_list_evidence_report(tmp_path):
     assert report["path"].endswith(".md")
 
 
+@pytest.mark.asyncio
+async def test_workflow_kill_and_resume_commands_use_registry(tmp_path, monkeypatch):
+    monkeypatch.setenv("HERMES_WORKFLOW_STORE", str(tmp_path / "workflow_registry.json"))
+    runner = _minimal_runner()
+
+    killed = await runner._handle_kill_command(_event("/kill rfq-intake noisy extraction"))
+    assert "Workflow disabled" in killed
+    assert "rfq-intake" in killed
+
+    resumed = await runner._handle_resume_command(_event("/resume rfq-intake"))
+    assert "Workflow enabled" in resumed
+    assert "rfq-intake" in resumed
+
+
+@pytest.mark.asyncio
+async def test_api_rfq_fast_path_does_not_hijack_operator_lane():
+    from gateway.platforms.api_server import _rfq_fast_path_reply_text
+
+    assert await _rfq_fast_path_reply_text("rfq") == ""
+
+
 def test_runtime_status_format_includes_path_routes_and_counts():
     from hermes_cli.runtime_status import format_runtime_status
 

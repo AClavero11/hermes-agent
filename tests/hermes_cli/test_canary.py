@@ -37,6 +37,7 @@ def test_canary_suite_runs_without_live_gateway(tmp_path):
     assert "runtime.imports" in names
     assert "runtime.model_routes" in names
     assert "contract.workspace_store" in names
+    assert "contract.workflow_registry" in names
     assert "contract.goal_workspace" in names
     assert any(
         result.name == "contract.aac_workflows" and result.status == PASS
@@ -396,6 +397,7 @@ def _quality_foundation_results() -> list[CanaryResult]:
         CanaryResult("contract.aac_workflows", PASS, 15, 15, "AAC workflows passed"),
         CanaryResult("contract.x_scrape", PASS, 10, 10, "X scrape contract passed"),
         CanaryResult("contract.workspace_store", PASS, 10, 10, "Workspace store passed"),
+        CanaryResult("contract.workflow_registry", PASS, 15, 15, "Workflow registry passed"),
         CanaryResult("contract.goal_workspace", PASS, 15, 15, "Goal workspace passed"),
         CanaryResult("contract.operator_safety", PASS, 10, 10, "Operator safety passed"),
         CanaryResult("contract.planner_self_heal", PASS, 20, 20, "planner self-heal passed"),

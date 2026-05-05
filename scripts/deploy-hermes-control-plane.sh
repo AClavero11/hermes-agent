@@ -32,19 +32,25 @@ REPO_FILES=(
   hermes_cli/model_routes.py
   hermes_cli/runtime_status.py
   hermes_cli/workspace.py
+  hermes_cli/workflows.py
   run_agent.py
   toolsets.py
   tools/terminal_tool.py
   tools/workspace_tool.py
+  tools/workflow_tool.py
   tools/x_scraper_tool.py
   tests/gateway/test_api_server.py
   tests/gateway/test_status_command.py
   tests/gateway/test_telegram_e2e_ack.py
   tests/gateway/test_telegram_operator_latency.py
+  tests/gateway/test_operator_fast_path.py
   tests/hermes_cli/test_canary.py
   tests/hermes_cli/test_model_routes.py
   tests/hermes_cli/test_runtime_status.py
+  tests/hermes_cli/test_workflows.py
+  tests/test_toolsets.py
   tests/tools/test_terminal_bare_file_guard.py
+  tests/tools/test_registry.py
   tests/tools/test_x_scraper_tool.py
   docs/AAC_LOCAL_DEEPSEEK.md
   docs/AAC_MIGRATION_v2026.4.23.md
