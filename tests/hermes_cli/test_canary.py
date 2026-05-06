@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import json
+import os
 import time
 from pathlib import Path
 
@@ -59,6 +60,7 @@ def test_canary_suite_runs_without_live_gateway(tmp_path):
         result.name == "contract.aeroxchange_browser_workflow" and result.status == PASS
         for result in report.results
     )
+    assert "contract.browser_harness" in names
     assert any(
         result.name == "live.gateway_health" and result.status == SKIP
         for result in report.results
@@ -96,6 +98,47 @@ def test_canary_suite_runs_without_live_gateway(tmp_path):
         for result in report.results
     )
     assert report.effective_max_score > 0
+
+
+def test_browser_harness_canary_passes_with_installed_skill(monkeypatch, tmp_path):
+    bin_dir = tmp_path / "bin"
+    bin_dir.mkdir()
+    executable = bin_dir / "browser-harness"
+    executable.write_text("#!/bin/sh\nprintf 'Browser Harness\\n'\n", encoding="utf-8")
+    executable.chmod(0o755)
+
+    home = tmp_path / "home"
+    repo = home / "tools" / "browser-harness"
+    repo.mkdir(parents=True)
+    for name in ("SKILL.md", "helpers.py", "install.md"):
+        (repo / name).write_text(name, encoding="utf-8")
+
+    hermes_home = tmp_path / "hermes-home"
+    skill_dir = hermes_home / "skills" / "browser-harness"
+    skill_dir.mkdir(parents=True)
+    for name in ("SKILL.md", "helpers.py", "install.md"):
+        (skill_dir / name).write_text(name, encoding="utf-8")
+    (skill_dir / "interaction-skills").mkdir()
+    (skill_dir / "domain-skills").mkdir()
+
+    provider_source = tmp_path / "repo" / "tools" / "browser_providers"
+    provider_source.mkdir(parents=True)
+    (provider_source / "browser_use.py").write_text("# provider\n", encoding="utf-8")
+
+    monkeypatch.setenv("PATH", str(bin_dir) + os.pathsep + os.environ.get("PATH", ""))
+    monkeypatch.setenv("BROWSER_USE_API_KEY", "test-key")
+    monkeypatch.setattr(canary_module.Path, "home", lambda: home)
+    options = CanaryOptions(
+        repo_root=tmp_path / "repo",
+        hermes_home=hermes_home,
+        env_wrapper=None,
+        timeout=0.2,
+    )
+
+    result = canary_module._canary_browser_harness_contract(options)
+
+    assert result.status == PASS
+    assert result.details["browser_use_api_key_present"] is True
 
 
 def test_release_profile_converts_skipped_live_checks_to_failures(tmp_path):

@@ -10,6 +10,7 @@ import json
 import os
 import re
 import shlex
+import shutil
 import socket
 import subprocess
 import tempfile
@@ -3817,6 +3818,97 @@ def _canary_aeroxchange_browser_workflow(options: CanaryOptions) -> CanaryResult
     )
 
 
+def _canary_browser_harness_contract(options: CanaryOptions) -> CanaryResult:
+    failed: dict[str, Any] = {}
+    passed: list[str] = []
+
+    executable = shutil.which("browser-harness")
+    home_executable = Path.home() / ".local" / "bin" / "browser-harness"
+    if executable or home_executable.is_file():
+        passed.append("browser_harness_executable")
+        executable = executable or str(home_executable)
+    else:
+        failed["browser_harness_executable"] = {
+            "path": os.getenv("PATH", ""),
+            "home_candidate": str(home_executable),
+        }
+
+    repo_root = Path.home() / "tools" / "browser-harness"
+    repo_files = [
+        repo_root / "SKILL.md",
+        repo_root / "helpers.py",
+        repo_root / "install.md",
+    ]
+    missing_repo_files = [str(path) for path in repo_files if not path.is_file()]
+    if not missing_repo_files:
+        passed.append("browser_harness_repo")
+    else:
+        failed["browser_harness_repo"] = {
+            "repo_root": str(repo_root),
+            "missing": missing_repo_files,
+        }
+
+    skill_dir = options.hermes_home / "skills" / "browser-harness"
+    skill_files = [
+        skill_dir / "SKILL.md",
+        skill_dir / "helpers.py",
+        skill_dir / "install.md",
+    ]
+    missing_skill_files = [str(path) for path in skill_files if not path.exists()]
+    if not missing_skill_files:
+        passed.append("hermes_skill_registered")
+    else:
+        failed["hermes_skill_registered"] = {
+            "skill_dir": str(skill_dir),
+            "missing": missing_skill_files,
+        }
+
+    support_dirs = [
+        skill_dir / "interaction-skills",
+        skill_dir / "domain-skills",
+    ]
+    missing_support_dirs = [str(path) for path in support_dirs if not path.is_dir()]
+    if not missing_support_dirs:
+        passed.append("supporting_browser_skills")
+    else:
+        failed["supporting_browser_skills"] = missing_support_dirs
+
+    provider_source = options.repo_root / "tools" / "browser_providers" / "browser_use.py"
+    if provider_source.is_file():
+        passed.append("browser_use_provider_source")
+    else:
+        failed["browser_use_provider_source"] = str(provider_source)
+
+    cloud_key_present = bool(os.getenv("BROWSER_USE_API_KEY", "").strip())
+    details = {
+        "passed": passed,
+        "failed": failed,
+        "executable": executable or "",
+        "repo_root": str(repo_root),
+        "skill_dir": str(skill_dir),
+        "browser_use_api_key_present": cloud_key_present,
+        "cloud_note": (
+            "Browser Use cloud browsers are available when BROWSER_USE_API_KEY is set; "
+            "local CDP browser-harness remains installed without it."
+        ),
+    }
+    total_checks = 5
+    score = round(15.0 * len(passed) / total_checks, 1)
+    status = PASS if not failed else WARN if passed else FAIL
+    summary = (
+        f"{len(passed)}/{total_checks} Browser Harness permanent-install checks passed"
+        + ("; Browser Use cloud key present" if cloud_key_present else "; cloud key not present")
+    )
+    return _result(
+        "contract.browser_harness",
+        status,
+        score,
+        15,
+        summary,
+        details,
+    )
+
+
 def _env_file_has_any_key(path: Path, keys: set[str]) -> bool:
     try:
         lines = path.read_text(encoding="utf-8").splitlines()
@@ -5286,6 +5378,7 @@ def run_canary_suite(options: CanaryOptions) -> CanaryReport:
         ("contract.business_os_brief", 20, lambda: _canary_business_os_brief(options)),
         ("contract.business_os_daily_report", 20, lambda: _canary_business_os_daily_report(options)),
         ("contract.aeroxchange_browser_workflow", 20, lambda: _canary_aeroxchange_browser_workflow(options)),
+        ("contract.browser_harness", 15, lambda: _canary_browser_harness_contract(options)),
         ("contract.quote_ops_runtime", 20, lambda: _canary_quote_ops_runtime(options)),
         ("live.rfq_dry_run_quote_package", 25, lambda: _canary_rfq_dry_run_quote_package(options)),
         ("live.approved_rfq_draft_quote", 30, lambda: _canary_approved_rfq_draft_quote(options)),
@@ -5386,6 +5479,9 @@ def _quality_dimensions(report: CanaryReport) -> list[QualityDimension]:
     aeroxchange_result = _result_by_name(report, "contract.aeroxchange_browser_workflow")
     if aeroxchange_result and aeroxchange_result.status == PASS:
         harness_score += 0.4
+    browser_harness_result = _result_by_name(report, "contract.browser_harness")
+    if browser_harness_result and browser_harness_result.status == PASS:
+        harness_score += 0.3
     harness_score = min(harness_score, 10.0)
 
     goal_result = _result_by_name(report, "contract.goal_workspace")
