@@ -130,6 +130,20 @@ DEFAULT_WORKFLOWS: tuple[dict[str, Any], ...] = (
         "rollback": "Disable workflow and keep inventory review manual",
         "notes": [],
     },
+    {
+        "id": "aeroxchange-rfq-browser-draft",
+        "title": "Aeroxchange RFQ browser draft workflow",
+        "category": "rfq",
+        "owner": "sales-rfq",
+        "status": "enabled",
+        "schedule": "manual/on-demand browser workflow; no portal submit without approval",
+        "kill_switch_env": "HERMES_AEROXCHANGE_BROWSER_ENABLED",
+        "max_candidates": "bounded RFQ snapshot/draft package per operator request",
+        "dedupe_key": "aeroxchange rfq id + part number + snapshot timestamp",
+        "health_check": "/aero status and contract.aeroxchange_browser_workflow",
+        "rollback": "Disable workflow and keep Aeroxchange RFQs manual",
+        "notes": [],
+    },
 )
 
 

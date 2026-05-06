@@ -250,6 +250,7 @@ def _time_case(
 def _canary_imports() -> CanaryResult:
     modules = [
         "gateway.run",
+        "hermes_cli.aeroxchange",
         "hermes_cli.commands",
         "hermes_cli.goals",
         "hermes_cli.workspace",
@@ -918,6 +919,11 @@ def _canary_command_registry() -> CanaryResult:
             "subcommands": {"brief", "score", "workflows", "report", "run", "daily"},
         },
         "business": {"gateway_only": True},
+        "aero": {
+            "gateway_only": True,
+            "subcommands": {"status", "draft", "report", "parse"},
+        },
+        "aeroxchange": {"gateway_only": True},
         "kill": {"gateway_only": True},
         "approve": {"gateway_only": True},
         "deny": {"gateway_only": True},
@@ -954,7 +960,7 @@ def _canary_command_registry() -> CanaryResult:
         PASS,
         10,
         10,
-        "Goal, Workspace, Workflow, Ops, and approval commands registered",
+        "Goal, Workspace, Workflow, Ops, Aeroxchange, and approval commands registered",
         details,
     )
 
@@ -1075,6 +1081,7 @@ def _canary_workflow_registry() -> CanaryResult:
         seeded = {workflow["id"]: workflow for workflow in store.list_workflows()}
         required_seeded = {
             "rfq-intake",
+            "aeroxchange-rfq-browser-draft",
             "finance-admin-daily-brief",
             "purchasing-vendor-followup",
             "repair-stuck-units",
@@ -3655,6 +3662,161 @@ def _canary_business_os_daily_report(options: CanaryOptions) -> CanaryResult:
     )
 
 
+def _canary_aeroxchange_browser_workflow(options: CanaryOptions) -> CanaryResult:
+    from hermes_cli.aeroxchange import (
+        AEROXCHANGE_WORKFLOW_ID,
+        build_aeroxchange_browser_readiness,
+        build_aeroxchange_draft_package,
+        render_aeroxchange_draft_package,
+        run_aeroxchange_draft_from_snapshot,
+    )
+    from hermes_cli.commands import resolve_command
+    from hermes_cli.workspace import WorkspaceStore
+    from hermes_cli.workflows import WorkflowRegistry
+
+    snapshot = "\n".join(
+        [
+            "RFQ # AX-1001",
+            "Buyer: Aero Accessories",
+            "Part Number: 5909891",
+            "Description: IDG accessory rotor",
+            "Qty: 1",
+            "Condition: AR",
+            "Due Date: 2026-05-08",
+            "Notes: quote from Aeroxchange queue",
+            "",
+            "RFQ # AX-1002",
+            "Customer: Advanced Aerospace Components",
+            "PN: 743502",
+            "Description: Pump liner",
+            "Quantity: 2",
+            "Cond: SV",
+            "Response Due: 2026-05-09",
+        ]
+    )
+    failed: dict[str, Any] = {}
+    passed: list[str] = []
+
+    package = build_aeroxchange_draft_package(snapshot, source_url="https://www.aeroxchange.com/rfq")
+    rfqs = package.get("rfqs") if isinstance(package.get("rfqs"), list) else []
+    part_numbers = {str(rfq.get("part_number") or "") for rfq in rfqs}
+    if len(rfqs) == 2 and {"5909891", "743502"}.issubset(part_numbers):
+        passed.append("rfq_parse")
+    else:
+        failed["rfq_parse"] = {"rfqs": rfqs}
+
+    if package.get("mode") == "draft_only" and package.get("approval_required", {}).get("before_submit") is True:
+        passed.append("draft_only_mode")
+    else:
+        failed["draft_only_mode"] = package
+
+    browser_actions = package.get("browser_actions") if isinstance(package.get("browser_actions"), list) else []
+    blocked_portal_actions = {"submit", "submit_quote", "send", "send_response", "award", "decline"}
+    unsafe_actions = [
+        action for action in browser_actions
+        if str(action.get("action") or "").lower() in blocked_portal_actions
+        or action.get("executes_external_write") is True
+    ]
+    if not unsafe_actions and package.get("blocked_actions"):
+        passed.append("no_submit_actions")
+    else:
+        failed["no_submit_actions"] = {"unsafe": unsafe_actions, "actions": browser_actions}
+
+    markdown = render_aeroxchange_draft_package(package)
+    required_text = [
+        "Aeroxchange RFQ Draft Package",
+        "Mode: draft_only",
+        "No Aeroxchange submit",
+        "5909891",
+        "743502",
+    ]
+    missing_text = [item for item in required_text if item not in markdown]
+    if missing_text:
+        failed["markdown"] = {"missing": missing_text, "markdown": markdown}
+    else:
+        passed.append("markdown")
+
+    readiness = build_aeroxchange_browser_readiness()
+    if readiness.get("status") == "draft_ready" and AEROXCHANGE_WORKFLOW_ID == readiness.get("workflow_id"):
+        passed.append("readiness")
+    else:
+        failed["readiness"] = readiness
+
+    with tempfile.TemporaryDirectory(prefix="hermes-aeroxchange-") as tmp:
+        root = Path(tmp)
+        workspace = WorkspaceStore(root / "workspace" / "control_plane.json")
+        result = run_aeroxchange_draft_from_snapshot(
+            snapshot,
+            hermes_home=root,
+            workspace_store=workspace,
+            source="canary",
+        )
+        paths = result.get("paths") or {}
+        path_checks = [
+            Path(paths.get("markdown", "")),
+            Path(paths.get("json", "")),
+            root / "aeroxchange" / "reports" / "latest.md",
+            root / "aeroxchange" / "reports" / "latest.json",
+        ]
+        missing_paths = [str(path) for path in path_checks if not path.is_file()]
+        data = workspace.read()
+        tasks = data.get("tasks") or {}
+        evidence = data.get("evidence") or {}
+        if not missing_paths and tasks and evidence and all(task.get("status") == "done" for task in tasks.values()):
+            passed.append("workspace_evidence")
+        else:
+            failed["workspace_evidence"] = {
+                "missing_paths": missing_paths,
+                "tasks": tasks,
+                "evidence": evidence,
+            }
+
+        registry = WorkflowRegistry(root / "workflows" / "registry.json")
+        if registry.has_workflow(AEROXCHANGE_WORKFLOW_ID):
+            passed.append("workflow_registered")
+        else:
+            failed["workflow_registered"] = sorted(registry.read().get("workflows", {}))
+
+    aero_command = resolve_command("aero")
+    aeroxchange_alias = resolve_command("aeroxchange")
+    if (
+        aero_command
+        and aero_command.gateway_only
+        and aeroxchange_alias
+        and aeroxchange_alias.name == "aero"
+    ):
+        passed.append("command_registered")
+    else:
+        failed["command_registered"] = {
+            "aero": None if aero_command is None else aero_command.name,
+            "aeroxchange": None if aeroxchange_alias is None else aeroxchange_alias.name,
+        }
+
+    source_paths = [
+        options.repo_root / "hermes_cli" / "aeroxchange.py",
+        options.repo_root / "gateway" / "run.py",
+        options.repo_root / "hermes_cli" / "commands.py",
+        options.repo_root / "hermes_cli" / "workflows.py",
+    ]
+    missing_sources = [str(path) for path in source_paths if not path.is_file()]
+    if missing_sources:
+        failed["source_files"] = missing_sources
+    else:
+        passed.append("source_files")
+
+    total_checks = 9
+    score = round(20.0 * len(passed) / total_checks, 1)
+    status = PASS if not failed else WARN if passed else FAIL
+    return _result(
+        "contract.aeroxchange_browser_workflow",
+        status,
+        score,
+        20,
+        f"{len(passed)}/{total_checks} Aeroxchange browser draft checks passed",
+        {"passed": passed, "failed": failed},
+    )
+
+
 def _env_file_has_any_key(path: Path, keys: set[str]) -> bool:
     try:
         lines = path.read_text(encoding="utf-8").splitlines()
@@ -5123,6 +5285,7 @@ def run_canary_suite(options: CanaryOptions) -> CanaryReport:
         ("contract.memory_grounding", 20, lambda: _canary_memory_grounding(options)),
         ("contract.business_os_brief", 20, lambda: _canary_business_os_brief(options)),
         ("contract.business_os_daily_report", 20, lambda: _canary_business_os_daily_report(options)),
+        ("contract.aeroxchange_browser_workflow", 20, lambda: _canary_aeroxchange_browser_workflow(options)),
         ("contract.quote_ops_runtime", 20, lambda: _canary_quote_ops_runtime(options)),
         ("live.rfq_dry_run_quote_package", 25, lambda: _canary_rfq_dry_run_quote_package(options)),
         ("live.approved_rfq_draft_quote", 30, lambda: _canary_approved_rfq_draft_quote(options)),
@@ -5220,6 +5383,9 @@ def _quality_dimensions(report: CanaryReport) -> list[QualityDimension]:
         harness_score += 0.6
     if live_behavior_result and live_behavior_result.status == PASS:
         harness_score += 0.5
+    aeroxchange_result = _result_by_name(report, "contract.aeroxchange_browser_workflow")
+    if aeroxchange_result and aeroxchange_result.status == PASS:
+        harness_score += 0.4
     harness_score = min(harness_score, 10.0)
 
     goal_result = _result_by_name(report, "contract.goal_workspace")
@@ -5309,6 +5475,11 @@ def _quality_dimensions(report: CanaryReport) -> list[QualityDimension]:
         aac_workflows_score = max(aac_workflows_score, 8.9)
         aac_workflows_summary = (
             "RFQ plus read-only finance/admin, purchasing, repair, inventory daily reports pass."
+        )
+    if aeroxchange_result and aeroxchange_result.status == PASS:
+        aac_workflows_score = max(aac_workflows_score, 9.0)
+        aac_workflows_summary = (
+            "RFQ, Business OS, and Aeroxchange browser draft workflows are canary-scored with submit blocked."
         )
 
     quote_ops_result = _result_by_name(report, "contract.quote_ops_runtime")
@@ -5438,6 +5609,7 @@ def quality_summary(report: CanaryReport) -> dict[str, Any]:
         and passed("contract.business_os_brief")
     )
     business_os_daily_done = business_os_done and passed("contract.business_os_daily_report")
+    aeroxchange_draft_done = business_os_daily_done and passed("contract.aeroxchange_browser_workflow")
     foundation_done = (
         business_os_daily_done
         and passed("contract.planner_self_heal")
@@ -5482,6 +5654,11 @@ def quality_summary(report: CanaryReport) -> dict[str, Any]:
             "target": "8.9/10",
             "increment": "Read-only Business OS daily reports create Workspace evidence across finance, purchasing, repairs, and inventory",
             "status": "done" if business_os_daily_done else "open",
+        },
+        {
+            "target": "8.95/10",
+            "increment": "Aeroxchange browser draft workflow parses RFQs, writes evidence, and blocks submit/send",
+            "status": "done" if aeroxchange_draft_done else "open",
         },
         {
             "target": "9.0/10",

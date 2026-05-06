@@ -109,6 +109,11 @@ COMMAND_REGISTRY: list[CommandDef] = [
                aliases=("business", "bizops"), args_hint="[brief|score|workflows|report|run|daily]",
                subcommands=("brief", "score", "workflows", "report", "run", "daily"),
                gateway_only=True),
+    CommandDef("aero", "Prepare Aeroxchange RFQ browser draft packages without submit/send", "Session",
+               aliases=("aerox", "aeroxchange"),
+               args_hint="[status|draft|parse] <snapshot text>",
+               subcommands=("status", "draft", "report", "parse"),
+               gateway_only=True),
     CommandDef("kill", "Disable a named workflow kill switch", "Session",
                aliases=("disable",), args_hint="<workflow>",
                gateway_only=True),
@@ -314,6 +319,9 @@ def is_gateway_known_command(name: str | None) -> bool:
 ACTIVE_SESSION_BYPASS_COMMANDS: frozenset[str] = frozenset(
     {
         "agents",
+        "aero",
+        "aerox",
+        "aeroxchange",
         "approve",
         "background",
         "commands",

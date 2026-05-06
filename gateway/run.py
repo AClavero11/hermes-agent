@@ -5540,6 +5540,47 @@ class GatewayRunner:
         except Exception as exc:
             return f"Ops error: {exc}"
 
+    async def _handle_aero_command(self, event: MessageEvent) -> str:
+        from hermes_cli.aeroxchange import (
+            build_aeroxchange_browser_readiness,
+            build_aeroxchange_draft_package,
+            format_aeroxchange_draft_run,
+            format_aeroxchange_readiness,
+            render_aeroxchange_draft_package,
+            run_aeroxchange_draft_from_snapshot,
+        )
+
+        args = event.get_command_args().strip()
+        command, _, rest = args.partition(" ")
+        command = command.lower().strip()
+        snapshot_text = rest.strip()
+        if command not in {"", "status", "summary", "draft", "report", "parse"}:
+            snapshot_text = args
+            command = "draft"
+
+        try:
+            if command in {"", "status", "summary"}:
+                return format_aeroxchange_readiness(build_aeroxchange_browser_readiness())
+
+            if command == "parse":
+                if not snapshot_text:
+                    return "Usage: /aero parse <Aeroxchange RFQ text or browser snapshot>"
+                package = build_aeroxchange_draft_package(snapshot_text)
+                return render_aeroxchange_draft_package(package)
+
+            if command in {"draft", "report"}:
+                if not snapshot_text:
+                    return "Usage: /aero draft <Aeroxchange RFQ text or browser snapshot>"
+                result = run_aeroxchange_draft_from_snapshot(
+                    snapshot_text,
+                    source=self._workspace_source_label(event),
+                )
+                return format_aeroxchange_draft_run(result)
+
+            return "Usage: /aero [status|draft|parse] <Aeroxchange RFQ text or browser snapshot>"
+        except Exception as exc:
+            return f"Aeroxchange error: {exc}"
+
     async def _handle_kill_command(self, event: MessageEvent) -> str:
         from hermes_cli.workflows import WorkflowRegistry, format_workflow
 
@@ -5838,6 +5879,9 @@ class GatewayRunner:
             if _cmd_def_inner and _cmd_def_inner.name == "ops":
                 return await self._handle_ops_command(event)
 
+            if _cmd_def_inner and _cmd_def_inner.name == "aero":
+                return await self._handle_aero_command(event)
+
             if _cmd_def_inner and _cmd_def_inner.name == "kill":
                 return await self._handle_kill_command(event)
 
@@ -5994,6 +6038,8 @@ class GatewayRunner:
                     return await self._handle_workflow_command(event)
                 if _cmd_def_inner.name == "ops":
                     return await self._handle_ops_command(event)
+                if _cmd_def_inner.name == "aero":
+                    return await self._handle_aero_command(event)
                 if _cmd_def_inner.name == "kill":
                     return await self._handle_kill_command(event)
 
@@ -6311,6 +6357,9 @@ class GatewayRunner:
 
         if canonical == "ops":
             return await self._handle_ops_command(event)
+
+        if canonical == "aero":
+            return await self._handle_aero_command(event)
 
         if canonical == "kill":
             return await self._handle_kill_command(event)

@@ -56,6 +56,10 @@ def test_canary_suite_runs_without_live_gateway(tmp_path):
         for result in report.results
     )
     assert any(
+        result.name == "contract.aeroxchange_browser_workflow" and result.status == PASS
+        for result in report.results
+    )
+    assert any(
         result.name == "live.gateway_health" and result.status == SKIP
         for result in report.results
     )
