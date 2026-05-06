@@ -1143,14 +1143,27 @@ class TelegramAdapter(BasePlatformAdapter):
             for item in expected_substrings
             if str(item).strip()
         ]
+        forbidden_substrings = pending.get("forbidden_substrings")
+        if not isinstance(forbidden_substrings, list):
+            forbidden_substrings = []
+        forbidden_text = [
+            str(item)
+            for item in forbidden_substrings
+            if str(item).strip()
+        ]
         normalized_content = re.sub(r"\s+", " ", (content or "").lower()).strip()
         missing = [
             item
             for item in expected_text
             if item.lower() not in normalized_content
         ]
-        content_match = bool(expected_text) and not missing
-        if not content_match:
+        forbidden_hits = [
+            item
+            for item in forbidden_text
+            if item.lower() in normalized_content
+        ]
+        content_match = bool(expected_text) and not missing and not forbidden_hits
+        if not content_match and not forbidden_hits:
             return
 
         now = time.time()
@@ -1158,14 +1171,16 @@ class TelegramAdapter(BasePlatformAdapter):
         latency_ms = max(1.0, round((now - sent_at) * 1000.0, 1))
         inbound_message_id = pending.get("inbound_message_id")
         evidence = {
-            "status": "pass",
+            "status": "pass" if content_match else "fail",
             "mode": "signed_operator_response_probe",
             "source": "telegram_bot_send",
             "nonce": pending.get("nonce", ""),
             "chat_id": str(chat_id),
             "prompt": pending.get("prompt", ""),
             "expected_substrings": expected_text,
+            "forbidden_substrings": forbidden_text,
             "missing_substrings": missing,
+            "forbidden_hits": forbidden_hits,
             "content_match": content_match,
             "telegram_send_ok": bool(success),
             "sent_message_id": message_id,

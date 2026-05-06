@@ -2780,6 +2780,10 @@ def _telegram_operator_response_paths(options: CanaryOptions) -> tuple[Path, Pat
 
 def _telegram_operator_expected_substrings(prompt: str) -> list[str]:
     normalized = re.sub(r"[^a-z0-9]+", "", (prompt or "").lower())
+    if re.fullmatch(r"(?:qty|quantity|qnty)\d+(?:\d+)?", normalized):
+        match = re.search(r"\d+", normalized)
+        qty = match.group(0) if match else ""
+        return [f"Received: qty {qty}"] if qty else ["Received:"]
     if normalized in {"ack", "acknowledged"}:
         return ["Ack received", "No task started"]
     if normalized in {"test", "testing", "ping"}:
@@ -2801,6 +2805,14 @@ def _telegram_operator_expected_substrings(prompt: str) -> list[str]:
     return ["RFQ", "V11", "follow", "Hermes", "code", "approval"]
 
 
+def _telegram_operator_forbidden_substrings(prompt: str) -> list[str]:
+    normalized = re.sub(r"[^a-z0-9]+", "", (prompt or "").lower())
+    forbidden = ["cannot", "sorry", "waiting for model"]
+    if re.fullmatch(r"(?:qty|quantity|qnty)\d+(?:\d+)?", normalized):
+        forbidden.extend(["Prioritized tasks", "Execution blocked", "No actions executed"])
+    return forbidden
+
+
 def _run_telegram_operator_response_probe(options: CanaryOptions) -> dict[str, Any]:
     secret_path = options.hermes_home / "private" / "telegram-webhook-secret"
     pending_path, evidence_path = _telegram_operator_response_paths(options)
@@ -2814,6 +2826,7 @@ def _run_telegram_operator_response_probe(options: CanaryOptions) -> dict[str, A
         "what can we do",
     ).strip()
     expected_substrings = _telegram_operator_expected_substrings(prompt)
+    forbidden_substrings = _telegram_operator_forbidden_substrings(prompt)
     started = time.time()
     details: dict[str, Any] = {
         "mode": "signed_operator_response_probe",
@@ -2824,6 +2837,7 @@ def _run_telegram_operator_response_probe(options: CanaryOptions) -> dict[str, A
         "chat_id_present": bool(chat_id),
         "prompt": prompt,
         "expected_substrings": expected_substrings,
+        "forbidden_substrings": forbidden_substrings,
     }
     if not chat_id:
         details.update({"ok": False, "error": "No Telegram channel id found"})
@@ -2859,6 +2873,7 @@ def _run_telegram_operator_response_probe(options: CanaryOptions) -> dict[str, A
         "nonce": nonce,
         "prompt": prompt,
         "expected_substrings": expected_substrings,
+        "forbidden_substrings": forbidden_substrings,
         "inbound_message_id": inbound_message_id,
         "repo_sha": repo_sha,
         "runtime_sha": repo_sha,

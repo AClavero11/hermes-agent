@@ -108,3 +108,42 @@ def test_operator_response_evidence_preserves_sha_binding(tmp_path, monkeypatch)
     assert evidence["repo_sha"] == "def456"
     assert evidence["runtime_sha"] == "def456"
     assert evidence["created_at"] > 0
+
+
+def test_operator_response_evidence_fails_for_forbidden_planner_scaffold(tmp_path, monkeypatch):
+    pending_path = tmp_path / "telegram_operator_response_pending.json"
+    evidence_path = tmp_path / "telegram_operator_response_last.json"
+    pending_path.write_text(
+        json.dumps(
+            {
+                "status": "pending",
+                "mode": "signed_operator_response_probe",
+                "chat_id": "496461229",
+                "sent_at": time.time() - 1,
+                "latency_budget_ms": 10000,
+                "nonce": "op-qty",
+                "prompt": "qty 1",
+                "expected_substrings": ["Received: qty 1"],
+                "forbidden_substrings": ["Prioritized tasks", "Execution blocked"],
+                "inbound_message_id": 101,
+                "repo_sha": "def456",
+                "runtime_sha": "def456",
+            }
+        ),
+        encoding="utf-8",
+    )
+    monkeypatch.setenv("HERMES_TELEGRAM_OPERATOR_PENDING_PATH", str(pending_path))
+    monkeypatch.setenv("HERMES_TELEGRAM_OPERATOR_EVIDENCE_PATH", str(evidence_path))
+
+    _adapter()._maybe_record_telegram_operator_response(
+        chat_id="496461229",
+        content="Received: qty 1.\n\nPrioritized tasks:\n1. Clarify.",
+        reply_to="101",
+        message_id="202",
+        success=True,
+    )
+
+    evidence = json.loads(evidence_path.read_text(encoding="utf-8"))
+    assert evidence["status"] == "fail"
+    assert evidence["content_match"] is False
+    assert evidence["forbidden_hits"] == ["Prioritized tasks"]

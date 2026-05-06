@@ -749,6 +749,17 @@ def test_telegram_operator_expected_substrings_follow_prompt_choice():
         "draft package",
         "No customer sends",
     ]
+    assert canary_module._telegram_operator_expected_substrings("qty 1") == [
+        "Received: qty 1",
+    ]
+    assert canary_module._telegram_operator_forbidden_substrings("qty 1") == [
+        "cannot",
+        "sorry",
+        "waiting for model",
+        "Prioritized tasks",
+        "Execution blocked",
+        "No actions executed",
+    ]
     assert canary_module._telegram_operator_expected_substrings("inventory") == [
         "Inventory mode",
         "V11",
