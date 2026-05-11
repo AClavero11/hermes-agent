@@ -1201,6 +1201,13 @@ def cmd_canary(args):
     _cmd_canary(args)
 
 
+def cmd_auto_think(args):
+    """Auto-think local utilities."""
+    from hermes_cli.auto_think import dashboard_command
+
+    dashboard_command(args)
+
+
 def cmd_runtime(args):
     """Show runtime path/model/health resolver."""
     from hermes_cli.runtime_status import cmd_runtime as _cmd_runtime
@@ -7269,6 +7276,33 @@ For more help on a command:
         help="Print the metrics JSON to stdout",
     )
     canary_parser.set_defaults(func=cmd_canary)
+
+    # =========================================================================
+    # auto-think command
+    # =========================================================================
+    auto_think_parser = subparsers.add_parser(
+        "auto-think",
+        help="Generate local Auto-think artifacts",
+        description="Generate local-only Auto-think artifacts from HERMES_HOME state.",
+    )
+    auto_think_subparsers = auto_think_parser.add_subparsers(dest="auto_think_command")
+    auto_think_dashboard = auto_think_subparsers.add_parser(
+        "dashboard",
+        help="Generate the local Auto-think candidate dashboard and print the artifact path",
+    )
+    auto_think_dashboard.add_argument(
+        "--hermes-home",
+        type=Path,
+        default=get_hermes_home(),
+        help="Hermes home containing auto_think/candidates.jsonl and html_artifacts/",
+    )
+    auto_think_dashboard.add_argument(
+        "--open",
+        action="store_true",
+        help="Open the generated artifact with macOS open; never enabled by default",
+    )
+    auto_think_parser.set_defaults(func=cmd_auto_think, auto_think_command="dashboard")
+    auto_think_dashboard.set_defaults(func=cmd_auto_think, auto_think_command="dashboard")
 
     # =========================================================================
     # runtime command

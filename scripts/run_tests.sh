@@ -23,28 +23,43 @@ set -euo pipefail
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 REPO_ROOT="$(cd "$SCRIPT_DIR/.." && pwd)"
 
-# ── Activate venv ───────────────────────────────────────────────────────────
-# Prefer a .venv in the current tree, fall back to the main checkout's venv
-# (useful for worktrees where we don't always duplicate the venv).
+# ── Activate venv or uv fallback ────────────────────────────────────────────
+# Prefer a usable local venv. If the checkout has a broken partial venv, skip it
+# and use uv with an explicit temp environment so uv does not auto-select .venv.
 VENV=""
 for candidate in "$REPO_ROOT/.venv" "$REPO_ROOT/venv" "$HOME/.hermes/hermes-agent/venv"; do
-  if [ -f "$candidate/bin/activate" ]; then
+  if [ -f "$candidate/bin/activate" ] && [ -x "$candidate/bin/python" ] && "$candidate/bin/python" -c "import sys" >/dev/null 2>&1; then
     VENV="$candidate"
     break
   fi
+  if [ -e "$candidate" ]; then
+    echo "→ Skipping unusable virtualenv: $candidate" >&2
+  fi
 done
 
-if [ -z "$VENV" ]; then
-  echo "error: no virtualenv found in $REPO_ROOT/.venv or $REPO_ROOT/venv" >&2
+PYTEST_RUNNER=()
+if [ -n "$VENV" ]; then
+  PYTHON="$VENV/bin/python"
+  # ── Ensure pytest-split is installed (required for shard-equivalent runs) ──
+  if ! "$PYTHON" -c "import pytest_split" 2>/dev/null; then
+    echo "→ installing pytest-split into $VENV"
+    "$PYTHON" -m pip install --quiet "pytest-split>=0.9,<1"
+  fi
+  PYTEST_RUNNER=("$PYTHON" -m pytest)
+elif command -v uv >/dev/null 2>&1; then
+  PYTHON_CMD="${HERMES_TEST_PYTHON:-}"
+  if [ -z "$PYTHON_CMD" ] && [ -x /usr/local/bin/python3 ]; then
+    PYTHON_CMD="/usr/local/bin/python3"
+  fi
+  if [ -z "$PYTHON_CMD" ]; then
+    PYTHON_CMD="python3"
+  fi
+  export UV_PROJECT_ENVIRONMENT="${UV_PROJECT_ENVIRONMENT:-${TMPDIR:-/tmp}/hermes-agent-test-venv}"
+  echo "→ no usable virtualenv found; using uv with $PYTHON_CMD at $UV_PROJECT_ENVIRONMENT" >&2
+  PYTEST_RUNNER=(uv run --python "$PYTHON_CMD" --extra dev --with "pytest-split>=0.9,<1" python -m pytest)
+else
+  echo "error: no usable virtualenv found and uv is not installed" >&2
   exit 1
-fi
-
-PYTHON="$VENV/bin/python"
-
-# ── Ensure pytest-split is installed (required for shard-equivalent runs) ──
-if ! "$PYTHON" -c "import pytest_split" 2>/dev/null; then
-  echo "→ installing pytest-split into $VENV"
-  "$PYTHON" -m pip install --quiet "pytest-split>=0.9,<1"
 fi
 
 # ── Hermetic environment ────────────────────────────────────────────────────
@@ -95,16 +110,10 @@ echo "▶ running pytest with $WORKERS workers, hermetic env, in $REPO_ROOT"
 echo "  (TZ=UTC LANG=C.UTF-8 PYTHONHASHSEED=0; all credential env vars unset)"
 
 # -o "addopts=" clears pyproject.toml's `-n auto` so our -n wins.
-PYTEST_BASE_ARGS=(
-  -o "addopts="
-  -n "$WORKERS"
-  --ignore=tests/integration
-  --ignore=tests/e2e
-  -m "not integration"
-)
-
-if [ "$#" -gt 0 ]; then
-  exec "$PYTHON" -m pytest "${PYTEST_BASE_ARGS[@]}" "${ARGS[@]}"
-else
-  exec "$PYTHON" -m pytest "${PYTEST_BASE_ARGS[@]}"
-fi
+exec "${PYTEST_RUNNER[@]}" \
+  -o "addopts=" \
+  -n "$WORKERS" \
+  --ignore=tests/integration \
+  --ignore=tests/e2e \
+  -m "not integration" \
+  "${ARGS[@]}"

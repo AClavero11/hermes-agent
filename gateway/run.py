@@ -1222,6 +1222,64 @@ def _build_operator_capability_model_answer_sync(message: str) -> str:
         except Exception as exc:
             logger.info("Operator capability OpenAI route failed: %s", exc)
 
+    openrouter_provider_requested = any(
+        str((route or {}).get("provider") or "").lower() == "openrouter"
+        for route in (planner, synthesizer)
+    ) or os.getenv("HERMES_FRONTIER_PROVIDER", "").strip().lower() == "openrouter"
+    openrouter_api_key = (
+        os.getenv("OPENROUTER_API_KEY", "").strip()
+        or os.getenv("HERMES_OPENROUTER_API_KEY", "").strip()
+    )
+    openrouter_model = (
+        os.getenv("HERMES_OPERATOR_CAPABILITY_OPENROUTER_MODEL", "").strip()
+        or os.getenv("HERMES_OPENROUTER_FRONTIER_MODEL", "").strip()
+        or os.getenv("HERMES_FRONTIER_MODEL", "").strip()
+        or os.getenv("HERMES_OPENROUTER_PLANNER_MODEL", "").strip()
+        or os.getenv("HERMES_PLANNER_MODEL", "").strip()
+    )
+    if (
+        openrouter_provider_requested
+        and openrouter_api_key
+        and openrouter_model
+        and "${" not in openrouter_model
+    ):
+        hosted_attempted = True
+        openrouter_base = os.getenv("OPENROUTER_BASE_URL", "https://openrouter.ai/api/v1").rstrip("/")
+        payload = {
+            "model": openrouter_model,
+            "messages": [
+                {
+                    "role": "system",
+                    "content": "You are Hermes for AC. Concise operational answer only. No tools.",
+                },
+                {"role": "user", "content": prompt},
+            ],
+            "temperature": 0.2,
+            "max_tokens": 260,
+            "stream": False,
+        }
+        try:
+            data = _post_json(
+                f"{openrouter_base}/chat/completions",
+                payload,
+                headers={"Authorization": f"Bearer {openrouter_api_key}"},
+                timeout=min(timeout, 6.0),
+            )
+            choices = data.get("choices") if isinstance(data, dict) else []
+            if isinstance(choices, list) and choices:
+                message_payload = choices[0].get("message") if isinstance(choices[0], dict) else {}
+                text = str(message_payload.get("content") or "").strip()
+                if text:
+                    answer = _finalize_operator_capability_answer(
+                        text,
+                        provider_label=f"OpenRouter {openrouter_model}",
+                        fallback_on_failure=False,
+                    )
+                    if answer:
+                        return answer
+        except Exception as exc:
+            logger.info("Operator capability OpenRouter route failed: %s", exc)
+
     try:
         runtime_kwargs = _resolve_runtime_agent_kwargs()
     except Exception as exc:
@@ -2410,6 +2468,21 @@ class GatewayRunner:
         if hasattr(self, "_pending_rfq_prompts"):
             self._pending_rfq_prompts.pop(session_key, None)
 
+    def _is_reply_to_quote_workflow(self, event: MessageEvent) -> bool:
+        reply_text = str(getattr(event, "reply_to_text", "") or "").lower()
+        if not reply_text:
+            return False
+        quote_markers = (
+            "new ils quote ready",
+            "approve to generate email draft",
+            "reject to cancel the v11 draft",
+            "rfq ref:",
+            "quote: so/",
+            "customer-ready draft:",
+            "approval required before customer send",
+        )
+        return any(marker in reply_text for marker in quote_markers)
+
     async def _run_session_rfq_fast_path(
         self,
         event: MessageEvent,
@@ -2419,10 +2492,11 @@ class GatewayRunner:
         text = (event.text or "").strip()
         if not text:
             return ""
+        if self._is_reply_to_quote_workflow(event):
+            return ""
         resolved_session_key = session_key or self._session_key_for_source(event.source)
         try:
             from gateway.rfq_fast_path import (
-                build_rfq_followup_without_context_response,
                 merge_rfq_followup_prompt,
             )
         except Exception as exc:
@@ -2449,9 +2523,6 @@ class GatewayRunner:
                 self._clear_pending_rfq_prompt(resolved_session_key)
             return str(result.response or "")
 
-        followup_response = build_rfq_followup_without_context_response(text)
-        if followup_response:
-            return followup_response
         return ""
 
     def _resolve_session_agent_runtime(

@@ -121,6 +121,7 @@ def test_run_slash_json_output(kanban_home):
 def test_run_slash_workflow_list_and_create_json(kanban_home):
     listed = json.loads(kc.run_slash("workflow list --json"))
     assert any(t["id"] == "research-brief" for t in listed)
+    assert any(t["id"] == "rfq-superoptimizer" for t in listed)
 
     out = kc.run_slash(
         "workflow create research-brief --title 'Atlas links' "
@@ -139,6 +140,33 @@ def test_run_slash_workflow_list_and_create_json(kanban_home):
         assert first.current_step_key == "research"
         assert second.current_step_key == "synthesis"
         assert payload["tasks"][0]["task_id"] in kb.parent_ids(conn, second.id)
+
+
+def test_run_slash_rfq_superoptimizer_workflow_json(kanban_home):
+    out = kc.run_slash(
+        "workflow create rfq-superoptimizer --title 'Turkish 767870 RFQ' "
+        "--body 'Inbound RFQ: Turkish pn 767870 qty 1 SV due 2026-06-15' --json"
+    )
+    payload = json.loads(out)
+
+    assert payload["template_id"] == "rfq-superoptimizer"
+    assert [task["key"] for task in payload["tasks"]] == [
+        "intake",
+        "v11-live-lookup",
+        "alexandria-history",
+        "draft-package",
+        "ac-approval-gate",
+    ]
+    assert payload["tasks"][0]["assignee"] == "sales-rfq"
+    assert payload["tasks"][-1]["assignee"] == "chief-of-staff"
+
+    with kb.connect() as conn:
+        draft_task = kb.get_task(conn, payload["tasks"][3]["task_id"])
+        approval_task = kb.get_task(conn, payload["tasks"][4]["task_id"])
+        assert "source list" in draft_task.body.lower()
+        assert "confidence" in draft_task.body.lower()
+        assert "no customer send" in approval_task.body.lower()
+        assert payload["tasks"][3]["task_id"] in kb.parent_ids(conn, approval_task.id)
 
 
 def test_run_slash_brief_json(kanban_home):

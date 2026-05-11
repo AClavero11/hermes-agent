@@ -141,6 +141,68 @@ TEMPLATES: dict[str, WorkflowTemplate] = {
             ),
         ),
     ),
+    "rfq-superoptimizer": WorkflowTemplate(
+        id="rfq-superoptimizer",
+        name="RFQ Superoptimizer",
+        description="Draft-only AAC RFQ pilot with V11 live lookup, Alexandria/QMD history, source list, confidence flags, and AC approval gate.",
+        steps=(
+            WorkflowStep(
+                key="intake",
+                title="Inbound RFQ intake and field extraction",
+                assignee="sales-rfq",
+                body=(
+                    "Extract customer, part number, qty, condition, due date, cert/lead-time notes, "
+                    "and missing fields from the inbound RFQ. Preserve the original RFQ text. "
+                    "No customer send, quote issuance, purchase, delete, ERP write, or external action."
+                ),
+                priority_delta=30,
+            ),
+            WorkflowStep(
+                key="v11-live-lookup",
+                title="V11 live product inventory customer sales lookup",
+                assignee="sales-rfq",
+                body=(
+                    "Use read-only V11 XML-RPC/MCP lookups for product, inventory, customer, and sales history. "
+                    "Return source names/record identifiers, confidence flags, and gaps. No ERP writes."
+                ),
+                parents=("intake",),
+                priority_delta=20,
+            ),
+            WorkflowStep(
+                key="alexandria-history",
+                title="Alexandria/QMD customer pricing history lookup",
+                assignee="research",
+                body=(
+                    "Search Alexandria/QMD for customer context, pricing history, prior quote/sale notes, "
+                    "risk flags, and source list. Cite every material claim. No external sends."
+                ),
+                parents=("intake",),
+                priority_delta=20,
+            ),
+            WorkflowStep(
+                key="draft-package",
+                title="Draft quote package with source list and confidence flags",
+                assignee="sales-rfq",
+                body=(
+                    "Combine intake, V11, and Alexandria/QMD findings into a draft-only quote/email package. "
+                    "Include source list, confidence flags, recommended price logic, missing fields, and draft customer text. "
+                    "No customer send, quote issuance, purchase, delete, ERP write, or external action."
+                ),
+                parents=("v11-live-lookup", "alexandria-history"),
+                priority_delta=10,
+            ),
+            WorkflowStep(
+                key="ac-approval-gate",
+                title="AC approval gate before quote/customer action",
+                assignee="chief-of-staff",
+                body=(
+                    "Review the draft package and return the exact approval decision needed from AC. "
+                    "No customer send, quote issuance, purchase, delete, ERP write, or external action without explicit AC approval."
+                ),
+                parents=("draft-package",),
+            ),
+        ),
+    ),
     "finance-follow-up": WorkflowTemplate(
         id="finance-follow-up",
         name="Finance Follow-Up",

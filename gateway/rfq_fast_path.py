@@ -20,6 +20,7 @@ READ_ONLY_RFQ_TOOLS = {
     "inventory": "mcp_v11_v11_get_inventory",
     "pricing": "mcp_v11_v11_search_sales",
 }
+ALEXANDRIA_RFQ_TOOL = "mcp_alexandria_unified_search"
 
 _CONDITION_RE = re.compile(r"\b(SV|OH|AR|NE|FN|NS)\b(?:\s+condition)?", re.IGNORECASE)
 _QTY_RE = re.compile(r"\b(?:qty|quantity|qnty)\s*[:#-]?\s*(\d+(?:\.\d+)?)\b", re.IGNORECASE)
@@ -30,6 +31,10 @@ _PART_LABEL_RE = re.compile(
 _PART_TOKEN_RE = re.compile(r"\b(?=[A-Z0-9._/-]*\d)[A-Z0-9][A-Z0-9._/-]{2,}\b", re.IGNORECASE)
 _TARGET_PRICE_RE = re.compile(
     r"\b(?:target(?:\s+price)?|price|at|offer)\s*[:$]?\s*\$?\s*(\d+(?:,\d{3})*(?:\.\d+)?)\b",
+    re.IGNORECASE,
+)
+_DUE_DATE_RE = re.compile(
+    r"\b(?:due(?:\s+date)?|need(?:ed)?\s+by|required\s+by|response\s+due)\s*[:#-]?\s*(\d{4}-\d{2}-\d{2})\b",
     re.IGNORECASE,
 )
 _RFQ_WORD_RE = re.compile(r"\b(?:rfq|quote|quoted|pricing)\b", re.IGNORECASE)
@@ -80,6 +85,7 @@ class ParsedRFQ:
     condition: str
     target_price: str
     free_text: str
+    due_date: str = ""
 
     @property
     def missing_fields(self) -> list[str]:
@@ -134,6 +140,12 @@ class PricingDecision:
     recommended_price: str
     confidence: str
     reasons: tuple[str, ...]
+
+
+@dataclass(frozen=True)
+class AlexandriaEvidence:
+    summary: str
+    sources: tuple[str, ...]
 
 
 @dataclass(frozen=True)
@@ -263,6 +275,11 @@ def _extract_condition(text: str) -> str:
 def _extract_target_price(text: str) -> str:
     match = _TARGET_PRICE_RE.search(text)
     return match.group(1).replace(",", "") if match else ""
+
+
+def _extract_due_date(text: str) -> str:
+    match = _DUE_DATE_RE.search(text)
+    return match.group(1) if match else ""
 
 
 def _extract_customer(text: str, part_number: str) -> str:
@@ -413,10 +430,12 @@ def parse_rfq_prompt(text: str) -> ParsedRFQ | None:
     condition = _extract_condition(raw)
     customer = _extract_customer(raw, part_number)
     target_price = _extract_target_price(raw)
+    due_date = _extract_due_date(raw)
 
     rfq_like = bool(_RFQ_WORD_RE.search(raw)) or bool(_PART_LABEL_RE.search(raw))
     has_core = bool(part_number and qty and condition)
-    if not (rfq_like or has_core):
+    has_rfq_payload = bool(part_number or qty or condition or target_price)
+    if not (has_core or (rfq_like and has_rfq_payload)):
         return None
 
     return ParsedRFQ(
@@ -426,6 +445,7 @@ def parse_rfq_prompt(text: str) -> ParsedRFQ | None:
         condition=condition,
         target_price=target_price,
         free_text=raw,
+        due_date=due_date,
     )
 
 
@@ -523,11 +543,35 @@ def _available_tool_names() -> set[str]:
 
 
 def _call_read_only_tool(name: str, args: dict[str, Any], *, task_id: str) -> str:
-    if name not in READ_ONLY_RFQ_TOOLS.values():
+    if name not in {*READ_ONLY_RFQ_TOOLS.values(), ALEXANDRIA_RFQ_TOOL}:
         raise ValueError(f"RFQ fast path refused non-read-only tool: {name}")
     from model_tools import handle_function_call
 
     return handle_function_call(name, args, task_id=task_id)
+
+
+def _summarize_alexandria(data: Any) -> AlexandriaEvidence:
+    if not isinstance(data, dict):
+        return AlexandriaEvidence("Lookup returned non-JSON output.", ())
+    if data.get("error"):
+        return AlexandriaEvidence(f"Lookup failed: {data.get('error')}", ())
+    raw_results = data.get("results") or data.get("matches") or []
+    if not isinstance(raw_results, list) or not raw_results:
+        return AlexandriaEvidence("No Alexandria/QMD context found.", ())
+
+    lines: list[str] = []
+    sources: list[str] = []
+    for item in raw_results[:3]:
+        if not isinstance(item, dict):
+            continue
+        title = str(item.get("title") or item.get("name") or item.get("path") or "Untitled source")
+        source = str(item.get("source") or item.get("path") or item.get("uri") or "Alexandria/QMD")
+        snippet = str(item.get("snippet") or item.get("content") or item.get("text") or "").strip()
+        lines.append(f"{title}: {snippet}" if snippet else title)
+        sources.append(source)
+    if not lines:
+        return AlexandriaEvidence("No Alexandria/QMD context found.", ())
+    return AlexandriaEvidence("; ".join(lines), tuple(sources))
 
 
 def _best_customer(customers: list[dict[str, Any]], query: str) -> dict[str, Any] | None:
@@ -1130,6 +1174,8 @@ def _format_quote_packet(
     tool_errors: list[str],
     context_summary: str = "",
     inferred_fields: tuple[InferredField, ...] = (),
+    alexandria: AlexandriaEvidence | None = None,
+    source_tools: tuple[str, ...] = (),
 ) -> str:
     draft = "Not enough evidence for a customer-ready draft."
     if customer_name and inventory.covers and decision.recommended_price.startswith("$"):
@@ -1148,6 +1194,7 @@ def _format_quote_packet(
         f"- Qty: {parsed.qty}",
         f"- Condition: {parsed.condition}",
         f"- Target price: {('$' + parsed.target_price) if parsed.target_price else 'not provided'}",
+        f"- Due date: {parsed.due_date or 'not provided'}",
         "",
     ]
     if context_summary:
@@ -1163,6 +1210,14 @@ def _format_quote_packet(
         "Pricing evidence:",
         f"- {pricing.summary}",
         "",
+    ])
+    if alexandria:
+        lines.extend([
+            "Alexandria/QMD context:",
+            f"- {alexandria.summary}",
+            "",
+        ])
+    lines.extend([
         "Recommended price:",
         f"- {decision.recommended_price}",
         "Confidence:",
@@ -1175,6 +1230,11 @@ def _format_quote_packet(
         "",
         "Approval required before customer send, V11 write, or Atlas write.",
     ])
+    if source_tools or (alexandria and alexandria.sources):
+        lines.extend(["", "Source list:"])
+        lines.extend(f"- {tool}" for tool in source_tools)
+        if alexandria:
+            lines.extend(f"- {ALEXANDRIA_RFQ_TOOL}: {source}" for source in alexandria.sources)
     if tool_errors:
         lines.extend(["", "Lookup issues:"])
         lines.extend(f"- {item}" for item in tool_errors)
@@ -1249,6 +1309,25 @@ def _run_standard_rfq_lookup(
             ),
         )
 
+    alexandria: AlexandriaEvidence | None = None
+    if ALEXANDRIA_RFQ_TOOL in tools:
+        called.append(ALEXANDRIA_RFQ_TOOL)
+        query_parts = [parsed.customer, parsed.part_number, parsed.condition, parsed.qty]
+        if parsed.due_date:
+            query_parts.append(parsed.due_date)
+        try:
+            alexandria = _summarize_alexandria(
+                _load_json_payload(
+                    caller(
+                        ALEXANDRIA_RFQ_TOOL,
+                        {"query": " ".join(part for part in query_parts if part), "num_results": 5},
+                    )
+                )
+            )
+        except Exception as exc:
+            errors.append(f"Alexandria/QMD lookup failed: {exc}")
+            alexandria = AlexandriaEvidence(f"Lookup failed: {exc}", ())
+
     decision = _make_pricing_decision(
         parsed,
         inventory=inventory,
@@ -1267,6 +1346,8 @@ def _run_standard_rfq_lookup(
             tool_errors=errors,
             context_summary=context_summary,
             inferred_fields=inferred_fields,
+            alexandria=alexandria,
+            source_tools=tuple(called),
         ),
         parsed=parsed,
         tool_calls=tuple(called),
@@ -1290,6 +1371,7 @@ def _build_contextual_rfq_response(
         condition=context.condition,
         target_price=context.target_price,
         free_text=context.free_text,
+        due_date=_extract_due_date(context.free_text),
     )
     required_missing = [field for field in context.missing_fields if field in {"customer", "part_category"}]
     if required_missing:
@@ -1367,6 +1449,7 @@ def _build_contextual_rfq_response(
         condition=resolved_condition,
         target_price=context.target_price,
         free_text=context.free_text,
+        due_date=_extract_due_date(context.free_text),
     )
     context_summary = f"Matched prior sale {_sales_match_line(match)}"
     return _run_standard_rfq_lookup(

@@ -3,7 +3,7 @@ import uuid
 from types import SimpleNamespace
 from unittest.mock import MagicMock, patch
 
-from run_agent import AIAgent
+from run_agent import AIAgent, has_explicit_execution_intent
 
 
 def _make_tool_defs(*names: str) -> list:
@@ -90,6 +90,66 @@ def test_tool_call_without_execution_intent_returns_plan(monkeypatch):
     assert result["completed"] is True
     assert "Execution blocked: web_search not run without explicit execution intent." in result["final_response"]
     assert "Execute? (yes/no)" in result["final_response"]
+    assert all(message.get("role") != "tool" for message in result["messages"])
+
+
+def test_learn_from_links_executes_skill_tool(monkeypatch):
+    agent = _agent("skill_view")
+    agent.client.chat.completions.create.side_effect = [
+        _response(
+            tool_calls=[_tool_call("skill_view", {"skill": "browser-harness"})],
+            finish_reason="tool_calls",
+        ),
+        _response(content="Learned from the linked source."),
+    ]
+
+    with patch("run_agent.handle_function_call", return_value='{"ok": true}') as handle_tool:
+        result = agent.run_conversation("Learn from these links")
+
+    assert result["completed"] is True
+    assert result["final_response"] == "Learned from the linked source."
+    handle_tool.assert_called_once()
+    assert handle_tool.call_args.args[:2] == (
+        "skill_view",
+        {"skill": "browser-harness"},
+    )
+    assert any(message.get("role") == "tool" for message in result["messages"])
+
+
+def test_kanban_work_command_executes_terminal_tool(monkeypatch):
+    agent = _agent("terminal")
+    agent.client.chat.completions.create.side_effect = [
+        _response(
+            tool_calls=[_tool_call("terminal", {"command": "kanban_show"})],
+            finish_reason="tool_calls",
+        ),
+        _response(content="Worker handoff complete."),
+    ]
+
+    with patch("run_agent.handle_function_call", return_value='{"ok": true}') as handle_tool:
+        result = agent.run_conversation("work kanban task t_be60fcd7")
+
+    assert result["completed"] is True
+    assert result["final_response"] == "Worker handoff complete."
+    handle_tool.assert_called_once()
+    assert handle_tool.call_args.args[:2] == (
+        "terminal",
+        {"command": "kanban_show"},
+    )
+    assert any(message.get("role") == "tool" for message in result["messages"])
+
+
+def test_planning_prompt_still_overrides_work_word(monkeypatch):
+    assert has_explicit_execution_intent("what can you work on for me right now") is True
+
+    agent = _agent("terminal")
+    agent.client.chat.completions.create.side_effect = AssertionError("planning mode must not call model/tools")
+
+    result = agent.run_conversation("what can you work on for me right now")
+
+    assert result["completed"] is True
+    assert result["planning_mode"] is True
+    assert "Prioritized tasks:" in result["final_response"]
     assert all(message.get("role") != "tool" for message in result["messages"])
 
 

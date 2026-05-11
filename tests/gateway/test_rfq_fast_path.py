@@ -28,6 +28,11 @@ def test_parse_turkish_rfq_prompt():
     assert parsed.sufficient_for_lookup is True
 
 
+def test_quote_comment_without_rfq_payload_does_not_trigger_fast_path():
+    assert parse_rfq_prompt("this is a terrible quote") is None
+    assert build_rfq_fast_path_response("this is a terrible quote") is None
+
+
 def test_rfq_followup_merges_missing_qty():
     merged = merge_rfq_followup_prompt(
         "quote aero accessories 5909891 AR condition",
@@ -118,6 +123,49 @@ async def test_gateway_rfq_followup_uses_pending_prompt(monkeypatch):
     assert runner._pending_rfq_prompts == {}
 
 
+@pytest.mark.asyncio
+async def test_gateway_does_not_treat_quote_card_reply_as_new_rfq():
+    from gateway.run import GatewayRunner
+
+    runner = object.__new__(GatewayRunner)
+    runner._pending_rfq_prompts = {}
+
+    response = await GatewayRunner._run_session_rfq_fast_path(
+        runner,
+        SimpleNamespace(
+            text="this is a terrible quote",
+            reply_to_text=(
+                "New ILS Quote Ready\n\n"
+                "Quote: SO/016873\n"
+                "Parts:\n"
+                "766956G1 SV — $1,101 (HISTORICAL)\n\n"
+                "Approve to generate email draft."
+            ),
+            reply_to_message_id="123",
+        ),
+        session_key="telegram:ac",
+    )
+
+    assert response == ""
+    assert runner._pending_rfq_prompts == {}
+
+
+@pytest.mark.asyncio
+async def test_gateway_field_only_without_pending_rfq_goes_to_main_agent():
+    from gateway.run import GatewayRunner
+
+    runner = object.__new__(GatewayRunner)
+    runner._pending_rfq_prompts = {}
+
+    response = await GatewayRunner._run_session_rfq_fast_path(
+        runner,
+        SimpleNamespace(text="qty 1", reply_to_text="", reply_to_message_id=None),
+        session_key="telegram:ac",
+    )
+
+    assert response == ""
+
+
 def test_rfq_fast_path_allows_read_only_tools_without_explicit_execution_words():
     calls = []
 
@@ -153,6 +201,71 @@ def test_rfq_fast_path_allows_read_only_tools_without_explicit_execution_words()
     assert "RFQ fast path" in result.response
     assert "No actions executed." not in result.response
     assert "say run, execute, check, update, fix, or do this" not in result.response
+    assert not any("send" in name or "write" in name or "atlas" in name.lower() for name, _ in calls)
+
+
+def test_rfq_superoptimizer_extracts_due_date_and_alexandria_sources():
+    calls = []
+
+    def caller(name, args):
+        calls.append((name, args))
+        if name == "mcp_v11_v11_customer_lookup":
+            return json.dumps({"result": json.dumps({"customers": [{"name": "TURKISH TECHNIC, INC."}]})})
+        if name == "mcp_v11_v11_get_inventory":
+            return json.dumps({
+                "result": json.dumps({
+                    "found": True,
+                    "total_qty": 3,
+                    "lines": [{"quantity": 1, "condition": "SV"}],
+                })
+            })
+        if name == "mcp_v11_v11_search_sales":
+            return json.dumps({
+                "result": json.dumps({
+                    "orders": [
+                        {
+                            "order": "SO/016849",
+                            "date": date.today().isoformat(),
+                            "customer": "MEL AVIATION COMPONENTS LTD",
+                            "matching_lines": [{"unit_price": 30000}],
+                        }
+                    ]
+                })
+            })
+        if name == "mcp_alexandria_unified_search":
+            assert "Turkish" in args["query"]
+            assert "767870" in args["query"]
+            return json.dumps({
+                "results": [
+                    {
+                        "title": "Turkish pricing note",
+                        "source": "alexandria/advanced/pricing/turkish.md",
+                        "snippet": "Prior Turkish IDG pricing context.",
+                    }
+                ]
+            })
+        raise AssertionError(name)
+
+    result = build_rfq_fast_path_response(
+        "Turkish pn 767870 qty 1 SV condition due 2026-06-15",
+        available_tools={*READ_ONLY_RFQ_TOOLS.values(), "mcp_alexandria_unified_search"},
+        tool_caller=caller,
+    )
+
+    assert result is not None
+    assert result.parsed.due_date == "2026-06-15"
+    assert result.tool_calls == (
+        "mcp_v11_v11_customer_lookup",
+        "mcp_v11_v11_get_inventory",
+        "mcp_v11_v11_search_sales",
+        "mcp_alexandria_unified_search",
+    )
+    assert "- Due date: 2026-06-15" in result.response
+    assert "Alexandria/QMD context:" in result.response
+    assert "Turkish pricing note" in result.response
+    assert "Source list:" in result.response
+    assert "mcp_alexandria_unified_search" in result.response
+    assert "Approval required before customer send, V11 write, or Atlas write." in result.response
     assert not any("send" in name or "write" in name or "atlas" in name.lower() for name, _ in calls)
 
 

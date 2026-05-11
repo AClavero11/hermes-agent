@@ -64,6 +64,9 @@ web/public/ds-assets/
 .release_notes.md
 mini-swe-agent/
 
+# Runtime deployment metadata written onto Studio checkouts.
+.hermes-runtime-version.json
+
 # Nix
 .direnv/
 .nix-stamps/

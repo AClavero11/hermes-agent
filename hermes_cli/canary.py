@@ -36,6 +36,7 @@ FAIL = "fail"
 SKIP = "skip"
 
 SECRET_PRESENCE_KEYS = {
+    "OPENROUTER_API_KEY": "OPENROUTER_API_KEY_PRESENT",
     "OPENAI_API_KEY": "OPENAI_API_KEY_PRESENT",
     "GEMINI_API_KEY": "GEMINI_API_KEY_PRESENT",
     "GOOGLE_API_KEY": "GOOGLE_API_KEY_PRESENT",
@@ -46,7 +47,7 @@ SECRET_PRESENCE_KEYS = {
 class CanaryOptions:
     repo_root: Path
     hermes_home: Path
-    gateway_url: str = "http://127.0.0.1:8642"
+    gateway_url: str = "http://127.0.0.1:8643"
     env_wrapper: Path | None = None
     api_key: str = ""
     live_behavior: bool = False
@@ -195,7 +196,7 @@ def default_options() -> CanaryOptions:
     return CanaryOptions(
         repo_root=_repo_root(),
         hermes_home=hermes_home,
-        gateway_url=os.getenv("HERMES_CANARY_GATEWAY_URL", "http://127.0.0.1:8642"),
+        gateway_url=os.getenv("HERMES_CANARY_GATEWAY_URL", "http://127.0.0.1:8643"),
         env_wrapper=_default_env_wrapper(hermes_home),
         api_key=os.getenv("HERMES_CANARY_API_KEY", ""),
         frontier_model=os.getenv("OPENAI_FRONTIER_MODEL", os.getenv("HERMES_FRONTIER_MODEL", "gpt-5.5")),
@@ -252,6 +253,7 @@ def _canary_imports() -> CanaryResult:
     modules = [
         "gateway.run",
         "hermes_cli.aeroxchange",
+        "hermes_cli.auto_think",
         "hermes_cli.commands",
         "hermes_cli.goals",
         "hermes_cli.workspace",
@@ -292,6 +294,10 @@ def _probe_env_wrapper(path: Path, timeout: float) -> dict[str, Any]:
         "HERMES_FRONTIER_MODEL",
         "HERMES_FRONTIER_AVAILABLE",
         "HERMES_INFERENCE_PROVIDER",
+        "OPENROUTER_BASE_URL",
+        "HERMES_OPENROUTER_FRONTIER_AVAILABLE",
+        "HERMES_OPENROUTER_FRONTIER_MODEL",
+        "HERMES_OPENROUTER_PLANNER_MODEL",
         "DEEPSEEK_LOCAL_BASE_URL",
         "DEEPSEEK_LOCAL_MODEL",
         "DEEPSEEK_V4_BASE_URL",
@@ -304,6 +310,7 @@ def _probe_env_wrapper(path: Path, timeout: float) -> dict[str, Any]:
         "HERMES_GEMINI_FRONTIER_FALLBACK_MODEL",
         "GEMINI_FRONTIER_MODEL",
         "GEMINI_FRONTIER_FALLBACK_MODEL",
+        "OPENROUTER_API_KEY_PRESENT",
         "OPENAI_API_KEY_PRESENT",
         "GEMINI_API_KEY_PRESENT",
         "GOOGLE_API_KEY_PRESENT",
@@ -370,6 +377,10 @@ def _env_model_snapshot(options: CanaryOptions) -> dict[str, Any]:
         "HERMES_FRONTIER_MODEL",
         "HERMES_FRONTIER_AVAILABLE",
         "HERMES_INFERENCE_PROVIDER",
+        "OPENROUTER_BASE_URL",
+        "HERMES_OPENROUTER_FRONTIER_AVAILABLE",
+        "HERMES_OPENROUTER_FRONTIER_MODEL",
+        "HERMES_OPENROUTER_PLANNER_MODEL",
         "DEEPSEEK_LOCAL_BASE_URL",
         "DEEPSEEK_LOCAL_MODEL",
         "DEEPSEEK_V4_BASE_URL",
@@ -382,6 +393,7 @@ def _env_model_snapshot(options: CanaryOptions) -> dict[str, Any]:
         "HERMES_GEMINI_FRONTIER_FALLBACK_MODEL",
         "GEMINI_FRONTIER_MODEL",
         "GEMINI_FRONTIER_FALLBACK_MODEL",
+        "OPENROUTER_API_KEY_PRESENT",
         "OPENAI_API_KEY_PRESENT",
         "GEMINI_API_KEY_PRESENT",
         "GOOGLE_API_KEY_PRESENT",
@@ -1259,6 +1271,97 @@ def _canary_safety_contract(options: CanaryOptions) -> CanaryResult:
     )
 
 
+def _canary_auto_think_candidate_schema(options: CanaryOptions) -> CanaryResult:
+    from hermes_cli import auto_think
+
+    payload = {
+        "source_type": "x_link",
+        "source_locator": "https://x.com/gkisokay/status/2046171501888516188?s=46",
+        "title": "Auto-think queue for high-EV ideas",
+        "core_idea": [
+            "Capture high-EV ideas from fetched sources.",
+            "Score, dedupe, and route only dry-run operator prototypes.",
+        ],
+        "evidence": [
+            {
+                "locator": "https://x.com/gkisokay/status/2046171501888516188?s=46",
+                "summary": "Auto-think / Auto-build agent workflow source was fetched.",
+                "confidence": "high",
+            }
+        ],
+        "affected_systems": ["kanban", "canary"],
+        "risk_class": "internal_write",
+        "approval_required": True,
+        "ev": {
+            "score": 8,
+            "relevance": 9,
+            "impact": 8,
+            "effort": 5,
+            "cost": 2,
+            "reliability": 7,
+            "privacy": 8,
+            "compounding": 9,
+        },
+        "recommended_route": "operator_prototype",
+        "smallest_safe_prototype": "Write a dry-run JSONL candidate and task handoff only.",
+        "stop_gates": [
+            "customer/vendor sends require AC approval",
+            "quotes require AC approval",
+            "payments require AC approval",
+            "orders require AC approval",
+            "inventory/V11 mutations require AC approval",
+            "public posts require AC approval",
+            "destructive production changes require AC approval",
+            "paid signup require AC approval",
+            "untrusted installs require AC approval",
+        ],
+        "acceptance_criteria": ["pytest tests/hermes_cli/test_auto_think.py -q passes"],
+    }
+    result = auto_think.enqueue_candidate(payload, hermes_home=options.hermes_home)
+    body = result["operator_task_body"]
+    required_body_terms = [
+        "customer/vendor sends",
+        "quotes",
+        "payments",
+        "orders",
+        "inventory/V11 mutations",
+        "public posts",
+        "destructive prod changes",
+        "paid signup",
+        "untrusted installs",
+        "Rollback",
+        "dry-run",
+    ]
+    missing = [term for term in required_body_terms if term not in body]
+    store_path = Path(result["store_path"])
+    if missing or result["written"] or store_path.exists():
+        return _result(
+            "contract.auto_think_candidate_schema",
+            FAIL,
+            0,
+            15,
+            "Auto-think schema, approval gates, or dry-run contract failed",
+            {
+                "missing_body_terms": missing,
+                "written": result["written"],
+                "store_exists": store_path.exists(),
+                "store_path": str(store_path),
+            },
+        )
+    return _result(
+        "contract.auto_think_candidate_schema",
+        PASS,
+        15,
+        15,
+        "Auto-think candidate schema, dedupe, approval gates, and dry-run contract pass",
+        {
+            "candidate_id": result["candidate"]["candidate_id"],
+            "dedupe_key": result["candidate"]["dedupe_key"],
+            "store_path": str(store_path),
+        },
+    )
+
+
 def _canary_live_x_scrape(options: CanaryOptions) -> CanaryResult:
     if not options.x_urls:
         return _result(
@@ -1309,6 +1412,17 @@ def _resolve_service_key_from_wrapper(options: CanaryOptions) -> str:
             f"source {shlex.quote(str(options.env_wrapper))}",
             "if typeset -f aac_configure_hermes_deepseek_env >/dev/null; then",
             "  aac_configure_hermes_deepseek_env",
+            "fi",
+            "if [[ -z \"${HERMES_SERVICE_KEY:-}\" && -f \"$HOME/.hermes/.env\" ]]; then",
+            "  service_key_line=\"$(grep -E '^HERMES_SERVICE_KEY=' \"$HOME/.hermes/.env\" | tail -n 1 || true)\"",
+            "  if [[ -n \"$service_key_line\" ]]; then",
+            "    service_key=\"${service_key_line#HERMES_SERVICE_KEY=}\"",
+            "    service_key=\"${service_key%\\\"}\"",
+            "    service_key=\"${service_key#\\\"}\"",
+            "    service_key=\"${service_key%\\'}\"",
+            "    service_key=\"${service_key#\\'}\"",
+            "    export HERMES_SERVICE_KEY=\"$service_key\"",
+            "  fi",
             "fi",
             "python3 - <<'PY'",
             "import os\nprint(os.environ.get('HERMES_SERVICE_KEY', ''))",
@@ -1933,6 +2047,19 @@ def _resolve_frontier_api_key(options: CanaryOptions) -> tuple[str, str]:
     )
 
 
+def _resolve_openrouter_api_key(options: CanaryOptions) -> tuple[str, str]:
+    if options.frontier_api_key:
+        return options.frontier_api_key, "argument"
+    for env_name in ("OPENROUTER_API_KEY", "HERMES_OPENROUTER_API_KEY"):
+        value = os.getenv(env_name, "").strip()
+        if value:
+            return value, env_name
+    return _resolve_env_wrapper_secret(
+        options,
+        ("OPENROUTER_API_KEY", "HERMES_OPENROUTER_API_KEY"),
+    )
+
+
 def _resolve_env_wrapper_secret(
     options: CanaryOptions,
     keys: tuple[str, ...],
@@ -2128,6 +2255,93 @@ def _run_openai_frontier_probe(options: CanaryOptions) -> dict[str, Any]:
     return attempt
 
 
+def _run_openrouter_frontier_probe(options: CanaryOptions) -> dict[str, Any]:
+    api_key, api_key_source = _resolve_openrouter_api_key(options)
+    model = (
+        options.frontier_model
+        or os.getenv("HERMES_OPENROUTER_FRONTIER_MODEL")
+        or os.getenv("HERMES_FRONTIER_MODEL")
+        or os.getenv("HERMES_OPENROUTER_PLANNER_MODEL")
+        or os.getenv("HERMES_PLANNER_MODEL")
+        or "openai/gpt-5.5"
+    ).strip()
+    base_url = (os.getenv("OPENROUTER_BASE_URL") or "https://openrouter.ai/api/v1").rstrip("/")
+    attempt: dict[str, Any] = {
+        "provider": "openrouter",
+        "api_key_present": bool(api_key),
+        "api_key_source": api_key_source,
+        "model": model,
+        "base_url": base_url,
+    }
+    if not api_key:
+        attempt.update({"ok": False, "summary": "No OpenRouter frontier API key available"})
+        return attempt
+
+    payload = {
+        "model": model,
+        "messages": [
+            {
+                "role": "user",
+                "content": _frontier_probe_prompt(),
+            }
+        ],
+        "temperature": 0,
+        "max_tokens": 300,
+        "stream": False,
+    }
+    started = time.perf_counter()
+    try:
+        status, data, raw = _http_post_json(
+            f"{base_url}/chat/completions",
+            payload,
+            timeout=max(options.timeout, 30.0),
+            api_key=api_key,
+        )
+    except urllib.error.HTTPError as exc:
+        details = _http_error_details(exc)
+        attempt.update(
+            {
+                "ok": False,
+                "summary": f"OpenRouter frontier probe failed: HTTP {details['status']}",
+                **details,
+            }
+        )
+        return attempt
+    except Exception as exc:
+        attempt.update(
+            {
+                "ok": False,
+                "summary": f"OpenRouter frontier probe failed: {type(exc).__name__}",
+                "error_type": type(exc).__name__,
+                "error": str(exc),
+            }
+        )
+        return attempt
+
+    elapsed_ms = round((time.perf_counter() - started) * 1000.0, 1)
+    text = _extract_chat_completion_text(data)
+    parsed = _parse_frontier_probe_text(text)
+    ok = _frontier_probe_passed(parsed, status=status)
+    usage = data.get("usage") if isinstance(data, dict) else {}
+    attempt.update(
+        {
+            "ok": ok,
+            "summary": (
+                f"{model} OpenRouter wrapper passed structured reasoning probe in {elapsed_ms:.0f}ms"
+                if ok
+                else "OpenRouter frontier wrapper returned an invalid structured probe result"
+            ),
+            "status": status,
+            "latency_ms": elapsed_ms,
+            "parsed": parsed,
+            "usage": usage if isinstance(usage, dict) else {},
+            "text_preview": text[:500],
+            "raw_preview": raw[:500],
+        }
+    )
+    return attempt
+
+
 def _extract_gemini_text(data: dict[str, Any] | None) -> str:
     if not isinstance(data, dict):
         return ""
@@ -2306,8 +2520,12 @@ def _canary_frontier_wrapper(options: CanaryOptions) -> CanaryResult:
         )
     provider = os.getenv("HERMES_FRONTIER_PROVIDER", "auto").strip().lower() or "auto"
     attempts: list[dict[str, Any]] = []
-    if provider not in {"gemini", "google"}:
+    if provider == "openrouter":
+        attempts.append(_run_openrouter_frontier_probe(options))
+    elif provider not in {"gemini", "google"}:
         attempts.append(_run_openai_frontier_probe(options))
+    if provider == "auto" and not any(attempt.get("ok") for attempt in attempts):
+        attempts.append(_run_openrouter_frontier_probe(options))
     if provider in {"auto", "gemini", "google"} and not any(attempt.get("ok") for attempt in attempts):
         attempts.append(_run_gemini_frontier_probe(options))
 
@@ -5274,14 +5492,20 @@ def _canary_planner_self_heal(options: CanaryOptions) -> CanaryResult:
     snapshot = _env_model_snapshot(options)
     provider = snapshot.get("HERMES_PLANNER_PROVIDER") or snapshot.get("HERMES_INFERENCE_PROVIDER") or ""
     v4_available = snapshot.get("HERMES_V4_PLANNER_AVAILABLE") == "1"
-    frontier_available = snapshot.get("HERMES_OPENAI_FRONTIER_AVAILABLE") == "1"
-    if provider and (v4_available or frontier_available or "openai-frontier" in provider):
+    frontier_available = (
+        snapshot.get("HERMES_OPENAI_FRONTIER_AVAILABLE") == "1"
+        or snapshot.get("HERMES_OPENROUTER_FRONTIER_AVAILABLE") == "1"
+        or snapshot.get("HERMES_FRONTIER_AVAILABLE") == "1"
+    )
+    if provider and (v4_available or frontier_available or "openai-frontier" in provider or provider == "openrouter"):
         passed.append("planner_runtime_route")
     else:
         failed["planner_runtime_route"] = {
             "provider": provider,
             "HERMES_V4_PLANNER_AVAILABLE": snapshot.get("HERMES_V4_PLANNER_AVAILABLE", ""),
             "HERMES_OPENAI_FRONTIER_AVAILABLE": snapshot.get("HERMES_OPENAI_FRONTIER_AVAILABLE", ""),
+            "HERMES_OPENROUTER_FRONTIER_AVAILABLE": snapshot.get("HERMES_OPENROUTER_FRONTIER_AVAILABLE", ""),
+            "HERMES_FRONTIER_AVAILABLE": snapshot.get("HERMES_FRONTIER_AVAILABLE", ""),
         }
 
     try:
@@ -5294,7 +5518,7 @@ def _canary_planner_self_heal(options: CanaryOptions) -> CanaryResult:
         "custom:office-deepseek-v4",
         "model_aliases:",
         "frontier:",
-        "custom:openai-frontier",
+        "provider: openrouter",
     ]
     missing_config = [needle for needle in config_needles if needle not in config_text]
     if missing_config:
@@ -5371,6 +5595,7 @@ def run_canary_suite(options: CanaryOptions) -> CanaryReport:
             lambda: _canary_telegram_operator_response(options),
         ),
         ("live.telegram_visible_delivery", 20, lambda: _canary_telegram_visible_delivery(options)),
+        ("contract.auto_think_candidate_schema", 15, lambda: _canary_auto_think_candidate_schema(options)),
         ("live.x_scrape", 10, lambda: _canary_live_x_scrape(options)),
         ("contract.scorecard_trend", 10, lambda: _canary_scorecard_trend(options)),
         ("contract.aac_workflows", 15, lambda: _canary_aac_workflow_goldens(options)),
@@ -6224,7 +6449,7 @@ def build_arg_parser() -> argparse.ArgumentParser:
     )
     parser.add_argument(
         "--gateway-url",
-        default=os.getenv("HERMES_CANARY_GATEWAY_URL", "http://127.0.0.1:8642"),
+        default=os.getenv("HERMES_CANARY_GATEWAY_URL", "http://127.0.0.1:8643"),
     )
     parser.add_argument(
         "--env-wrapper",

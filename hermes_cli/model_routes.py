@@ -70,6 +70,18 @@ def _route(
 
 
 def _frontier_model(env: Mapping[str, Any], provider: str) -> str:
+    if provider == "openrouter":
+        return _first_value(
+            env,
+            (
+                "HERMES_OPENROUTER_FRONTIER_MODEL",
+                "HERMES_FRONTIER_MODEL",
+                "OPENROUTER_FRONTIER_MODEL",
+                "HERMES_OPENROUTER_PLANNER_MODEL",
+                "HERMES_PLANNER_MODEL",
+            ),
+            "openai/gpt-5.5",
+        )
     if provider == "gemini":
         if not (_flag(env, "HERMES_FRONTIER_AVAILABLE") or _flag(env, "HERMES_GEMINI_FRONTIER_AVAILABLE")):
             return _first_value(
@@ -92,6 +104,11 @@ def _frontier_model(env: Mapping[str, Any], provider: str) -> str:
 def _frontier_route(env: Mapping[str, Any]) -> tuple[str, str, str, bool]:
     generic_frontier = _flag(env, "HERMES_FRONTIER_AVAILABLE")
     openai_frontier = generic_frontier or _flag(env, "HERMES_OPENAI_FRONTIER_AVAILABLE")
+    openrouter_frontier = (
+        _flag(env, "HERMES_OPENROUTER_FRONTIER_AVAILABLE")
+        or _key_present(env, "OPENROUTER_API_KEY")
+        or (generic_frontier and _value(env, "HERMES_FRONTIER_PROVIDER").lower() == "openrouter")
+    )
     gemini_frontier = (
         generic_frontier
         or _flag(env, "HERMES_GEMINI_FRONTIER_AVAILABLE")
@@ -100,10 +117,14 @@ def _frontier_route(env: Mapping[str, Any]) -> tuple[str, str, str, bool]:
     )
     requested_provider = _value(env, "HERMES_FRONTIER_PROVIDER").lower()
 
+    if requested_provider == "openrouter" and openrouter_frontier:
+        return "openrouter", _frontier_model(env, "openrouter"), "openrouter", True
     if requested_provider in {"gemini", "google"} and gemini_frontier:
         return "gemini", _frontier_model(env, "gemini"), "gemini", True
     if requested_provider in {"openai", "custom:openai-frontier"} and openai_frontier:
         return "custom:openai-frontier", _frontier_model(env, "openai"), "openai", True
+    if openrouter_frontier and not requested_provider:
+        return "openrouter", _frontier_model(env, "openrouter"), "openrouter", True
     if openai_frontier:
         return "custom:openai-frontier", _frontier_model(env, "openai"), "openai", True
     if gemini_frontier:
@@ -141,6 +162,7 @@ def resolve_model_routes(env: Mapping[str, Any] | None = None) -> dict[str, Any]
     frontier_provider, frontier_model, frontier_source, frontier_available = _frontier_route(env)
     frontier_verified = bool(
         _flag(env, "HERMES_FRONTIER_AVAILABLE")
+        or _flag(env, "HERMES_OPENROUTER_FRONTIER_AVAILABLE")
         or _flag(env, "HERMES_OPENAI_FRONTIER_AVAILABLE")
         or _flag(env, "HERMES_GEMINI_FRONTIER_AVAILABLE")
     )

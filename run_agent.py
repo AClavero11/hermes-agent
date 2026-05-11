@@ -293,8 +293,16 @@ _PLANNING_MODE_NORMALIZED = {
 }
 
 _EXECUTION_INTENT_RE = re.compile(
-    r"\b(?:run|execute|check|update|fix)\b|\bdo\s+this\b",
+    r"\b(?:run|execute|check|update|fix|work|learn|read|fetch|digest|summarize|"
+    r"research|investigate|analyze|build|create|implement|handle|monitor)\b|"
+    r"\bdo\s+this\b|\bfollow\s+up\b",
     re.IGNORECASE,
+)
+
+_EXECUTION_INTENT_EXAMPLES = (
+    "run, execute, check, update, fix, work, learn, read, fetch, digest, "
+    "summarize, research, investigate, analyze, build, create, implement, "
+    "handle, monitor, follow up, or do this"
 )
 
 
@@ -341,7 +349,7 @@ def build_planning_mode_response(text: str, attempted_tools: list[str] | None = 
         "3. Define the evidence needed before any write, send, or workflow step.\n"
         f"{attempted_line}\n\n"
         "No actions executed.\n"
-        "Next available action: choose one task and say run, execute, check, update, fix, or do this.\n"
+        f"Next available action: choose one task and say {_EXECUTION_INTENT_EXAMPLES}.\n"
         "Execute? (yes/no)"
     )
 

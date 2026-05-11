@@ -38,6 +38,10 @@ ENV_SNAPSHOT_KEYS = [
     "HERMES_FRONTIER_MODEL",
     "HERMES_FRONTIER_AVAILABLE",
     "HERMES_INFERENCE_PROVIDER",
+    "OPENROUTER_BASE_URL",
+    "HERMES_OPENROUTER_FRONTIER_AVAILABLE",
+    "HERMES_OPENROUTER_FRONTIER_MODEL",
+    "HERMES_OPENROUTER_PLANNER_MODEL",
     "DEEPSEEK_LOCAL_BASE_URL",
     "DEEPSEEK_LOCAL_MODEL",
     "DEEPSEEK_V4_BASE_URL",
@@ -52,12 +56,14 @@ ENV_SNAPSHOT_KEYS = [
     "GEMINI_FRONTIER_MODEL",
     "GEMINI_FRONTIER_FALLBACK_MODEL",
     "OPENAI_API_KEY_PRESENT",
+    "OPENROUTER_API_KEY_PRESENT",
     "GEMINI_API_KEY_PRESENT",
     "GOOGLE_API_KEY_PRESENT",
     "HERMES_SERVICE_KEY_PRESENT",
 ]
 
 SECRET_PRESENCE_KEYS = {
+    "OPENROUTER_API_KEY": "OPENROUTER_API_KEY_PRESENT",
     "OPENAI_API_KEY": "OPENAI_API_KEY_PRESENT",
     "GEMINI_API_KEY": "GEMINI_API_KEY_PRESENT",
     "GOOGLE_API_KEY": "GOOGLE_API_KEY_PRESENT",
@@ -416,7 +422,7 @@ def _normalize_health_url(health_url: str | None) -> str:
         health_url
         or os.getenv("HERMES_RUNTIME_HEALTH_URL")
         or os.getenv("HERMES_CANARY_GATEWAY_URL")
-        or "http://127.0.0.1:8642"
+        or "http://127.0.0.1:8643"
     ).strip()
     if not value:
         return ""
@@ -617,7 +623,6 @@ def collect_runtime_status(
     )
     model_routes = resolve_model_routes(env)
     normalized_health_url = _normalize_health_url(health_url)
-    service_key_present = str(env.get("HERMES_SERVICE_KEY_PRESENT") or "").lower() in {"1", "true", "yes", "on"}
     runtime_repo = Path(str(selected_repo)).expanduser() if selected_repo else repo_root
     label = (
         launchd_label
@@ -625,7 +630,6 @@ def collect_runtime_status(
         or "ai.hermes.deepseek-gateway"
     )
     launchd = _launchd_snapshot(label, timeout=timeout)
-    launchd_env = launchd.get("environment", {}) if isinstance(launchd, dict) else {}
     return {
         "collected_at": time.time(),
         "host": platform.node(),
@@ -658,27 +662,7 @@ def collect_runtime_status(
             "synthesizer_model": str(env.get("HERMES_SYNTHESIZER_MODEL", "")),
             "routing": model_routes,
         },
-        "health": (
-            _health_probe(normalized_health_url, timeout=timeout)
-            if (
-                service_key_present
-                or bool(os.getenv("HERMES_SERVICE_KEY", "").strip())
-                or _env_file_has_secret(
-                    str(
-                        env.get("HERMES_PLANNER_ENV_FILE")
-                        or os.getenv("HERMES_PLANNER_ENV_FILE", "")
-                        or launchd_env.get("HERMES_PLANNER_ENV_FILE", "")
-                    ),
-                    "HERMES_SERVICE_KEY",
-                )
-            )
-            else {
-                "ok": False,
-                "skipped": True,
-                "url": normalized_health_url,
-                "error": "HERMES_SERVICE_KEY missing; HTTP API server is skipped",
-            }
-        ),
+        "health": _health_probe(normalized_health_url, timeout=timeout),
         "git": {
             "repo_root": _git_info(repo_root, timeout=timeout),
             "runtime_repo": _git_info(runtime_repo, timeout=timeout),
