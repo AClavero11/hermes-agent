@@ -259,6 +259,7 @@ def _canary_imports() -> CanaryResult:
         "hermes_cli.workspace",
         "hermes_cli.workflows",
         "tools.x_scraper_tool",
+        "tools.codex_worker_tool",
         "tools.workspace_tool",
         "tools.workflow_tool",
     ]
@@ -507,6 +508,74 @@ def _canary_model_routes(options: CanaryOptions) -> CanaryResult:
         20,
         20,
         route_summary(policy),
+        details,
+    )
+
+
+def _canary_codex_worker_contract(options: CanaryOptions) -> CanaryResult:
+    from tools import codex_worker_tool
+    from tools.registry import registry
+    from toolsets import resolve_toolset
+
+    entry = registry.get_entry("codex_worker")
+    code_execution_tools = set(resolve_toolset("code_execution"))
+    unsafe_error = codex_worker_tool.validate_codex_worker_task(
+        "send this quote to the customer by email"
+    )
+    noncoding_error = codex_worker_tool.validate_codex_worker_task(
+        "what is the weather tomorrow"
+    )
+    coding_error = codex_worker_tool.validate_codex_worker_task(
+        "fix failing pytest coverage in the repository"
+    )
+    status = codex_worker_tool.codex_worker_status(
+        force=True,
+        timeout=min(max(float(options.timeout), 1.0), 10.0),
+    )
+    details = {
+        "registered": entry is not None,
+        "toolset": entry.toolset if entry else "",
+        "in_code_execution_toolset": "codex_worker" in code_execution_tools,
+        "unsafe_task_rejected": bool(unsafe_error),
+        "noncoding_task_rejected": bool(noncoding_error),
+        "coding_task_allowed": coding_error is None,
+        "status": status,
+    }
+    hard_failures = [
+        name
+        for name, ok in (
+            ("registered", details["registered"]),
+            ("code_execution_toolset", details["in_code_execution_toolset"]),
+            ("unsafe_task_rejected", details["unsafe_task_rejected"]),
+            ("noncoding_task_rejected", details["noncoding_task_rejected"]),
+            ("coding_task_allowed", details["coding_task_allowed"]),
+        )
+        if not ok
+    ]
+    if hard_failures:
+        return _result(
+            "contract.codex_worker",
+            FAIL,
+            0,
+            10,
+            f"Codex worker contract failed: {', '.join(hard_failures)}",
+            details,
+        )
+    if not status.get("available"):
+        return _result(
+            "contract.codex_worker",
+            WARN,
+            6,
+            10,
+            status.get("summary") or "Codex worker unavailable",
+            details,
+        )
+    return _result(
+        "contract.codex_worker",
+        PASS,
+        10,
+        10,
+        "Codex worker registered, safety-gated, and logged in using ChatGPT",
         details,
     )
 
@@ -5593,6 +5662,7 @@ def run_canary_suite(options: CanaryOptions) -> CanaryReport:
         ("runtime.imports", 10, _canary_imports),
         ("runtime.model_route", 15, lambda: _canary_model_route(options)),
         ("runtime.model_routes", 20, lambda: _canary_model_routes(options)),
+        ("contract.codex_worker", 10, lambda: _canary_codex_worker_contract(options)),
         ("live.gateway_health", 15, lambda: _canary_gateway_health(options)),
         ("contract.command_registry", 10, _canary_command_registry),
         ("contract.x_scrape", 10, _canary_x_scrape_contract),

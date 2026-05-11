@@ -53,7 +53,7 @@ _HERMES_CORE_TOOLS = [
     # Clarifying questions
     "clarify",
     # Code execution + delegation
-    "execute_code", "delegate_task",
+    "execute_code", "codex_worker", "delegate_task",
     # Cronjob management
     "cronjob",
     # Cross-platform messaging (gated on gateway running via check_fn)
@@ -197,8 +197,8 @@ TOOLSETS = {
     },
     
     "code_execution": {
-        "description": "Run Python scripts that call tools programmatically (reduces LLM round trips)",
-        "tools": ["execute_code"],
+        "description": "Run Python scripts and subscription-backed Codex coding workers",
+        "tools": ["execute_code", "codex_worker"],
         "includes": []
     },
     
@@ -282,7 +282,7 @@ TOOLSETS = {
             "browser_vision", "browser_console", "browser_cdp",
             "todo", "workflow", "workspace", "memory",
             "session_search",
-            "execute_code", "delegate_task",
+            "execute_code", "codex_worker", "delegate_task",
         ],
         "includes": []
     },
@@ -310,7 +310,7 @@ TOOLSETS = {
             # Session history search
             "session_search",
             # Code execution + delegation
-            "execute_code", "delegate_task",
+            "execute_code", "codex_worker", "delegate_task",
             # Cronjob management
             "cronjob",
             # Home Assistant smart home control (gated on HASS_TOKEN via check_fn)

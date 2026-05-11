@@ -37,6 +37,7 @@ def test_canary_suite_runs_without_live_gateway(tmp_path):
 
     assert "runtime.imports" in names
     assert "runtime.model_routes" in names
+    assert "contract.codex_worker" in names
     assert "contract.workspace_store" in names
     assert "contract.workflow_registry" in names
     assert "contract.goal_workspace" in names
@@ -317,6 +318,58 @@ def test_model_routes_canary_warns_without_frontier(monkeypatch, tmp_path):
 
     assert result.status == WARN
     assert "no frontier planner route" in result.summary
+
+
+def test_codex_worker_canary_passes_with_chatgpt_login(monkeypatch, tmp_path):
+    from tools import codex_worker_tool
+
+    monkeypatch.setattr(
+        codex_worker_tool,
+        "codex_worker_status",
+        lambda **kwargs: {
+            "available": True,
+            "auth_mode": "chatgpt",
+            "binary": "/usr/bin/codex",
+            "summary": "Codex CLI is logged in using ChatGPT",
+        },
+    )
+    options = CanaryOptions(
+        repo_root=Path(__file__).resolve().parents[2],
+        hermes_home=tmp_path,
+        env_wrapper=None,
+        timeout=0.2,
+    )
+
+    result = canary_module._canary_codex_worker_contract(options)
+
+    assert result.status == PASS
+    assert result.details["in_code_execution_toolset"] is True
+
+
+def test_codex_worker_canary_warns_when_cli_not_chatgpt(monkeypatch, tmp_path):
+    from tools import codex_worker_tool
+
+    monkeypatch.setattr(
+        codex_worker_tool,
+        "codex_worker_status",
+        lambda **kwargs: {
+            "available": False,
+            "auth_mode": "api_key",
+            "binary": "/usr/bin/codex",
+            "summary": "Codex CLI is using an API key",
+        },
+    )
+    options = CanaryOptions(
+        repo_root=Path(__file__).resolve().parents[2],
+        hermes_home=tmp_path,
+        env_wrapper=None,
+        timeout=0.2,
+    )
+
+    result = canary_module._canary_codex_worker_contract(options)
+
+    assert result.status == WARN
+    assert result.details["status"]["auth_mode"] == "api_key"
 
 
 def test_live_behavior_allows_loopback_without_api_key(monkeypatch, tmp_path):
