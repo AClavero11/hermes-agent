@@ -7190,8 +7190,8 @@ For more help on a command:
     )
     canary_parser.add_argument(
         "--frontier-model",
-        default=os.getenv("OPENAI_FRONTIER_MODEL", os.getenv("HERMES_FRONTIER_MODEL", "gpt-5.5")),
-        help="OpenAI frontier model for --frontier-eval",
+        default="",
+        help="Frontier model override for --frontier-eval; defaults come from provider env/wrapper",
     )
     canary_parser.add_argument(
         "--frontier-base-url",
@@ -7200,8 +7200,8 @@ For more help on a command:
     )
     canary_parser.add_argument(
         "--frontier-api-key",
-        default=os.getenv("HERMES_FRONTIER_API_KEY", os.getenv("OPENAI_API_KEY", "")),
-        help="OpenAI-compatible API key for --frontier-eval; Gemini uses GEMINI_API_KEY/GOOGLE_API_KEY",
+        default="",
+        help="Frontier API key override for --frontier-eval; defaults come from provider env/wrapper",
     )
     canary_parser.add_argument(
         "--telegram-webhook-sim",

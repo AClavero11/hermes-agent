@@ -209,6 +209,69 @@ def test_options_from_args_release_profile_requires_live(tmp_path):
     assert options.require_live is True
 
 
+def test_frontier_cli_defaults_do_not_capture_openai_env(monkeypatch):
+    monkeypatch.setenv("OPENAI_API_KEY", "sk-openai-test")
+    monkeypatch.setenv("HERMES_FRONTIER_MODEL", "anthropic/claude-sonnet-4.6")
+
+    parser = canary_module.build_arg_parser()
+    args = parser.parse_args([])
+    options = canary_module.options_from_args(args)
+
+    assert options.frontier_api_key == ""
+    assert options.frontier_model == ""
+
+
+def test_openrouter_frontier_probe_reads_wrapper_key_and_model(monkeypatch, tmp_path):
+    wrapper = tmp_path / "hermes-env.sh"
+    wrapper.write_text(
+        "export OPENROUTER_API_KEY=or-test-key\n"
+        "export HERMES_OPENROUTER_PLANNER_MODEL=openai/gpt-5.5\n",
+        encoding="utf-8",
+    )
+    captured = {}
+
+    def fake_http_post_json(url, payload, *, timeout, api_key=""):
+        captured["url"] = url
+        captured["payload"] = payload
+        captured["api_key"] = api_key
+        return (
+            200,
+            {
+                "choices": [
+                    {
+                        "message": {
+                            "content": json.dumps(
+                                {"ok": True, "answer": 59, "contract": "schema"}
+                            )
+                        }
+                    }
+                ]
+            },
+            "",
+        )
+
+    monkeypatch.delenv("OPENROUTER_API_KEY", raising=False)
+    monkeypatch.delenv("HERMES_OPENROUTER_API_KEY", raising=False)
+    monkeypatch.delenv("HERMES_OPENROUTER_PLANNER_MODEL", raising=False)
+    monkeypatch.setattr(canary_module, "_http_post_json", fake_http_post_json)
+    options = CanaryOptions(
+        repo_root=Path(__file__).resolve().parents[2],
+        hermes_home=tmp_path,
+        env_wrapper=wrapper,
+        frontier_eval=True,
+        timeout=0.2,
+    )
+
+    result = canary_module._run_openrouter_frontier_probe(options)
+
+    assert result["ok"] is True
+    assert result["api_key_source"] == "env_wrapper:OPENROUTER_API_KEY"
+    assert result["model"] == "openai/gpt-5.5"
+    assert captured["api_key"] == "or-test-key"
+    assert captured["payload"]["model"] == "openai/gpt-5.5"
+    assert captured["url"] == "https://openrouter.ai/api/v1/chat/completions"
+
+
 def test_current_repo_sha_reads_deploy_runtime_version(tmp_path):
     (tmp_path / ".hermes-runtime-version.json").write_text(
         json.dumps({"sha": "runtime-sha-123"}) + "\n",
@@ -1011,6 +1074,11 @@ def test_frontier_wrapper_falls_back_to_gemini(monkeypatch, tmp_path):
     )
     monkeypatch.setattr(
         canary_module,
+        "_run_openrouter_frontier_probe",
+        lambda _options: {"provider": "openrouter", "ok": False, "summary": "OpenRouter unavailable"},
+    )
+    monkeypatch.setattr(
+        canary_module,
         "_run_gemini_frontier_probe",
         lambda _options: {
             "provider": "gemini",
@@ -1027,7 +1095,7 @@ def test_frontier_wrapper_falls_back_to_gemini(monkeypatch, tmp_path):
 
     assert result.status == PASS
     assert result.details["provider"] == "gemini"
-    assert [attempt["provider"] for attempt in result.details["attempts"]] == ["openai", "gemini"]
+    assert [attempt["provider"] for attempt in result.details["attempts"]] == ["openai", "openrouter", "gemini"]
 
 
 def test_gemini_frontier_probe_retries_after_timeout(monkeypatch, tmp_path):

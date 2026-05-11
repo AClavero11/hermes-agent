@@ -2060,6 +2060,30 @@ def _resolve_openrouter_api_key(options: CanaryOptions) -> tuple[str, str]:
     )
 
 
+def _resolve_openrouter_model(options: CanaryOptions) -> str:
+    if options.frontier_model:
+        return options.frontier_model.strip()
+    for env_name in (
+        "HERMES_OPENROUTER_FRONTIER_MODEL",
+        "HERMES_FRONTIER_MODEL",
+        "HERMES_OPENROUTER_PLANNER_MODEL",
+        "HERMES_PLANNER_MODEL",
+    ):
+        value = os.getenv(env_name, "").strip()
+        if value:
+            return value
+    value, _source = _resolve_env_wrapper_secret(
+        options,
+        (
+            "HERMES_OPENROUTER_FRONTIER_MODEL",
+            "HERMES_FRONTIER_MODEL",
+            "HERMES_OPENROUTER_PLANNER_MODEL",
+            "HERMES_PLANNER_MODEL",
+        ),
+    )
+    return value or "openai/gpt-5.5"
+
+
 def _resolve_env_wrapper_secret(
     options: CanaryOptions,
     keys: tuple[str, ...],
@@ -2257,14 +2281,7 @@ def _run_openai_frontier_probe(options: CanaryOptions) -> dict[str, Any]:
 
 def _run_openrouter_frontier_probe(options: CanaryOptions) -> dict[str, Any]:
     api_key, api_key_source = _resolve_openrouter_api_key(options)
-    model = (
-        options.frontier_model
-        or os.getenv("HERMES_OPENROUTER_FRONTIER_MODEL")
-        or os.getenv("HERMES_FRONTIER_MODEL")
-        or os.getenv("HERMES_OPENROUTER_PLANNER_MODEL")
-        or os.getenv("HERMES_PLANNER_MODEL")
-        or "openai/gpt-5.5"
-    ).strip()
+    model = _resolve_openrouter_model(options)
     base_url = (os.getenv("OPENROUTER_BASE_URL") or "https://openrouter.ai/api/v1").rstrip("/")
     attempt: dict[str, Any] = {
         "provider": "openrouter",
@@ -6497,8 +6514,8 @@ def build_arg_parser() -> argparse.ArgumentParser:
     )
     parser.add_argument(
         "--frontier-model",
-        default=os.getenv("OPENAI_FRONTIER_MODEL", os.getenv("HERMES_FRONTIER_MODEL", "gpt-5.5")),
-        help="OpenAI-compatible frontier model for --frontier-eval",
+        default="",
+        help="Frontier model override for --frontier-eval; defaults come from provider env/wrapper",
     )
     parser.add_argument(
         "--frontier-base-url",
@@ -6507,8 +6524,8 @@ def build_arg_parser() -> argparse.ArgumentParser:
     )
     parser.add_argument(
         "--frontier-api-key",
-        default=os.getenv("HERMES_FRONTIER_API_KEY", os.getenv("OPENAI_API_KEY", "")),
-        help="OpenAI-compatible API key for --frontier-eval; Gemini uses GEMINI_API_KEY/GOOGLE_API_KEY",
+        default="",
+        help="Frontier API key override for --frontier-eval; defaults come from provider env/wrapper",
     )
     parser.add_argument(
         "--telegram-webhook-sim",
