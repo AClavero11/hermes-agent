@@ -362,6 +362,26 @@ async def _gateway_operator_capability_reply_text(content: Any) -> str:
         return ""
 
 
+async def _gateway_codex_worker_reply_text(content: Any) -> str:
+    """Return Codex CLI worker text for eligible code/repo work before the agent loop."""
+    text = _normalize_chat_content(content).strip()
+    if not text:
+        return ""
+    try:
+        from gateway import run as gateway_run
+
+        is_candidate = getattr(gateway_run, "_is_codex_worker_candidate_prompt", None)
+        run_direct = getattr(gateway_run, "_run_codex_worker_direct_path", None)
+        if not callable(is_candidate) or not callable(run_direct):
+            return ""
+        if not bool(is_candidate(text)):
+            return ""
+        return str(await run_direct(text) or "").strip()
+    except Exception as exc:
+        logger.debug("Gateway Codex worker probe failed: %s", exc)
+        return ""
+
+
 def _deterministic_no_tool_reply_text(content: Any) -> str:
     """Answer narrow exact-output tasks without paying the agent/tool tax."""
     text = _normalize_chat_content(content).strip()
@@ -1158,6 +1178,35 @@ class APIServerAdapter(BasePlatformAdapter):
                         "message": {
                             "role": "assistant",
                             "content": direct_reply,
+                        },
+                        "finish_reason": "stop",
+                    }
+                ],
+                "usage": {
+                    "prompt_tokens": 0,
+                    "completion_tokens": 0,
+                    "total_tokens": 0,
+                },
+            }
+            return web.json_response(response_data, headers={"X-Hermes-Session-Id": session_id})
+
+        codex_worker_reply = (
+            await _gateway_codex_worker_reply_text(user_message)
+            if operator_shortcuts_allowed
+            else ""
+        )
+        if codex_worker_reply:
+            response_data = {
+                "id": completion_id,
+                "object": "chat.completion",
+                "created": created,
+                "model": model_name,
+                "choices": [
+                    {
+                        "index": 0,
+                        "message": {
+                            "role": "assistant",
+                            "content": codex_worker_reply,
                         },
                         "finish_reason": "stop",
                     }
@@ -2126,6 +2175,49 @@ class APIServerAdapter(BasePlatformAdapter):
                 full_history = list(conversation_history)
                 full_history.append({"role": "user", "content": user_message})
                 full_history.append({"role": "assistant", "content": direct_reply})
+                self._response_store.put(response_id, {
+                    "response": response_data,
+                    "conversation_history": full_history,
+                    "instructions": instructions,
+                    "session_id": session_id,
+                })
+                if conversation:
+                    self._response_store.set_conversation(conversation, response_id)
+            return web.json_response(response_data)
+
+        codex_worker_reply = (
+            await _gateway_codex_worker_reply_text(user_message)
+            if operator_shortcuts_allowed
+            else ""
+        )
+        if codex_worker_reply:
+            response_id = f"resp_{uuid.uuid4().hex[:28]}"
+            created_at = int(time.time())
+            response_data = {
+                "id": response_id,
+                "object": "response",
+                "status": "completed",
+                "created_at": created_at,
+                "model": body.get("model", self._model_name),
+                "output": [
+                    {
+                        "type": "message",
+                        "role": "assistant",
+                        "content": [
+                            {"type": "output_text", "text": codex_worker_reply}
+                        ],
+                    }
+                ],
+                "usage": {
+                    "input_tokens": 0,
+                    "output_tokens": 0,
+                    "total_tokens": 0,
+                },
+            }
+            if store:
+                full_history = list(conversation_history)
+                full_history.append({"role": "user", "content": user_message})
+                full_history.append({"role": "assistant", "content": codex_worker_reply})
                 self._response_store.put(response_id, {
                     "response": response_data,
                     "conversation_history": full_history,

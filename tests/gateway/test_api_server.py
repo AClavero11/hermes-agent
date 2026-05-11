@@ -582,6 +582,35 @@ class TestChatCompletionsEndpoint:
         mock_run.assert_not_called()
 
     @pytest.mark.asyncio
+    async def test_codex_worker_prompt_bypasses_chat_agent(self, adapter):
+        app = _create_app(adapter)
+        async with TestClient(TestServer(app)) as cli:
+            with patch("gateway.platforms.api_server._gateway_direct_reply_text", return_value=""):
+                with patch(
+                    "gateway.platforms.api_server._gateway_codex_worker_reply_text",
+                    new_callable=AsyncMock,
+                ) as codex_reply:
+                    codex_reply.return_value = "Codex worker completed (zero Hermes planner/API call)."
+                    with patch.object(adapter, "_run_agent", new_callable=AsyncMock) as mock_run:
+                        resp = await cli.post(
+                            "/v1/chat/completions",
+                            json={
+                                "model": "hermes-agent",
+                                "messages": [
+                                    {"role": "user", "content": "repair the Hermes repo and run focused tests"}
+                                ],
+                                "stream": False,
+                            },
+                        )
+                        data = await resp.json()
+
+        assert resp.status == 200
+        assert data["choices"][0]["message"]["content"].startswith("Codex worker completed")
+        assert data["usage"]["total_tokens"] == 0
+        codex_reply.assert_awaited_once()
+        mock_run.assert_not_called()
+
+    @pytest.mark.asyncio
     async def test_rfq_prompt_bypasses_agent_and_runs_read_only_tools(self, adapter):
         tool_calls = []
 
@@ -1225,6 +1254,33 @@ class TestResponsesEndpoint:
                     data = await resp.json()
 
         assert data["output"][0]["content"][0]["text"] == direct_text
+        mock_run.assert_not_called()
+
+    @pytest.mark.asyncio
+    async def test_responses_codex_worker_bypasses_agent(self, adapter):
+        app = _create_app(adapter)
+        async with TestClient(TestServer(app)) as cli:
+            with patch("gateway.platforms.api_server._gateway_direct_reply_text", return_value=""):
+                with patch(
+                    "gateway.platforms.api_server._gateway_codex_worker_reply_text",
+                    new_callable=AsyncMock,
+                ) as codex_reply:
+                    codex_reply.return_value = "Codex worker completed (zero Hermes planner/API call)."
+                    with patch.object(adapter, "_run_agent", new_callable=AsyncMock) as mock_run:
+                        resp = await cli.post(
+                            "/v1/responses",
+                            json={
+                                "model": "hermes-agent",
+                                "input": "repair the Hermes repo and run focused tests",
+                                "store": False,
+                            },
+                        )
+                        data = await resp.json()
+
+        assert resp.status == 200
+        assert data["output"][0]["content"][0]["text"].startswith("Codex worker completed")
+        assert data["usage"]["total_tokens"] == 0
+        codex_reply.assert_awaited_once()
         mock_run.assert_not_called()
 
     @pytest.mark.asyncio

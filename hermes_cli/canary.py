@@ -528,6 +528,28 @@ def _canary_codex_worker_contract(options: CanaryOptions) -> CanaryResult:
     coding_error = codex_worker_tool.validate_codex_worker_task(
         "fix failing pytest coverage in the repository"
     )
+    try:
+        from gateway import run as gateway_run
+
+        direct_code_prompt_routes = bool(
+            gateway_run._is_codex_worker_candidate_prompt(
+                "repair the Hermes repo and run focused tests"
+            )
+        )
+        direct_quote_prompt_blocks = not bool(
+            gateway_run._is_codex_worker_candidate_prompt(
+                "send this quote to the customer by email"
+            )
+        )
+        direct_capability_prompt_blocks = not bool(
+            gateway_run._is_codex_worker_candidate_prompt("what can you do")
+        )
+        direct_router_error = ""
+    except Exception as exc:
+        direct_code_prompt_routes = False
+        direct_quote_prompt_blocks = False
+        direct_capability_prompt_blocks = False
+        direct_router_error = f"{type(exc).__name__}: {exc}"
     status = codex_worker_tool.codex_worker_status(
         force=True,
         timeout=min(max(float(options.timeout), 1.0), 10.0),
@@ -539,6 +561,10 @@ def _canary_codex_worker_contract(options: CanaryOptions) -> CanaryResult:
         "unsafe_task_rejected": bool(unsafe_error),
         "noncoding_task_rejected": bool(noncoding_error),
         "coding_task_allowed": coding_error is None,
+        "direct_code_prompt_routes": direct_code_prompt_routes,
+        "direct_quote_prompt_blocks": direct_quote_prompt_blocks,
+        "direct_capability_prompt_blocks": direct_capability_prompt_blocks,
+        "direct_router_error": direct_router_error,
         "status": status,
     }
     hard_failures = [
@@ -549,6 +575,9 @@ def _canary_codex_worker_contract(options: CanaryOptions) -> CanaryResult:
             ("unsafe_task_rejected", details["unsafe_task_rejected"]),
             ("noncoding_task_rejected", details["noncoding_task_rejected"]),
             ("coding_task_allowed", details["coding_task_allowed"]),
+            ("direct_code_prompt_routes", details["direct_code_prompt_routes"]),
+            ("direct_quote_prompt_blocks", details["direct_quote_prompt_blocks"]),
+            ("direct_capability_prompt_blocks", details["direct_capability_prompt_blocks"]),
         )
         if not ok
     ]
@@ -575,7 +604,7 @@ def _canary_codex_worker_contract(options: CanaryOptions) -> CanaryResult:
         PASS,
         10,
         10,
-        "Codex worker registered, safety-gated, and logged in using ChatGPT",
+        "Codex worker registered, safety-gated, direct-routed, and logged in using ChatGPT",
         details,
     )
 

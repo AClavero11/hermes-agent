@@ -950,6 +950,187 @@ def _build_planning_mode_answer(message: str) -> str:
         )
 
 
+_FALSE_ENV_VALUES = {"0", "false", "no", "off"}
+_TRUE_ENV_VALUES = {"1", "true", "yes", "on"}
+
+
+def _env_flag(name: str, *, default: bool = False) -> bool:
+    value = os.getenv(name)
+    if value is None:
+        return default
+    normalized = value.strip().lower()
+    if normalized in _TRUE_ENV_VALUES:
+        return True
+    if normalized in _FALSE_ENV_VALUES:
+        return False
+    return default
+
+
+def _hosted_api_fast_paths_allowed() -> bool:
+    """Return True only when fast-path hosted model calls are explicitly enabled."""
+    if os.getenv("HERMES_OPERATOR_CAPABILITY_ALLOW_API") is not None:
+        return _env_flag("HERMES_OPERATOR_CAPABILITY_ALLOW_API")
+    return _env_flag("HERMES_ALLOW_HOSTED_FAST_PATH")
+
+
+def _runtime_route_is_local(provider: str, base_url: str) -> bool:
+    provider_lower = (provider or "").lower()
+    base_lower = (base_url or "").lower()
+    if "deepseek" in provider_lower or "office-deepseek" in provider_lower:
+        return True
+    return bool(
+        base_lower.startswith(("http://127.0.0.1", "http://localhost", "http://0.0.0.0"))
+        or ".local" in base_lower
+    )
+
+
+_CODEX_WORKER_DIRECT_ACTION_RE = re.compile(
+    r"\b("
+    r"fix|repair|debug|implement|add|update|change|modify|refactor|review|"
+    r"test|run tests|pytest|lint|build|compile|typecheck|investigate|inspect|"
+    r"diagnose|patch|set up|setup|install|configure|wire|scaffold|document"
+    r")\b",
+    re.IGNORECASE,
+)
+_CODEX_WORKER_DIRECT_CODE_RE = re.compile(
+    r"\b("
+    r"repo|repository|code|coding|test|tests|pytest|bug|debug|fix|repair|"
+    r"implement|refactor|review|patch|file|module|function|class|script|"
+    r"lint|build|compile|typecheck|package|dependency|git|branch|pull request|"
+    r"pr|readme|docs|config|tool|cli|canary|gateway|hermes|worker"
+    r")\b|"
+    r"(\.(?:py|ts|tsx|js|jsx|go|rs|rb|php|java|c|cc|cpp|h|hpp|sh|yaml|yml|json|toml|md)\b)",
+    re.IGNORECASE,
+)
+_CODEX_WORKER_DIRECT_BLOCK_RE = re.compile(
+    r"\b(quote|rfq|customer|supplier|vendor|client|invoice|purchase order|payment|"
+    r"wire|shipment|v11|atlas|aeroxchange)\b|"
+    r"\b(git\s+push|push\s+to\s+(?:github|origin|production|prod)|force[-\s]?push|"
+    r"deploy\s+to\s+(?:prod|production)|release\s+to\s+production)\b|"
+    r"\b(rm\s+-rf|git\s+reset\s+--hard|git\s+clean\s+-fd|drop\s+database|truncate\s+table)\b|"
+    r"\b(credential|secret|api key|password)\b",
+    re.IGNORECASE,
+)
+_CODEX_WORKER_READ_ONLY_RE = re.compile(
+    r"\b(review|inspect|analyze|analyse|explain|audit|read only|read-only|no edits?|do not edit)\b",
+    re.IGNORECASE,
+)
+_CODEX_WORKER_FORCE_READ_ONLY_RE = re.compile(
+    r"\b(read only|read-only|no edits?|do not edit|do not change|without editing)\b",
+    re.IGNORECASE,
+)
+_CODEX_WORKER_MUTATION_RE = re.compile(
+    r"\b(fix|repair|implement|add|update|change|modify|refactor|patch|write|edit|set up|setup|install|configure|wire|scaffold)\b",
+    re.IGNORECASE,
+)
+
+
+def _is_codex_worker_candidate_prompt(message: str) -> bool:
+    text = (message or "").strip()
+    if not text or text.startswith("/"):
+        return False
+    lowered = text.lower()
+    normalized = re.sub(r"[^a-z0-9]+", "", lowered)
+    if normalized in {"yes", "y", "no", "n", "ok", "okay", "ack", "stop", "new", "status"}:
+        return False
+    if _is_planning_mode_prompt(text) or _is_operator_capability_prompt(text):
+        return False
+    if _CODEX_WORKER_DIRECT_BLOCK_RE.search(text):
+        return False
+    if not _CODEX_WORKER_DIRECT_ACTION_RE.search(text):
+        return False
+    if not _CODEX_WORKER_DIRECT_CODE_RE.search(text):
+        return False
+    try:
+        from tools.codex_worker_tool import validate_codex_worker_task
+
+        if validate_codex_worker_task(text):
+            return False
+    except Exception as exc:
+        logger.debug("Codex worker validation probe failed: %s", exc)
+        return False
+    return True
+
+
+def _codex_worker_sandbox_for_message(message: str) -> str:
+    text = message or ""
+    if _CODEX_WORKER_FORCE_READ_ONLY_RE.search(text):
+        return "read-only"
+    if _CODEX_WORKER_READ_ONLY_RE.search(text) and not _CODEX_WORKER_MUTATION_RE.search(text):
+        return "read-only"
+    return "workspace-write"
+
+
+def _default_codex_worker_workdir() -> str:
+    configured = (
+        os.getenv("HERMES_CODEX_WORKER_DEFAULT_WORKDIR", "").strip()
+        or os.getenv("AAC_HERMES_DEEPSEEK_REPO", "").strip()
+    )
+    if configured:
+        return configured
+    try:
+        return str(Path(__file__).resolve().parent.parent)
+    except Exception:
+        return os.getcwd()
+
+
+def _format_codex_worker_direct_response(payload: dict[str, Any]) -> str:
+    success = bool(payload.get("success"))
+    auth_mode = str(payload.get("auth_mode") or "unknown")
+    model = str(payload.get("model") or os.getenv("HERMES_CODEX_WORKER_MODEL") or "gpt-5.5")
+    sandbox = str(payload.get("sandbox") or "workspace-write")
+    elapsed_ms = payload.get("elapsed_ms")
+    elapsed = ""
+    if isinstance(elapsed_ms, (int, float)):
+        elapsed = f" in {elapsed_ms / 1000.0:.1f}s"
+    header = (
+        f"Codex worker {'completed' if success else 'failed'}{elapsed} "
+        f"(zero Hermes planner/API call; auth={auth_mode}; model={model}; sandbox={sandbox})."
+    )
+    body = str(
+        payload.get("final_message")
+        or payload.get("error")
+        or payload.get("stderr_tail")
+        or payload.get("stdout_tail")
+        or ""
+    ).strip()
+    if not body:
+        body = "No final worker message was produced."
+    return _truncate_context_text(f"{header}\n\n{body}", 3900)
+
+
+async def _run_codex_worker_direct_path(message: str) -> str:
+    """Run eligible repo/code work through Codex CLI before the Hermes planner."""
+    task = (message or "").strip()
+    if not _is_codex_worker_candidate_prompt(task):
+        return ""
+
+    args = {
+        "task": task,
+        "workdir": _default_codex_worker_workdir(),
+        "model": os.getenv("HERMES_CODEX_WORKER_MODEL", "").strip() or "gpt-5.5",
+        "sandbox": os.getenv("HERMES_CODEX_WORKER_SANDBOX", "").strip()
+        or _codex_worker_sandbox_for_message(task),
+        "timeout_seconds": os.getenv("HERMES_CODEX_WORKER_TIMEOUT_SECONDS", "").strip() or "1800",
+    }
+    try:
+        from tools.codex_worker_tool import codex_worker
+
+        raw = await asyncio.to_thread(codex_worker, args)
+        payload = json.loads(raw) if isinstance(raw, str) else raw
+        if not isinstance(payload, dict):
+            payload = {"success": False, "error": f"unexpected codex_worker result: {raw!r}"}
+        return _format_codex_worker_direct_response(payload)
+    except Exception as exc:
+        payload = {
+            "success": False,
+            "error": f"{type(exc).__name__}: {exc}",
+            "model": args["model"],
+            "sandbox": args["sandbox"],
+        }
+        return _format_codex_worker_direct_response(payload)
+
+
 async def _run_rfq_fast_path_result(message: str) -> Any:
     text = (message or "").strip()
     if not text:
@@ -1173,12 +1354,8 @@ def _build_operator_capability_model_answer_sync(message: str) -> str:
     fallback_timeout = float(os.getenv("HERMES_OPERATOR_CAPABILITY_FALLBACK_TIMEOUT", "8") or "8")
     local_timeout = float(os.getenv("HERMES_OPERATOR_CAPABILITY_LOCAL_TIMEOUT", "1.5") or "1.5")
     hosted_attempted = False
-    prefer_runtime = os.getenv("HERMES_OPERATOR_CAPABILITY_PREFER_RUNTIME", "1").strip().lower() not in {
-        "0",
-        "false",
-        "no",
-        "off",
-    }
+    hosted_allowed = _hosted_api_fast_paths_allowed()
+    prefer_runtime = os.getenv("HERMES_OPERATOR_CAPABILITY_PREFER_RUNTIME", "1").strip().lower() not in _FALSE_ENV_VALUES
 
     openai_api_key = (
         os.getenv("HERMES_FRONTIER_API_KEY", "").strip()
@@ -1190,7 +1367,7 @@ def _build_operator_capability_model_answer_sync(message: str) -> str:
         or os.getenv("HERMES_FRONTIER_MODEL", "").strip()
         or "gpt-5.4-mini"
     )
-    if not prefer_runtime and openai_api_key and openai_model:
+    if hosted_allowed and not prefer_runtime and openai_api_key and openai_model:
         hosted_attempted = True
         openai_base = os.getenv("OPENAI_BASE_URL", "https://api.openai.com/v1").rstrip("/")
         payload = {
@@ -1238,7 +1415,8 @@ def _build_operator_capability_model_answer_sync(message: str) -> str:
         or os.getenv("HERMES_PLANNER_MODEL", "").strip()
     )
     if (
-        openrouter_provider_requested
+        hosted_allowed
+        and openrouter_provider_requested
         and openrouter_api_key
         and openrouter_model
         and "${" not in openrouter_model
@@ -1303,14 +1481,17 @@ def _build_operator_capability_model_answer_sync(message: str) -> str:
     runtime_api_mode = str(runtime_kwargs.get("api_mode") or "chat_completions").strip()
     runtime_attempted = False
     runtime_failure = ""
+    runtime_allowed = hosted_allowed or _runtime_route_is_local(runtime_provider, runtime_base)
     if (
-        runtime_model
+        runtime_allowed
+        and runtime_model
         and runtime_base
         and runtime_key
         and runtime_provider not in {"gemini"}
         and runtime_api_mode in {"", "chat_completions"}
     ):
-        hosted_attempted = True
+        if not _runtime_route_is_local(runtime_provider, runtime_base):
+            hosted_attempted = True
         runtime_attempted = True
         payload = {
             "model": runtime_model,
@@ -1359,7 +1540,7 @@ def _build_operator_capability_model_answer_sync(message: str) -> str:
         model = str((route or {}).get("model") or "").strip()
         if provider == "gemini" and model and model not in gemini_models:
             gemini_models.append(model)
-    if gemini_models:
+    if hosted_allowed and gemini_models:
         api_key = os.getenv("GEMINI_API_KEY", "").strip() or os.getenv("GOOGLE_API_KEY", "").strip()
         if api_key:
             hosted_attempted = True
@@ -1446,7 +1627,7 @@ def _build_operator_capability_model_answer_sync(message: str) -> str:
             )
 
     return _operator_capability_fallback(
-        "no usable synthesizer or local executor route",
+        "no usable local executor route; hosted capability APIs are disabled",
         elapsed=time.perf_counter() - started,
     )
 
@@ -3071,6 +3252,24 @@ class GatewayRunner:
                 await adapter._send_with_retry(
                     chat_id=event.source.chat_id,
                     content=_build_planning_mode_answer(event.text or ""),
+                    reply_to=event.message_id,
+                    metadata=thread_meta,
+                )
+                return True
+
+            if _is_codex_worker_candidate_prompt(event.text or ""):
+                await self._interrupt_and_clear_session(
+                    session_key,
+                    event.source,
+                    interrupt_reason=_INTERRUPT_REASON_RESET,
+                    invalidation_reason="codex_worker_direct_prompt",
+                )
+                self._reset_session_for_operator_lane(event.source, "codex_worker")
+                codex_worker_answer = await _run_codex_worker_direct_path(event.text or "")
+                thread_meta = {"thread_id": event.source.thread_id} if event.source.thread_id else None
+                await adapter._send_with_retry(
+                    chat_id=event.source.chat_id,
+                    content=codex_worker_answer,
                     reply_to=event.message_id,
                     metadata=thread_meta,
                 )
@@ -5879,6 +6078,16 @@ class GatewayRunner:
             if not event.get_command() and _is_planning_mode_prompt(event.text or ""):
                 return _build_planning_mode_answer(event.text or "")
 
+            if not event.get_command() and _is_codex_worker_candidate_prompt(event.text or ""):
+                await self._interrupt_and_clear_session(
+                    _quick_key,
+                    source,
+                    interrupt_reason=_INTERRUPT_REASON_RESET,
+                    invalidation_reason="codex_worker_direct_prompt",
+                )
+                self._reset_session_for_operator_lane(source, "codex_worker")
+                return await _run_codex_worker_direct_path(event.text or "")
+
             if not event.get_command() and _is_operator_capability_prompt(event.text or ""):
                 await self._interrupt_and_clear_session(
                     _quick_key,
@@ -6577,6 +6786,10 @@ class GatewayRunner:
 
             if _is_planning_mode_prompt(event.text or ""):
                 return _build_planning_mode_answer(event.text or "")
+
+            codex_worker_answer = await _run_codex_worker_direct_path(event.text or "")
+            if codex_worker_answer:
+                return codex_worker_answer
 
             if _is_operator_capability_prompt(event.text or ""):
                 return await _run_operator_capability_fast_path(event.text or "")

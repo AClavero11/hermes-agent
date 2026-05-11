@@ -46,6 +46,46 @@ def test_operator_capability_classifier_catches_regression_prompt():
     assert gateway_run._is_operator_capability_prompt(prompt)
 
 
+def test_codex_worker_classifier_routes_code_and_blocks_external_actions():
+    import gateway.run as gateway_run
+
+    assert gateway_run._is_codex_worker_candidate_prompt("repair the Hermes repo and run the focused tests")
+    assert gateway_run._is_codex_worker_candidate_prompt("fix failing pytest in gateway/run.py")
+    assert gateway_run._is_codex_worker_candidate_prompt("fix the text overflow bug in the frontend code")
+    assert not gateway_run._is_codex_worker_candidate_prompt("what can you do")
+    assert not gateway_run._is_codex_worker_candidate_prompt("send a quote to the customer")
+    assert not gateway_run._is_codex_worker_candidate_prompt("push the repo to github")
+
+
+def test_codex_worker_read_only_sandbox_honors_no_edit_prompts():
+    import gateway.run as gateway_run
+
+    assert (
+        gateway_run._codex_worker_sandbox_for_message(
+            "review the Hermes repo status for this smoke; do not edit files"
+        )
+        == "read-only"
+    )
+    assert gateway_run._codex_worker_sandbox_for_message("repair the Hermes repo") == "workspace-write"
+
+
+@pytest.mark.asyncio
+async def test_codex_worker_prompt_uses_direct_path_not_agent_loop(monkeypatch):
+    import gateway.run as gateway_run
+
+    async def fake_codex_worker_path(message: str) -> str:
+        assert "repo" in message
+        return "Codex worker completed (zero Hermes planner/API call)."
+
+    monkeypatch.setattr(gateway_run, "_run_codex_worker_direct_path", fake_codex_worker_path)
+    runner = _minimal_runner()
+
+    result = await runner._handle_message(_event("repair the Hermes repo and run focused tests"))
+
+    assert "Codex worker completed" in result
+    runner._handle_message_with_agent.assert_not_called()
+
+
 @pytest.mark.asyncio
 async def test_broad_operator_prompt_uses_fast_path_not_agent_loop(monkeypatch):
     import gateway.run as gateway_run
@@ -80,6 +120,7 @@ def test_operator_fast_path_is_model_backed_not_canned_menu(monkeypatch):
 
     monkeypatch.setenv("HERMES_FRONTIER_API_KEY", "test-key")
     monkeypatch.setenv("OPENAI_FRONTIER_MODEL", "gpt-test")
+    monkeypatch.setenv("HERMES_OPERATOR_CAPABILITY_ALLOW_API", "1")
     monkeypatch.setenv("HERMES_OPERATOR_CAPABILITY_PREFER_RUNTIME", "0")
     monkeypatch.setattr(gateway_run, "_post_json", fake_post_json)
 
@@ -134,6 +175,7 @@ def test_operator_fast_path_prefers_gemini_planner_before_pro_synthesizer(monkey
         }
 
     monkeypatch.setenv("GEMINI_API_KEY", "test-gemini-key")
+    monkeypatch.setenv("HERMES_OPERATOR_CAPABILITY_ALLOW_API", "1")
     monkeypatch.delenv("HERMES_FRONTIER_API_KEY", raising=False)
     monkeypatch.delenv("OPENAI_API_KEY", raising=False)
     monkeypatch.setattr(gateway_run, "resolve_model_routes", fake_routes)
@@ -147,6 +189,43 @@ def test_operator_fast_path_prefers_gemini_planner_before_pro_synthesizer(monkey
     assert len(calls) == 1
     assert "Hosted planner" in answer
     assert "approval" in answer.lower()
+
+
+def test_operator_fast_path_skips_hosted_api_by_default(monkeypatch):
+    import gateway.run as gateway_run
+
+    calls = []
+
+    def fake_routes():
+        return {
+            "frontier_available": True,
+            "frontier_source": "openrouter",
+            "frontier_verified": True,
+            "routes": {
+                "planner": {"provider": "openrouter", "model": "openai/gpt-test"},
+                "hard_task_planner": {"provider": "openrouter", "model": "openai/gpt-test"},
+                "executor": {"provider": "missing", "model": ""},
+                "verifier": {"provider": "openrouter", "model": "openai/gpt-test"},
+                "synthesizer": {"provider": "openrouter", "model": "openai/gpt-test"},
+            },
+        }
+
+    def fake_post_json(*_args, **_kwargs):
+        calls.append(_args)
+        return {"output_text": "should not be called"}
+
+    monkeypatch.delenv("HERMES_ALLOW_HOSTED_FAST_PATH", raising=False)
+    monkeypatch.delenv("HERMES_OPERATOR_CAPABILITY_ALLOW_API", raising=False)
+    monkeypatch.setenv("OPENROUTER_API_KEY", "test-openrouter-key")
+    monkeypatch.setenv("HERMES_OPENROUTER_PLANNER_MODEL", "openai/gpt-test")
+    monkeypatch.setattr(gateway_run, "resolve_model_routes", fake_routes)
+    monkeypatch.setattr(gateway_run, "_resolve_runtime_agent_kwargs", lambda: {})
+    monkeypatch.setattr(gateway_run, "_post_json", fake_post_json)
+
+    answer = gateway_run._build_operator_capability_model_answer_sync("what can you do")
+
+    assert calls == []
+    assert "hosted capability APIs are disabled" in answer
 
 
 @pytest.mark.asyncio
