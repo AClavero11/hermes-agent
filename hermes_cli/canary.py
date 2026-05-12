@@ -1415,49 +1415,58 @@ def _canary_auto_think_candidate_schema(options: CanaryOptions) -> CanaryResult:
         ],
         "acceptance_criteria": ["pytest tests/hermes_cli/test_auto_think.py -q passes"],
     }
-    result = auto_think.enqueue_candidate(payload, hermes_home=options.hermes_home)
-    body = result["operator_task_body"]
-    required_body_terms = [
-        "customer/vendor sends",
-        "quotes",
-        "payments",
-        "orders",
-        "inventory/V11 mutations",
-        "public posts",
-        "destructive prod changes",
-        "paid signup",
-        "untrusted installs",
-        "Rollback",
-        "dry-run",
-    ]
-    missing = [term for term in required_body_terms if term not in body]
-    store_path = Path(result["store_path"])
-    if missing or result["written"] or store_path.exists():
+    with tempfile.TemporaryDirectory(prefix="hermes-auto-think-canary-") as temp_dir:
+        canary_home = Path(temp_dir)
+        result = auto_think.enqueue_candidate(payload, hermes_home=canary_home, dry_run=True)
+        body = result["operator_task_body"]
+        required_body_terms = [
+            "customer/vendor sends",
+            "quotes",
+            "payments",
+            "orders",
+            "inventory/V11 mutations",
+            "public posts",
+            "destructive prod changes",
+            "paid signup",
+            "untrusted installs",
+            "Rollback",
+            "dry-run",
+        ]
+        missing = [term for term in required_body_terms if term not in body]
+        store_path = Path(result["store_path"])
+        store_exists = store_path.exists()
+        if missing or result["written"] or store_exists:
+            return _result(
+                "contract.auto_think_candidate_schema",
+                FAIL,
+                0,
+                15,
+                "Auto-think schema, approval gates, or dry-run contract failed",
+                {
+                    "missing_body_terms": missing,
+                    "written": result["written"],
+                    "store_exists": store_exists,
+                    "store_path": str(store_path),
+                    "production_store_path": str(
+                        options.hermes_home / "auto_think" / "candidates.jsonl"
+                    ),
+                },
+            )
         return _result(
             "contract.auto_think_candidate_schema",
-            FAIL,
-            0,
+            PASS,
             15,
-            "Auto-think schema, approval gates, or dry-run contract failed",
+            15,
+            "Auto-think candidate schema, dedupe, approval gates, and dry-run contract pass",
             {
-                "missing_body_terms": missing,
-                "written": result["written"],
-                "store_exists": store_path.exists(),
+                "candidate_id": result["candidate"]["candidate_id"],
+                "dedupe_key": result["candidate"]["dedupe_key"],
                 "store_path": str(store_path),
+                "production_store_path": str(
+                    options.hermes_home / "auto_think" / "candidates.jsonl"
+                ),
             },
         )
-    return _result(
-        "contract.auto_think_candidate_schema",
-        PASS,
-        15,
-        15,
-        "Auto-think candidate schema, dedupe, approval gates, and dry-run contract pass",
-        {
-            "candidate_id": result["candidate"]["candidate_id"],
-            "dedupe_key": result["candidate"]["dedupe_key"],
-            "store_path": str(store_path),
-        },
-    )
 
 
 def _canary_live_x_scrape(options: CanaryOptions) -> CanaryResult:

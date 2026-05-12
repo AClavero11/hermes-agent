@@ -588,6 +588,17 @@ def test_operator_capability_guard_replaces_incomplete_model_output():
     assert "Research/code" in result
 
 
+def test_operator_capability_fallback_has_live_golden_terms():
+    import gateway.run as gateway_run
+
+    result = gateway_run._operator_capability_fallback("TimeoutError: timed out", elapsed=1.5)
+    lowered = result.lower()
+
+    for term in ["RFQ", "V11", "follow", "code", "approval"]:
+        assert term.lower() in lowered
+    assert "TimeoutError: timed out" in result
+
+
 def test_operator_capability_answer_removes_generic_i_can_prefix():
     import gateway.run as gateway_run
 

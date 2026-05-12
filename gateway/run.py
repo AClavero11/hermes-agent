@@ -1255,13 +1255,26 @@ def _operator_route_summary() -> str:
 
 
 def _operator_capability_fallback(error: str, *, elapsed: float | None = None) -> str:
-    elapsed_line = f"Elapsed: {elapsed:.1f}s.\n" if elapsed is not None else ""
+    elapsed_line = f" Elapsed: {elapsed:.1f}s." if elapsed is not None else ""
+    diagnostic = (
+        f"Route: {_operator_route_summary()}.{elapsed_line} "
+        f"Failure: {error[:220]}."
+    )
     return (
-        "Hermes fast operator route failed before producing a model answer.\n"
-        f"Route: {_operator_route_summary()}.\n"
-        f"{elapsed_line}"
-        f"Failure: {error[:220]}.\n"
-        "Next safe action: retry once, or use `/runtime status` if you want the live route and health facts."
+        "Hermes operator planner did not return a model answer inside the fast lane, "
+        "so this is the deterministic safe fallback.\n"
+        "- RFQ/quotes: prepare sourced quote packages from V11 stock, customer history, "
+        "pricing rules, and approval cards.\n"
+        "- V11 context: pull inventory, sales history, customer terms, products, and "
+        "source paths before answering.\n"
+        "- Follow-ups: draft customer/vendor follow-up notes, stale quote actions, and "
+        "next-step work queues.\n"
+        "- Hermes runtime: inspect canaries, logs, model routes, LSH/QMD retrieval, and "
+        "stuck sessions.\n"
+        "- Research/code: digest X/GitHub/vendor links, patch repo issues, and attach "
+        "test proof.\n"
+        f"Diagnostic: {diagnostic}\n"
+        "Approval required before customer sends, V11/Atlas writes, or destructive actions."
     )
 
 
