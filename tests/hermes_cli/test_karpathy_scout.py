@@ -94,6 +94,55 @@ def test_run_scout_writes_report_enqueues_candidate_and_sends_telegram(monkeypat
     assert "Karpathy scout" in queued
 
 
+def test_run_scout_dedupes_repeated_telegram_candidate(monkeypatch, tmp_path):
+    item = karpathy_scout.ExternalItem(
+        source_type="github_release",
+        locator="https://github.com/openai/codex/releases/tag/v1.2.3",
+        title="openai/codex: reliability release",
+        summary="Fixed sandbox auth timeout with regression canary tests and eval metrics.",
+        systems=["codex_worker", "safety"],
+        fetched_at="2026-05-11T12:00:00+00:00",
+    )
+
+    monkeypatch.setattr(karpathy_scout, "collect_external_items", lambda **_kwargs: [item])
+    monkeypatch.setattr(
+        karpathy_scout,
+        "run_metric_tests",
+        lambda _repo_root: karpathy_scout.TestResult(
+            command=["pytest"],
+            ok=True,
+            exit_code=0,
+            elapsed_ms=100,
+            output_tail="passed",
+        ),
+    )
+    sent_messages: list[str] = []
+    monkeypatch.setattr(
+        karpathy_scout,
+        "send_telegram_packet",
+        lambda message: sent_messages.append(message) or {"sent": True, "message_id": len(sent_messages)},
+    )
+
+    first = karpathy_scout.run_scout(
+        hermes_home=tmp_path,
+        repo_root=Path.cwd(),
+        source_config_path=None,
+        telegram=True,
+    )
+    second = karpathy_scout.run_scout(
+        hermes_home=tmp_path,
+        repo_root=Path.cwd(),
+        source_config_path=None,
+        telegram=True,
+    )
+
+    history = (tmp_path / "karpathy_scout" / "reports" / "history.jsonl").read_text(encoding="utf-8")
+    assert first.telegram["sent"] is True
+    assert second.telegram["deduped"] is True
+    assert len(sent_messages) == 1
+    assert len(history.strip().splitlines()) == 2
+
+
 def test_run_scout_blocks_candidate_when_tests_fail(monkeypatch, tmp_path):
     item = karpathy_scout.ExternalItem(
         source_type="github_release",

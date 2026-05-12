@@ -9,6 +9,7 @@ candidate into the existing Auto-think queue.
 from __future__ import annotations
 
 import argparse
+import hashlib
 import json
 import os
 import re
@@ -17,6 +18,7 @@ import sys
 import time
 import urllib.parse
 import urllib.request
+from collections import deque
 from dataclasses import asdict, dataclass, field
 from datetime import datetime, timezone
 from pathlib import Path
@@ -604,9 +606,8 @@ def run_scout(
         telegram={"sent": False},
         notes=notes,
     )
-    report = _write_report(home=home, report=preliminary)
-    message = render_telegram_packet(report)
-    telegram_result = send_telegram_packet(message) if telegram else {"sent": False, "reason": "telegram disabled"}
+    report = _write_report(home=home, report=preliminary, append_history=False)
+    telegram_result = maybe_send_telegram_packet(home=home, report=report, enabled=telegram)
     final = ScoutReport(
         status=report.status,
         generated_at=report.generated_at,
@@ -727,7 +728,28 @@ def send_telegram_packet(message: str) -> dict[str, Any]:
         return {"sent": False, "reason": f"{type(exc).__name__}: {exc}"}
 
 
-def _write_report(*, home: Path, report: ScoutReport) -> ScoutReport:
+def maybe_send_telegram_packet(*, home: Path, report: ScoutReport, enabled: bool) -> dict[str, Any]:
+    if not enabled:
+        return {"sent": False, "reason": "telegram disabled"}
+    signature = _telegram_signature(report)
+    previous = _previous_telegram_delivery(home, signature)
+    if previous is not None:
+        return {
+            "sent": False,
+            "deduped": True,
+            "reason": "telegram packet already sent for this candidate signature",
+            "signature": signature,
+            "previous_message_id": previous.get("message_id"),
+            "previous_sent_at": previous.get("sent_at") or previous.get("generated_at"),
+        }
+    result = send_telegram_packet(render_telegram_packet(report))
+    result["signature"] = signature
+    if result.get("sent"):
+        _record_telegram_delivery(home, report=report, signature=signature, result=result)
+    return result
+
+
+def _write_report(*, home: Path, report: ScoutReport, append_history: bool = True) -> ScoutReport:
     reports_dir = home / "karpathy_scout" / "reports"
     reports_dir.mkdir(parents=True, exist_ok=True)
     existing_json_path = report.artifacts.get("json") if report.artifacts else ""
@@ -755,9 +777,106 @@ def _write_report(*, home: Path, report: ScoutReport) -> ScoutReport:
     markdown_path.write_text(render_markdown_report(final), encoding="utf-8")
     (reports_dir / "latest.json").write_text(json_payload + "\n", encoding="utf-8")
     (reports_dir / "latest.md").write_text(render_markdown_report(final), encoding="utf-8")
-    with (reports_dir / "history.jsonl").open("a", encoding="utf-8") as handle:
-        handle.write(json.dumps(asdict(final), sort_keys=True, ensure_ascii=False) + "\n")
+    if append_history:
+        with (reports_dir / "history.jsonl").open("a", encoding="utf-8") as handle:
+            handle.write(json.dumps(asdict(final), sort_keys=True, ensure_ascii=False) + "\n")
     return final
+
+
+def _telegram_signature(report: ScoutReport) -> str:
+    candidate = report.candidate or {}
+    score = report.score or {}
+    tests = report.tests or {}
+    raw = "|".join(
+        [
+            str(report.status),
+            str(candidate.get("dedupe_key") or candidate.get("source_locator") or candidate.get("title") or ""),
+            str(score.get("total") or ""),
+            str(score.get("lane") or ""),
+            str(tests.get("ok") or False),
+        ]
+    )
+    return "v1:" + hashlib.sha256(raw.encode("utf-8")).hexdigest()[:24]
+
+
+def _previous_telegram_delivery(home: Path, signature: str) -> dict[str, Any] | None:
+    state = _read_json_dict(_telegram_state_path(home))
+    for delivery in reversed(state.get("deliveries") or []):
+        if isinstance(delivery, dict) and delivery.get("signature") == signature:
+            return delivery
+    for report in _recent_history_reports(home):
+        if _telegram_signature(report) != signature:
+            continue
+        telegram = report.telegram or {}
+        if telegram.get("sent"):
+            return {
+                "signature": signature,
+                "message_id": telegram.get("message_id"),
+                "sent_at": report.generated_at,
+                "source": (report.candidate or {}).get("source_locator"),
+            }
+    return None
+
+
+def _record_telegram_delivery(
+    home: Path,
+    *,
+    report: ScoutReport,
+    signature: str,
+    result: dict[str, Any],
+) -> None:
+    path = _telegram_state_path(home)
+    path.parent.mkdir(parents=True, exist_ok=True)
+    state = _read_json_dict(path)
+    deliveries = [delivery for delivery in (state.get("deliveries") or []) if isinstance(delivery, dict)]
+    deliveries.append(
+        {
+            "signature": signature,
+            "message_id": result.get("message_id"),
+            "sent_at": utc_now(),
+            "generated_at": report.generated_at,
+            "status": report.status,
+            "source": (report.candidate or {}).get("source_locator"),
+            "title": (report.candidate or {}).get("title"),
+        }
+    )
+    payload = {"updated_at": utc_now(), "deliveries": deliveries[-500:]}
+    tmp_path = path.with_suffix(".tmp")
+    tmp_path.write_text(json.dumps(payload, indent=2, sort_keys=True, ensure_ascii=False) + "\n", encoding="utf-8")
+    os.replace(tmp_path, path)
+
+
+def _recent_history_reports(home: Path, limit: int = 200) -> list[ScoutReport]:
+    path = home / "karpathy_scout" / "reports" / "history.jsonl"
+    if not path.is_file():
+        return []
+    reports: list[ScoutReport] = []
+    try:
+        with path.open(encoding="utf-8") as handle:
+            lines = deque(handle, maxlen=limit)
+    except Exception:
+        return reports
+    for line in reversed(lines):
+        try:
+            payload = json.loads(line)
+            reports.append(ScoutReport(**payload))
+        except Exception:
+            continue
+    return reports
+
+
+def _telegram_state_path(home: Path) -> Path:
+    return home / "karpathy_scout" / "telegram_state.json"
+
+
+def _read_json_dict(path: Path) -> dict[str, Any]:
+    if not path.is_file():
+        return {}
+    try:
+        payload = json.loads(path.read_text(encoding="utf-8"))
+    except Exception:
+        return {}
+    return payload if isinstance(payload, dict) else {}
 
 
 def _read_latest_canary(home: Path) -> dict[str, Any]:
