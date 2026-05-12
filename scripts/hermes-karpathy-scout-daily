@@ -1,0 +1,22 @@
+#!/bin/zsh
+set -euo pipefail
+
+ENV_WRAPPER="${HERMES_KARPATHY_ENV_WRAPPER:-$HOME/.hermes-deepseek/bin/hermes-env.sh}"
+if [[ -f "$ENV_WRAPPER" ]]; then
+  source "$ENV_WRAPPER"
+  aac_configure_hermes_deepseek_env
+fi
+
+REPO="${AAC_HERMES_DEEPSEEK_REPO:-$HOME/.hermes/hermes-agent-v2026.4.23}"
+PYTHON_BIN="${AAC_HERMES_DEEPSEEK_PYTHON:-python3}"
+HERMES_HOME_DIR="${AAC_HERMES_DEEPSEEK_HOME:-${HERMES_HOME:-$HOME/.hermes-deepseek}}"
+
+cd "$REPO"
+
+exec "$PYTHON_BIN" -m hermes_cli.karpathy_scout run \
+  --hermes-home "$HERMES_HOME_DIR" \
+  --repo-root "$REPO" \
+  --source-limit "${HERMES_KARPATHY_SCOUT_SOURCE_LIMIT:-40}" \
+  --min-score "${HERMES_KARPATHY_SCOUT_MIN_SCORE:-70}" \
+  --timeout "${HERMES_KARPATHY_SCOUT_HTTP_TIMEOUT:-8}" \
+  --telegram

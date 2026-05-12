@@ -1,0 +1,48 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN"
+  "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0">
+<dict>
+  <key>Label</key>
+  <string>ai.hermes.karpathy-scout</string>
+
+  <key>ProgramArguments</key>
+  <array>
+    <string>/bin/zsh</string>
+    <string>/Users/anthonyclavero/.hermes/hermes-agent-v2026.4.23/scripts/hermes-karpathy-scout-daily</string>
+  </array>
+
+  <key>WorkingDirectory</key>
+  <string>/Users/anthonyclavero/.hermes/hermes-agent-v2026.4.23</string>
+
+  <key>EnvironmentVariables</key>
+  <dict>
+    <key>HOME</key>
+    <string>/Users/anthonyclavero</string>
+    <key>HERMES_HOME</key>
+    <string>/Users/anthonyclavero/.hermes-deepseek</string>
+    <key>HERMES_PLANNER_ENV_FILE</key>
+    <string>/Users/anthonyclavero/.hermes/.env</string>
+    <key>HERMES_KARPATHY_SCOUT_TELEGRAM</key>
+    <string>1</string>
+  </dict>
+
+  <key>StartCalendarInterval</key>
+  <dict>
+    <key>Hour</key>
+    <integer>7</integer>
+    <key>Minute</key>
+    <integer>20</integer>
+  </dict>
+
+  <key>StandardOutPath</key>
+  <string>/Users/anthonyclavero/.hermes-deepseek/logs/karpathy-scout.log</string>
+  <key>StandardErrorPath</key>
+  <string>/Users/anthonyclavero/.hermes-deepseek/logs/karpathy-scout.error.log</string>
+
+  <key>RunAtLoad</key>
+  <false/>
+  <key>KeepAlive</key>
+  <false/>
+</dict>
+</plist>
