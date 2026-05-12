@@ -89,6 +89,11 @@ def test_brain_retrieval_health_reports_freshness_and_order(monkeypatch, tmp_pat
     fresh_index.write_text("fresh", encoding="utf-8")
     stale_index.write_text("stale", encoding="utf-8")
     monkeypatch.setattr(context_router.shutil, "which", lambda name, path=None: f"/bin/{name}")
+    monkeypatch.setattr(
+        context_router,
+        "lsh_daemon_health",
+        lambda: {"running": True, "responsive": True, "alex_docs": 10, "v11_products": 20},
+    )
     monkeypatch.delenv("HERMES_BRAIN_QMD_MODE", raising=False)
     old_time = now - 30 * 86400
     fresh_time = now - 2 * 86400
@@ -109,6 +114,7 @@ def test_brain_retrieval_health_reports_freshness_and_order(monkeypatch, tmp_pat
 
     assert health["retrieval_order"] == ["alex-search", "qmd-search", "v11-search"]
     assert health["lsh_first"] is True
+    assert health["daemon"]["responsive"] is True
     assert health["qmd_expansion_default"] is False
     assert health["stale_indexes"] == ["qmd"]
 

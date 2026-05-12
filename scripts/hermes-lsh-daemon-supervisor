@@ -1,0 +1,198 @@
+#!/usr/bin/env python3
+"""Launchd-friendly supervisor for the Alexandria LSH daemon.
+
+The upstream lsh-daemon treats a live PID file as success even when the Unix
+socket is not ready. That is fine for a CLI, but unstable under launchd
+KeepAlive. This wrapper owns stale PID/socket cleanup, waits for readiness, and
+then keeps the foreground daemon attached to launchd.
+"""
+
+from __future__ import annotations
+
+import json
+import os
+import signal
+import socket
+import subprocess
+import sys
+import time
+from pathlib import Path
+
+
+HOME = Path.home()
+PYTHON = Path(os.getenv("HERMES_LSH_PYTHON", str(HOME / ".venvs" / "search" / "bin" / "python3")))
+DAEMON = Path(
+    os.getenv(
+        "HERMES_LSH_DAEMON",
+        str(HOME / "alexandria" / "_system" / "scripts" / "lsh-daemon"),
+    )
+)
+PID_FILE = Path(os.getenv("HERMES_LSH_PID_FILE", str(HOME / ".lsh-daemon.pid")))
+SOCKET_PATH = Path(os.getenv("HERMES_LSH_SOCKET", str(HOME / ".lsh-daemon.sock")))
+READY_TIMEOUT = float(os.getenv("HERMES_LSH_READY_TIMEOUT", "90") or 90)
+POLL_SECONDS = float(os.getenv("HERMES_LSH_POLL_SECONDS", "0.5") or 0.5)
+
+
+child: subprocess.Popen | None = None
+
+
+def log(message: str) -> None:
+    print(f"[hermes-lsh-supervisor] {message}", flush=True)
+
+
+def daemon_status(timeout: float = 1.0) -> dict:
+    if not SOCKET_PATH.exists():
+        return {"responsive": False, "error": "socket missing"}
+    try:
+        client = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
+        client.settimeout(timeout)
+        client.connect(str(SOCKET_PATH))
+        client.sendall(b'{"action": "status"}\n')
+        response = b""
+        while True:
+            chunk = client.recv(8192)
+            if not chunk:
+                break
+            response += chunk
+            if b"\n" in response:
+                break
+        client.close()
+        payload = json.loads(response.decode("utf-8").strip())
+    except Exception as exc:
+        return {"responsive": False, "error": f"{type(exc).__name__}: {exc}"}
+    payload["responsive"] = True
+    return payload
+
+
+def live_pid() -> int | None:
+    try:
+        pid = int(PID_FILE.read_text(encoding="utf-8").strip())
+    except Exception:
+        return None
+    try:
+        os.kill(pid, 0)
+    except OSError:
+        return None
+    return pid
+
+
+def remove_path(path: Path) -> None:
+    try:
+        path.unlink()
+    except FileNotFoundError:
+        return
+    except OSError as exc:
+        log(f"could not remove {path}: {exc}")
+
+
+def terminate_pid(pid: int) -> None:
+    log(f"terminating unresponsive existing daemon pid={pid}")
+    try:
+        os.kill(pid, signal.SIGTERM)
+    except OSError:
+        return
+    deadline = time.time() + 12
+    while time.time() < deadline:
+        try:
+            os.kill(pid, 0)
+        except OSError:
+            return
+        time.sleep(0.25)
+    try:
+        os.kill(pid, signal.SIGKILL)
+        log(f"killed daemon pid={pid}")
+    except OSError:
+        pass
+
+
+def cleanup_unresponsive_state() -> None:
+    status = daemon_status(timeout=0.5)
+    if status.get("responsive"):
+        log(
+            "existing daemon is responsive: "
+            f"alex_docs={status.get('alex_docs')} v11_products={status.get('v11_products')}"
+        )
+        return
+    pid = live_pid()
+    if pid is not None:
+        terminate_pid(pid)
+    remove_path(PID_FILE)
+    remove_path(SOCKET_PATH)
+
+
+def wait_for_ready() -> dict:
+    deadline = time.time() + READY_TIMEOUT
+    last_error = ""
+    while time.time() < deadline:
+        if child is not None and child.poll() is not None:
+            raise RuntimeError(f"daemon exited before ready with code {child.returncode}")
+        status = daemon_status(timeout=1.0)
+        if status.get("responsive"):
+            return status
+        last_error = str(status.get("error") or "not ready")
+        time.sleep(POLL_SECONDS)
+    raise TimeoutError(f"daemon socket not ready after {READY_TIMEOUT:g}s: {last_error}")
+
+
+def handle_signal(signum: int, _frame: object) -> None:
+    global child
+    log(f"received signal {signum}; stopping daemon")
+    if child is not None and child.poll() is None:
+        child.terminate()
+        try:
+            child.wait(timeout=15)
+        except subprocess.TimeoutExpired:
+            child.kill()
+            child.wait(timeout=5)
+    sys.exit(0)
+
+
+def main() -> int:
+    global child
+    signal.signal(signal.SIGTERM, handle_signal)
+    signal.signal(signal.SIGINT, handle_signal)
+
+    if not PYTHON.is_file():
+        raise FileNotFoundError(f"search Python not found: {PYTHON}")
+    if not DAEMON.is_file():
+        raise FileNotFoundError(f"lsh-daemon not found: {DAEMON}")
+
+    cleanup_unresponsive_state()
+    existing = daemon_status(timeout=0.5)
+    if existing.get("responsive"):
+        log("monitoring existing responsive daemon")
+        while True:
+            time.sleep(15)
+
+    env = os.environ.copy()
+    env["HOME"] = str(HOME)
+    env["PYTHONUNBUFFERED"] = "1"
+    env["PATH"] = ":".join(
+        [
+            str(HOME / "alexandria" / "_system" / "scripts"),
+            str(HOME / "alexandria" / "advanced" / "operations" / "scripts"),
+            str(HOME / ".venvs" / "search" / "bin"),
+            "/opt/homebrew/bin",
+            "/usr/local/bin",
+            "/usr/bin",
+            "/bin",
+        ]
+    )
+
+    log(f"starting daemon via {PYTHON} {DAEMON} start")
+    child = subprocess.Popen([str(PYTHON), str(DAEMON), "start"], env=env)
+    status = wait_for_ready()
+    log(
+        "daemon ready: "
+        f"alex_docs={status.get('alex_docs')} v11_products={status.get('v11_products')} "
+        f"load_times={status.get('load_times')}"
+    )
+    return child.wait()
+
+
+if __name__ == "__main__":
+    try:
+        raise SystemExit(main())
+    except Exception as exc:
+        log(f"fatal: {type(exc).__name__}: {exc}")
+        raise

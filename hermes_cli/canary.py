@@ -3559,6 +3559,12 @@ def _canary_brain_retrieval(options: CanaryOptions) -> CanaryResult:
     else:
         passed.append("lsh_first")
 
+    daemon = health.get("daemon") if isinstance(health.get("daemon"), dict) else {}
+    if not daemon.get("responsive"):
+        failed["lsh_daemon"] = daemon or {"responsive": False}
+    else:
+        passed.append("lsh_daemon")
+
     if health.get("qmd_expansion_default"):
         failed["qmd_mode"] = {
             "qmd_mode": health.get("qmd_mode"),
@@ -3603,7 +3609,7 @@ def _canary_brain_retrieval(options: CanaryOptions) -> CanaryResult:
         status = WARN
     else:
         status = PASS
-    total_checks = 6
+    total_checks = 7
     passed_count = len(passed)
     if failed:
         score = max(0.0, round(20.0 * passed_count / total_checks, 1) - 6.0)

@@ -9,6 +9,7 @@ import logging
 import os
 import re
 import shutil
+import socket
 import subprocess
 import time
 from pathlib import Path
@@ -136,6 +137,7 @@ PART_NUMBER_RE = re.compile(
 URL_RE = re.compile(r"https?://\S+", re.IGNORECASE)
 HEALTH_PROBE_RE = re.compile(r"^(?:ping|pong|status\??|health\??|healthy|ok\??|okay\??)$", re.IGNORECASE)
 DEFAULT_BRAIN_INDEX_MAX_AGE_DAYS = 14.0
+LSH_DAEMON_SOCKET_PATH = Path.home() / ".lsh-daemon.sock"
 
 
 _ALEXANDRIA_CONTEXT_TERMS = CONTEXT_TERMS
@@ -415,6 +417,45 @@ def _index_age_days(path: Path, *, now: float | None = None) -> float | None:
     return max(0.0, (timestamp - stat.st_mtime) / 86400.0)
 
 
+def lsh_daemon_health(socket_path: Path | None = None, timeout: float = 1.0) -> dict[str, Any]:
+    path = Path(socket_path) if socket_path else LSH_DAEMON_SOCKET_PATH
+    if not path.exists():
+        return {"running": False, "responsive": False, "socket": str(path), "error": "socket missing"}
+    try:
+        client = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
+        client.settimeout(timeout)
+        client.connect(str(path))
+        client.sendall(b'{"action": "status"}\n')
+        response = b""
+        while True:
+            chunk = client.recv(8192)
+            if not chunk:
+                break
+            response += chunk
+            if b"\n" in response:
+                break
+        client.close()
+        payload = json.loads(response.decode("utf-8").strip())
+    except Exception as exc:
+        return {
+            "running": True,
+            "responsive": False,
+            "socket": str(path),
+            "error": f"{type(exc).__name__}: {exc}",
+        }
+    return {
+        "running": True,
+        "responsive": True,
+        "socket": str(path),
+        "version": payload.get("version"),
+        "alex_docs": payload.get("alex_docs"),
+        "v11_products": payload.get("v11_products"),
+        "cache": payload.get("cache"),
+        "watcher": payload.get("watcher"),
+        "load_times": payload.get("load_times"),
+    }
+
+
 def brain_retrieval_health(
     *,
     now: float | None = None,
@@ -454,6 +495,7 @@ def brain_retrieval_health(
         "commands": commands,
         "missing_commands": missing_commands,
         "indexes": index_status,
+        "daemon": lsh_daemon_health(),
         "stale_indexes": stale_indexes,
         "max_age_days": max_age_days,
         "qmd_mode": _brain_qmd_mode(),

@@ -1,0 +1,30 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0">
+<dict>
+	<key>Label</key>
+	<string>com.ac.lsh-daemon</string>
+	<key>ProgramArguments</key>
+	<array>
+		<string>/Users/anthonyclavero/.venvs/search/bin/python3</string>
+		<string>/Users/anthonyclavero/.hermes/hermes-agent-v2026.4.23/scripts/hermes-lsh-daemon-supervisor</string>
+	</array>
+	<key>EnvironmentVariables</key>
+	<dict>
+		<key>HOME</key>
+		<string>/Users/anthonyclavero</string>
+		<key>PATH</key>
+		<string>/Users/anthonyclavero/alexandria/_system/scripts:/Users/anthonyclavero/alexandria/advanced/operations/scripts:/Users/anthonyclavero/.venvs/search/bin:/opt/homebrew/bin:/usr/local/bin:/usr/bin:/bin</string>
+		<key>HERMES_LSH_READY_TIMEOUT</key>
+		<string>120</string>
+	</dict>
+	<key>RunAtLoad</key>
+	<true/>
+	<key>KeepAlive</key>
+	<true/>
+	<key>StandardOutPath</key>
+	<string>/Users/anthonyclavero/.hermes-deepseek/logs/lsh-daemon-supervisor.log</string>
+	<key>StandardErrorPath</key>
+	<string>/Users/anthonyclavero/.hermes-deepseek/logs/lsh-daemon-supervisor.error.log</string>
+</dict>
+</plist>
