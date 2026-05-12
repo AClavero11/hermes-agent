@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import hashlib
 import json
 import os
 import time
@@ -38,6 +39,7 @@ def test_canary_suite_runs_without_live_gateway(tmp_path):
     assert "runtime.imports" in names
     assert "runtime.model_routes" in names
     assert "contract.codex_worker" in names
+    assert "contract.codex_worker_route_audit" in names
     assert "contract.workspace_store" in names
     assert "contract.workflow_registry" in names
     assert "contract.goal_workspace" in names
@@ -474,9 +476,12 @@ def test_canary_writes_markdown_and_json(tmp_path):
     markdown = markdown_path.read_text(encoding="utf-8")
     assert "Hermes Capability Metrics" in markdown
     assert "Frontier readiness" in markdown
+    assert "Quality ladder:" in markdown
+    assert "## Trend Delta" in markdown
     payload = json.loads(json_path.read_text(encoding="utf-8"))
     assert payload["results"]
     assert payload["readiness"]["status"] == "not_frontier_ready"
+    assert payload["trend_delta"]["status"] == "first_run"
     assert payload["markdown_path"] == str(markdown_path)
     assert (tmp_path / "reports" / "latest.json").is_file()
     assert (tmp_path / "reports" / "latest.md").is_file()
@@ -506,6 +511,127 @@ def test_report_markdown_contains_metrics_tables(tmp_path):
     assert payload["effective_max_score"] == report.effective_max_score
     assert payload["readiness"]["total"] >= 8
     assert any(result.status == PASS for result in report.results)
+
+
+def test_codex_worker_route_audit_canary_passes_without_api_tokens(tmp_path):
+    options = CanaryOptions(
+        repo_root=Path(__file__).resolve().parents[2],
+        hermes_home=tmp_path,
+        gateway_url="",
+        env_wrapper=None,
+        require_live=False,
+        timeout=0.2,
+    )
+
+    result = canary_module._canary_codex_worker_route_audit(options)
+
+    assert result.status == PASS
+    assert result.details["checks"]["code_prompt_routes"] is True
+    assert result.details["checks"]["quote_prompt_blocked"] is True
+    assert result.details["checks"]["tool_rejects_push"] is True
+
+
+def test_approved_send_final_packet_includes_risk_grade_and_pdf_hash(tmp_path):
+    pdf_path = tmp_path / "QAMFORM11-preview.pdf"
+    pdf_path.write_bytes(b"%PDF-1.4\n" + (b"x" * 2048))
+    package = {
+        "rehearsal_reference": "hermes-canary-send-20260512143000",
+        "source_draft_package": {
+            "draft_reference": "HERMES-CANARY-DRAFT-20260512143000",
+            "draft_line": {
+                "part_number": "160SG119-3",
+                "quantity": 1,
+                "unit_price": 1250.0,
+                "condition": "SV",
+                "lot": "LOT-HERMES-CANARY",
+                "trace_to": "AAC canary evidence",
+            },
+            "source_rfq_package": {
+                "scenario": "canary_approved_operator_quote",
+                "v11": {
+                    "stock": {"available_internal_quantity": 2},
+                    "customer": {"id": 1001, "name": "Internal Canary Customer"},
+                },
+                "pricing": {
+                    "suggestion": {
+                        "basis": "customer_last_paid",
+                        "candidate_unit_price": 1250.0,
+                        "manual_review_required": False,
+                        "red_flags": [],
+                    },
+                    "master_part_pricing": {
+                        "avg_sale_price": 1200.0,
+                        "max_sale_price": 1300.0,
+                    },
+                },
+            },
+        },
+        "email_draft": {
+            "to": ["ac@advanced.aero"],
+            "subject": "REHEARSAL ONLY - Quote HERMES-CANARY-DRAFT-20260512143000",
+        },
+        "follow_up": {
+            "due_at": "2026-05-13T14:30:00+00:00",
+            "owner": "hermes",
+            "action": "Review operator decision",
+        },
+    }
+    artifacts = {"pdf_path": str(pdf_path)}
+
+    risk_grade = canary_module._build_quote_send_risk_grade(package, artifacts)
+    approval_packet = canary_module._build_final_send_approval_packet(
+        package,
+        artifacts,
+        risk_grade,
+    )
+
+    assert risk_grade["status"] == "pass"
+    assert risk_grade["blocking_count"] == 0
+    assert approval_packet["status"] == "ready_for_explicit_operator_approval"
+    assert approval_packet["send_enabled"] is False
+    assert approval_packet["callbacks"]["approve_send"]["enabled"] is False
+    assert approval_packet["exact_recipient"]["email"] == "ac@advanced.aero"
+    assert approval_packet["pdf"]["sha256"] == hashlib.sha256(
+        pdf_path.read_bytes()
+    ).hexdigest()
+
+
+def test_qamform_preview_falls_back_when_renderer_dependency_missing(monkeypatch, tmp_path):
+    home = tmp_path / "home"
+    service_dir = home / ".hermes" / "services"
+    service_dir.mkdir(parents=True)
+    (service_dir / "quote_pdf.py").write_text(
+        "raise ModuleNotFoundError(\"No module named 'qrcode'\")\n",
+        encoding="utf-8",
+    )
+    monkeypatch.setattr(canary_module.Path, "home", lambda: home)
+    package = {
+        "draft_reference": "HERMES-CANARY-DRAFT-FALLBACK",
+        "source_rfq_package": {
+            "scenario": {
+                "rfq_id": "RFQ-FALLBACK",
+                "customer_name": "Internal Canary Customer",
+            },
+            "pricing": {"suggestion": {"basis": "customer_last_paid"}},
+        },
+        "draft_line": {
+            "part_number": "160SG119-3",
+            "quantity": 1,
+            "unit_price": 1250.0,
+            "condition": "SV",
+        },
+    }
+
+    preview = canary_module._render_approved_rfq_qamform_preview(
+        package,
+        tmp_path / "previews",
+    )
+    pdf_path = Path(preview["pdf_path"])
+
+    assert preview["status"] == "fallback_rendered"
+    assert "qrcode" in preview["fallback_reason"]
+    assert preview["pdf_bytes"] > 500
+    assert pdf_path.read_bytes().startswith(b"%PDF-1.4")
 
 
 def test_score_text_case_accepts_final_numeric_answer():

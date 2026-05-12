@@ -648,6 +648,10 @@ def test_operator_capability_uses_openai_fast_path(monkeypatch):
 
     monkeypatch.setenv("OPENAI_API_KEY", "test-key")
     monkeypatch.setenv("OPENAI_FRONTIER_MODEL", "gpt-test")
+    monkeypatch.setenv("HERMES_OPERATOR_CAPABILITY_ALLOW_API", "1")
+    monkeypatch.setenv("HERMES_OPERATOR_CAPABILITY_PREFER_RUNTIME", "0")
+    monkeypatch.setenv("HERMES_OPERATOR_CAPABILITY_TIMEOUT", "4")
+    monkeypatch.delenv("HERMES_FRONTIER_API_KEY", raising=False)
     monkeypatch.delenv("GEMINI_API_KEY", raising=False)
     monkeypatch.setattr(gateway_run, "_post_json", fake_post_json)
 
@@ -716,7 +720,18 @@ def test_build_hermes_direct_answer_for_quality_score(monkeypatch, tmp_path):
                 "score": 190.0,
                 "effective_max_score": 210.0,
                 "percent": 90.48,
-                "overall_quality": {"score": 8.5},
+                "overall_quality": {
+                    "score": 8.5,
+                    "caps": [
+                        {
+                            "reason": "human-visible Telegram delivery is not currently proven"
+                        }
+                    ],
+                },
+                "trend_delta": {
+                    "status": "compared",
+                    "summary": "score_delta=+15.0; fixed_failed=contract.codex_worker",
+                },
                 "readiness": {
                     "status": "not_frontier_ready",
                     "passed": 6,
@@ -733,6 +748,21 @@ def test_build_hermes_direct_answer_for_quality_score(monkeypatch, tmp_path):
                         "name": "live.telegram_e2e",
                         "status": "warn",
                         "summary": "No live Telegram E2E latency/restart evidence",
+                    },
+                    {
+                        "name": "live.telegram_visible_delivery",
+                        "status": "pass",
+                        "summary": "Visible delivery confirmed by operator ack",
+                    },
+                    {
+                        "name": "live.approved_quote_send_rehearsal",
+                        "status": "pass",
+                        "summary": "Approved quote-send rehearsal prepared internal-only packet",
+                    },
+                    {
+                        "name": "contract.codex_worker_route_audit",
+                        "status": "pass",
+                        "summary": "14/14 Codex-worker route audit checks passed",
                     }
                 ],
             }
@@ -746,9 +776,15 @@ def test_build_hermes_direct_answer_for_quality_score(monkeypatch, tmp_path):
     )
 
     assert result.startswith("Latest Hermes metrics: WARN.")
+    assert "Quality ladder: 8.5/10; caps: human-visible Telegram delivery is not currently proven" in result
     assert "Frontier readiness: NOT_FRONTIER_READY (6/10 gates passed)." in result
     assert "Open gates: local_model_reasoning, hermes_reasoning_eval, frontier_wrapper, telegram_e2e" in result
     assert "Telegram E2E gate: WARN" in result
+    assert "Visible Telegram gate: PASS - Visible delivery confirmed by operator ack" in result
+    assert "Approved-send rehearsal: PASS - Approved quote-send rehearsal prepared internal-only packet" in result
+    assert "real customer send remains approval-gated" in result
+    assert "Codex-worker route audit: PASS - 14/14 Codex-worker route audit checks passed" in result
+    assert "Trend delta: score_delta=+15.0; fixed_failed=contract.codex_worker" in result
     assert "no single quality score claim" in result
     assert str(reports_dir / "latest.json") in result
 

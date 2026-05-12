@@ -55,6 +55,8 @@ _BLOCKED_TASK_PATTERNS: tuple[tuple[re.Pattern[str], str], ...] = (
     (
         re.compile(
             r"\b(git\s+push|push\s+to\s+(github|origin|production|prod)|"
+            r"push\s+(the\s+)?(repo|repository|branch|changes|code)\s+to\s+"
+            r"(github|origin|production|prod)|"
             r"force[-\s]?push|deploy\s+to\s+(prod|production)|"
             r"release\s+to\s+production)\b",
             re.IGNORECASE,

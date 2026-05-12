@@ -735,11 +735,20 @@ def _read_latest_canary_scorecard() -> dict[str, Any]:
     readiness = payload.get("readiness", {})
     if not isinstance(readiness, dict):
         readiness = {}
-    telegram_result: dict[str, Any] = {}
+    result_by_name: dict[str, dict[str, Any]] = {}
     for result in payload.get("results") or []:
-        if isinstance(result, dict) and result.get("name") == "live.telegram_e2e":
-            telegram_result = result
-            break
+        if isinstance(result, dict) and result.get("name"):
+            result_by_name[str(result.get("name"))] = result
+    telegram_result = result_by_name.get("live.telegram_e2e", {})
+    visible_result = result_by_name.get("live.telegram_visible_delivery", {})
+    approved_send_result = result_by_name.get("live.approved_quote_send_rehearsal", {})
+    codex_route_result = result_by_name.get("contract.codex_worker_route_audit", {})
+    trend_delta = payload.get("trend_delta", {})
+    if not isinstance(trend_delta, dict):
+        trend_delta = {}
+    quality_caps = quality.get("caps", [])
+    if not isinstance(quality_caps, list):
+        quality_caps = []
 
     return {
         "path": str(report_path),
@@ -749,6 +758,7 @@ def _read_latest_canary_scorecard() -> dict[str, Any]:
         "max_points": payload.get("effective_max_score"),
         "percent": payload.get("percent"),
         "score": quality.get("score"),
+        "quality_caps": quality_caps,
         "readiness_status": str(readiness.get("status") or "unknown"),
         "readiness_passed": readiness.get("passed"),
         "readiness_total": readiness.get("total"),
@@ -762,6 +772,22 @@ def _read_latest_canary_scorecard() -> dict[str, Any]:
             telegram_result.get("summary")
             or "No live Telegram E2E canary evidence in latest metrics report"
         ),
+        "telegram_visible_status": str(visible_result.get("status") or "missing"),
+        "telegram_visible_summary": str(
+            visible_result.get("summary")
+            or "No visible Telegram delivery canary evidence in latest metrics report"
+        ),
+        "approved_send_status": str(approved_send_result.get("status") or "missing"),
+        "approved_send_summary": str(
+            approved_send_result.get("summary")
+            or "No approved-send rehearsal canary evidence in latest metrics report"
+        ),
+        "codex_route_audit_status": str(codex_route_result.get("status") or "missing"),
+        "codex_route_audit_summary": str(
+            codex_route_result.get("summary")
+            or "No Codex-worker route audit canary evidence in latest metrics report"
+        ),
+        "trend_delta": trend_delta,
     }
 
 
@@ -1006,6 +1032,8 @@ _CODEX_WORKER_DIRECT_BLOCK_RE = re.compile(
     r"\b(quote|rfq|customer|supplier|vendor|client|invoice|purchase order|payment|"
     r"wire|shipment|v11|atlas|aeroxchange)\b|"
     r"\b(git\s+push|push\s+to\s+(?:github|origin|production|prod)|force[-\s]?push|"
+    r"push\s+(?:the\s+)?(?:repo|repository|branch|changes|code)\s+to\s+"
+    r"(?:github|origin|production|prod)|"
     r"deploy\s+to\s+(?:prod|production)|release\s+to\s+production)\b|"
     r"\b(rm\s+-rf|git\s+reset\s+--hard|git\s+clean\s+-fd|drop\s+database|truncate\s+table)\b|"
     r"\b(credential|secret|api key|password)\b",
@@ -1273,7 +1301,8 @@ def _operator_capability_fallback(error: str, *, elapsed: float | None = None) -
         "stuck sessions.\n"
         "- Research/code: digest X/GitHub/vendor links, patch repo issues, and attach "
         "test proof.\n"
-        f"Diagnostic: {diagnostic}\n"
+        f"Fast operator route failed: {diagnostic}\n"
+        "Next safe action: use `/runtime status` to inspect the live route before retrying.\n"
         "Approval required before customer sends, V11/Atlas writes, or destructive actions."
     )
 
@@ -1774,13 +1803,42 @@ def _build_hermes_direct_answer(message: str) -> str:
             readiness_line = f"Frontier readiness: {readiness_status}."
         open_gates = scorecard.get("open_gates") or []
         open_gate_line = "Open gates: " + ", ".join(open_gates[:8]) if open_gates else "Open gates: none reported"
+        quality_score = scorecard.get("score")
+        if isinstance(quality_score, (int, float)):
+            quality_line = f"Quality ladder: {float(quality_score):.1f}/10"
+        else:
+            quality_line = "Quality ladder: unknown"
+        quality_caps = scorecard.get("quality_caps") or []
+        cap_reasons = [
+            str(cap.get("reason") or "")
+            for cap in quality_caps
+            if isinstance(cap, dict) and cap.get("reason")
+        ]
+        quality_line += "; caps: " + ("none" if not cap_reasons else "; ".join(cap_reasons))
+        visible_status = str(scorecard.get("telegram_visible_status") or "missing").upper()
+        visible_summary = str(scorecard.get("telegram_visible_summary") or "")
+        approved_send_status = str(scorecard.get("approved_send_status") or "missing").upper()
+        approved_send_summary = str(scorecard.get("approved_send_summary") or "")
+        codex_route_status = str(scorecard.get("codex_route_audit_status") or "missing").upper()
+        codex_route_summary = str(scorecard.get("codex_route_audit_summary") or "")
+        trend_delta = scorecard.get("trend_delta") or {}
+        trend_summary = (
+            str(trend_delta.get("summary") or trend_delta.get("status") or "unknown")
+            if isinstance(trend_delta, dict)
+            else "unknown"
+        )
         return (
             f"Latest Hermes metrics: {status}.\n"
             f"{points_line}.\n"
+            f"{quality_line}.\n"
             f"{readiness_line}\n"
             f"{open_gate_line}\n"
             f"Telegram E2E gate: {telegram_status} - {telegram_summary}\n"
-            "Rule: no single quality score claim; use readiness gates and raw task metrics.\n"
+            f"Visible Telegram gate: {visible_status} - {visible_summary}\n"
+            f"Approved-send rehearsal: {approved_send_status} - {approved_send_summary}; real customer send remains approval-gated.\n"
+            f"Codex-worker route audit: {codex_route_status} - {codex_route_summary}\n"
+            f"Trend delta: {trend_summary}\n"
+            "Rule: no single quality score claim without readiness gates; report coverage, quality ladder, caps, and open gates together.\n"
             f"Source: `{scorecard.get('path')}`"
         )
     mentions_alexandria = "alexandria" in lowered

@@ -48,6 +48,13 @@ def test_validate_codex_worker_task_blocks_external_quote_send():
     assert "external-facing" in error
 
 
+def test_validate_codex_worker_task_blocks_push_to_github():
+    error = cwt.validate_codex_worker_task("push the repo to github")
+
+    assert error
+    assert "pushes and production deploys" in error
+
+
 def test_validate_codex_worker_task_requires_coding_signal():
     error = cwt.validate_codex_worker_task("what should I cook tonight?")
 

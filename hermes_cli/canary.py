@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import argparse
 import csv
+import hashlib
 import importlib
 import importlib.util
 import json
@@ -607,6 +608,74 @@ def _canary_codex_worker_contract(options: CanaryOptions) -> CanaryResult:
         10,
         "Codex worker registered, safety-gated, direct-routed, and logged in using ChatGPT",
         details,
+    )
+
+
+def _canary_codex_worker_route_audit(options: CanaryOptions) -> CanaryResult:
+    from tools import codex_worker_tool
+    from gateway import run as gateway_run
+
+    api_server_path = options.repo_root / "gateway" / "platforms" / "api_server.py"
+    gateway_run_path = options.repo_root / "gateway" / "run.py"
+    tool_path = options.repo_root / "tools" / "codex_worker_tool.py"
+    try:
+        api_server_text = api_server_path.read_text(encoding="utf-8")
+    except OSError:
+        api_server_text = ""
+    try:
+        gateway_run_text = gateway_run_path.read_text(encoding="utf-8")
+    except OSError:
+        gateway_run_text = ""
+    try:
+        tool_text = tool_path.read_text(encoding="utf-8")
+    except OSError:
+        tool_text = ""
+
+    code_prompt = "repair the Hermes repo and run focused tests"
+    read_only_prompt = "review gateway/run.py read-only and explain the bug"
+    blocked_quote_prompt = "send this quote to the customer by email"
+    blocked_push_prompt = "push the repo to github"
+    generic_prompt = "what can you do"
+    checks = {
+        "code_prompt_routes": bool(gateway_run._is_codex_worker_candidate_prompt(code_prompt)),
+        "read_only_prompt_routes": bool(gateway_run._is_codex_worker_candidate_prompt(read_only_prompt)),
+        "read_only_sandbox": gateway_run._codex_worker_sandbox_for_message(read_only_prompt) == "read-only",
+        "mutation_sandbox": gateway_run._codex_worker_sandbox_for_message(code_prompt) == "workspace-write",
+        "quote_prompt_blocked": not bool(gateway_run._is_codex_worker_candidate_prompt(blocked_quote_prompt)),
+        "push_prompt_blocked": not bool(gateway_run._is_codex_worker_candidate_prompt(blocked_push_prompt)),
+        "generic_prompt_blocked": not bool(gateway_run._is_codex_worker_candidate_prompt(generic_prompt)),
+        "tool_rejects_quote": bool(codex_worker_tool.validate_codex_worker_task(blocked_quote_prompt)),
+        "tool_rejects_push": bool(codex_worker_tool.validate_codex_worker_task(blocked_push_prompt)),
+        "tool_allows_code": codex_worker_tool.validate_codex_worker_task(code_prompt) is None,
+        "telegram_direct_hook_present": "_run_codex_worker_direct_path(event.text" in gateway_run_text
+        or "_run_codex_worker_direct_path(event.text or" in gateway_run_text,
+        "api_chat_shortcut_present": "_gateway_codex_worker_reply_text" in api_server_text
+        and "codex_worker_reply" in api_server_text,
+        "zero_api_user_message": "zero Hermes planner/API call" in gateway_run_text,
+        "sensitive_env_stripped": "_SENSITIVE_ENV_PREFIXES" in tool_text
+        and "_build_codex_env" in tool_text,
+    }
+    failed = {name: value for name, value in checks.items() if not value}
+    score = round(15.0 * (len(checks) - len(failed)) / len(checks), 1)
+    status = PASS if not failed else FAIL
+    return _result(
+        "contract.codex_worker_route_audit",
+        status,
+        score,
+        15,
+        f"{len(checks) - len(failed)}/{len(checks)} Codex-worker route audit checks passed",
+        {
+            "checks": checks,
+            "failed": failed,
+            "prompts": {
+                "code": code_prompt,
+                "read_only": read_only_prompt,
+                "blocked_quote": blocked_quote_prompt,
+                "blocked_push": blocked_push_prompt,
+                "generic": generic_prompt,
+            },
+            "failure_class": "codex_route_audit_failed" if failed else "",
+        },
     )
 
 
@@ -5370,6 +5439,121 @@ def _build_approved_rfq_draft_package(options: CanaryOptions) -> dict[str, Any]:
     }
 
 
+def _safe_filename_fragment(value: Any, fallback: str = "hermes-canary") -> str:
+    text = str(value or fallback)
+    safe = "".join(ch if ch.isalnum() or ch in {"-", "_"} else "-" for ch in text)
+    return safe or fallback
+
+
+def _escape_pdf_text(value: Any) -> str:
+    text = str(value or "")
+    return text.replace("\\", "\\\\").replace("(", "\\(").replace(")", "\\)")
+
+
+def _build_minimal_qamform_preview_pdf(
+    package: dict[str, Any],
+    *,
+    fallback_reason: str,
+) -> bytes:
+    source = package.get("source_rfq_package") or {}
+    scenario = source.get("scenario") or {}
+    line = package.get("draft_line") or {}
+    pricing = source.get("pricing") or {}
+    suggestion = pricing.get("suggestion") or {}
+    rows = [
+        "QAMFORM11 Quotation Preview",
+        f"Draft: {package.get('draft_reference', 'HERMES-CANARY-DRAFT')}",
+        f"Customer: {scenario.get('customer_name', 'Hermes Canary Customer')}",
+        f"RFQ: {scenario.get('rfq_id', '')}",
+        f"Part: {line.get('part_number', '')}",
+        f"Qty: {line.get('quantity', '')}",
+        f"Condition: {line.get('condition', '')}",
+        f"Unit price: {line.get('unit_price', '')}",
+        f"Pricing basis: {suggestion.get('basis', '')}",
+        "State: draft preview only",
+        "Customer send: disabled",
+        f"Fallback renderer: {fallback_reason[:180]}",
+    ]
+    text_ops = ["BT", "/F1 11 Tf", "72 740 Td"]
+    for index, row in enumerate(rows):
+        if index:
+            text_ops.append("0 -18 Td")
+        text_ops.append(f"({_escape_pdf_text(row)}) Tj")
+    text_ops.append("ET")
+    stream = "\n".join(text_ops).encode("latin-1", errors="replace")
+    objects = [
+        b"<< /Type /Catalog /Pages 2 0 R >>",
+        b"<< /Type /Pages /Kids [3 0 R] /Count 1 >>",
+        b"<< /Type /Page /Parent 2 0 R /MediaBox [0 0 612 792] "
+        b"/Resources << /Font << /F1 4 0 R >> >> /Contents 5 0 R >>",
+        b"<< /Type /Font /Subtype /Type1 /BaseFont /Helvetica >>",
+        b"<< /Length "
+        + str(len(stream)).encode("ascii")
+        + b" >>\nstream\n"
+        + stream
+        + b"\nendstream",
+    ]
+    pdf = bytearray(b"%PDF-1.4\n")
+    offsets = [0]
+    for number, body in enumerate(objects, start=1):
+        offsets.append(len(pdf))
+        pdf.extend(f"{number} 0 obj\n".encode("ascii"))
+        pdf.extend(body)
+        pdf.extend(b"\nendobj\n")
+    xref_offset = len(pdf)
+    pdf.extend(f"xref\n0 {len(objects) + 1}\n".encode("ascii"))
+    pdf.extend(b"0000000000 65535 f \n")
+    for offset in offsets[1:]:
+        pdf.extend(f"{offset:010d} 00000 n \n".encode("ascii"))
+    pdf.extend(
+        (
+            f"trailer\n<< /Size {len(objects) + 1} /Root 1 0 R >>\n"
+            f"startxref\n{xref_offset}\n%%EOF\n"
+        ).encode("ascii")
+    )
+    return bytes(pdf)
+
+
+def _write_qamform_preview_pdf(
+    package: dict[str, Any],
+    output_dir: Path,
+    pdf_bytes: bytes,
+    *,
+    status: str,
+    fallback_reason: str = "",
+) -> dict[str, Any]:
+    if not pdf_bytes:
+        raise RuntimeError("QAMFORM renderer returned empty PDF")
+    output_dir.mkdir(parents=True, exist_ok=True)
+    safe_ref = _safe_filename_fragment(package.get("draft_reference"))
+    pdf_path = output_dir / f"{safe_ref}-QAMFORM11-preview.pdf"
+    pdf_path.write_bytes(pdf_bytes)
+    preview = {
+        "status": status,
+        "qamform_id": "QAMFORM11",
+        "state": "draft",
+        "pdf_path": str(pdf_path),
+        "pdf_bytes": len(pdf_bytes),
+    }
+    if fallback_reason:
+        preview["fallback_reason"] = fallback_reason
+    return preview
+
+
+def _write_fallback_qamform_preview(
+    package: dict[str, Any],
+    output_dir: Path,
+    reason: str,
+) -> dict[str, Any]:
+    return _write_qamform_preview_pdf(
+        package,
+        output_dir,
+        _build_minimal_qamform_preview_pdf(package, fallback_reason=reason),
+        status="fallback_rendered",
+        fallback_reason=reason,
+    )
+
+
 def _render_approved_rfq_qamform_preview(
     package: dict[str, Any],
     output_dir: Path,
@@ -5377,13 +5561,18 @@ def _render_approved_rfq_qamform_preview(
     service_dir = Path.home() / ".hermes" / "services"
     quote_pdf_path = service_dir / "quote_pdf.py"
     if not quote_pdf_path.is_file():
-        raise FileNotFoundError(str(quote_pdf_path))
+        return _write_fallback_qamform_preview(
+            package,
+            output_dir,
+            f"quote_pdf renderer missing: {quote_pdf_path}",
+        )
     previous_dyld_fallback = os.environ.get("DYLD_FALLBACK_LIBRARY_PATH", "")
     homebrew_lib = "/opt/homebrew/lib"
     if Path(homebrew_lib).is_dir():
         paths = [path for path in previous_dyld_fallback.split(":") if path]
         if homebrew_lib not in paths:
             os.environ["DYLD_FALLBACK_LIBRARY_PATH"] = ":".join([homebrew_lib, *paths])
+    pdf_bytes = b""
     try:
         spec = importlib.util.spec_from_file_location("hermes_canary_quote_pdf", quote_pdf_path)
         if spec is None or spec.loader is None:
@@ -5454,27 +5643,35 @@ def _render_approved_rfq_qamform_preview(
             so_data,
             access_url=f"https://advanced.aero/d/{package.get('draft_reference', 'hermes-canary')}",
         )
+    except ModuleNotFoundError as exc:
+        return _write_fallback_qamform_preview(
+            package,
+            output_dir,
+            f"quote_pdf optional dependency missing: {exc}",
+        )
+    except Exception as exc:
+        return _write_fallback_qamform_preview(
+            package,
+            output_dir,
+            f"quote_pdf renderer failed: {type(exc).__name__}: {exc}",
+        )
     finally:
         if previous_dyld_fallback:
             os.environ["DYLD_FALLBACK_LIBRARY_PATH"] = previous_dyld_fallback
         else:
             os.environ.pop("DYLD_FALLBACK_LIBRARY_PATH", None)
     if not pdf_bytes:
-        raise RuntimeError("QAMFORM renderer returned empty PDF")
-    output_dir.mkdir(parents=True, exist_ok=True)
-    safe_ref = "".join(
-        ch if ch.isalnum() or ch in {"-", "_"} else "-"
-        for ch in str(package.get("draft_reference") or "hermes-canary")
+        return _write_fallback_qamform_preview(
+            package,
+            output_dir,
+            "quote_pdf renderer returned empty PDF",
+        )
+    return _write_qamform_preview_pdf(
+        package,
+        output_dir,
+        pdf_bytes,
+        status="rendered",
     )
-    pdf_path = output_dir / f"{safe_ref}-QAMFORM11-preview.pdf"
-    pdf_path.write_bytes(pdf_bytes)
-    return {
-        "status": "rendered",
-        "qamform_id": "QAMFORM11",
-        "state": "draft",
-        "pdf_path": str(pdf_path),
-        "pdf_bytes": len(pdf_bytes),
-    }
 
 
 def _render_approved_rfq_draft_markdown(package: dict[str, Any]) -> str:
@@ -5665,6 +5862,228 @@ def _is_internal_test_recipient(email: str) -> bool:
     return bool(normalized and normalized.endswith("@advanced.aero"))
 
 
+def _file_sha256(path: str | Path) -> str:
+    target = Path(path)
+    digest = hashlib.sha256()
+    with target.open("rb") as handle:
+        for chunk in iter(lambda: handle.read(1024 * 1024), b""):
+            digest.update(chunk)
+    return digest.hexdigest()
+
+
+def _risk_check(
+    name: str,
+    ok: bool,
+    severity: str,
+    summary: str,
+    evidence: dict[str, Any] | None = None,
+) -> dict[str, Any]:
+    return {
+        "name": name,
+        "status": "pass" if ok else severity,
+        "severity": "" if ok else severity,
+        "summary": summary,
+        "evidence": evidence or {},
+    }
+
+
+def _build_quote_send_risk_grade(
+    package: dict[str, Any],
+    artifacts: dict[str, str],
+) -> dict[str, Any]:
+    source = package.get("source_draft_package") or {}
+    rfq_source = source.get("source_rfq_package") or {}
+    v11 = rfq_source.get("v11") or {}
+    pricing = rfq_source.get("pricing") or {}
+    line = source.get("draft_line") or {}
+    stock = v11.get("stock") or {}
+    customer = v11.get("customer") or {}
+    suggestion = pricing.get("suggestion") or {}
+    master_pricing = pricing.get("master_part_pricing") or {}
+    pdf_path = artifacts.get("pdf_path", "")
+
+    quantity = _float_or_zero(line.get("quantity")) or 1.0
+    unit_price = _float_or_zero(line.get("unit_price"))
+    available_quantity = _float_or_zero(stock.get("available_internal_quantity"))
+    avg_sale = _float_or_zero(master_pricing.get("avg_sale_price"))
+    max_sale = _float_or_zero(master_pricing.get("max_sale_price"))
+    basis = str(suggestion.get("basis") or "")
+    lot = str(line.get("lot") or "")
+    trace_to = str(line.get("trace_to") or line.get("trace") or "").strip()
+    condition = str(line.get("condition") or "").upper()
+    customer_name = str(customer.get("name") or "").lower()
+
+    price_not_weird = unit_price > 0
+    price_review_reason = ""
+    if unit_price <= 0:
+        price_review_reason = "unit price is zero or missing"
+    elif avg_sale and unit_price < avg_sale * 0.5:
+        price_not_weird = False
+        price_review_reason = "unit price is less than 50% of average sale"
+    elif max_sale and unit_price > max_sale * 3:
+        price_not_weird = False
+        price_review_reason = "unit price is more than 3x max historical sale"
+
+    price_basis_recent = basis in {
+        "customer_last_paid",
+        "general_last_sale_support",
+        "master_history_or_oem_support",
+    }
+    blocked_customer_terms = ("blocked", "do not sell", "do-not-sell", "sanction")
+    customer_not_blocked = bool(customer.get("id")) and not any(
+        term in customer_name for term in blocked_customer_terms
+    )
+    qamform_exists = bool(pdf_path) and Path(pdf_path).is_file() and Path(pdf_path).stat().st_size > 1000
+    lead_time_review_needed = condition in {"SV", "OH", "RP"} and not lot
+
+    checks = [
+        _risk_check(
+            "missing_qamform",
+            qamform_exists,
+            "block",
+            "QAMFORM preview exists and is non-empty",
+            {"pdf_path": pdf_path},
+        ),
+        _risk_check(
+            "zero_stock",
+            available_quantity >= quantity,
+            "block",
+            "Internal available stock covers quoted quantity",
+            {"available_quantity": available_quantity, "quoted_quantity": quantity},
+        ),
+        _risk_check(
+            "blocked_customer",
+            customer_not_blocked,
+            "block",
+            "Customer is present and not marked by blocked-customer heuristics",
+            {"customer_id": customer.get("id"), "customer_name": customer.get("name")},
+        ),
+        _risk_check(
+            "weird_margin_or_price",
+            price_not_weird,
+            "review",
+            price_review_reason or "Unit price is within deterministic historical sanity bounds",
+            {"unit_price": unit_price, "avg_sale": avg_sale, "max_sale": max_sale},
+        ),
+        _risk_check(
+            "stale_or_unsupported_price",
+            bool(price_basis_recent) and not bool(suggestion.get("manual_review_required")),
+            "review",
+            "Price basis is recent/supported and no manual review flag is active",
+            {
+                "basis": basis,
+                "manual_review_required": bool(suggestion.get("manual_review_required")),
+                "red_flags": suggestion.get("red_flags") or [],
+            },
+        ),
+        _risk_check(
+            "trace_missing",
+            bool(trace_to or lot),
+            "review",
+            "Trace/lot evidence is present for operator review",
+            {"trace_to": trace_to, "lot": lot},
+        ),
+        _risk_check(
+            "lead_time_condition_mismatch",
+            not lead_time_review_needed,
+            "review",
+            "Condition/lot evidence is sufficient for lead-time wording review",
+            {"condition": condition, "lot": lot},
+        ),
+    ]
+    blocking = [item for item in checks if item["status"] == "block"]
+    review = [item for item in checks if item["status"] == "review"]
+    status = "blocked" if blocking else "review_required" if review else "pass"
+    return {
+        "status": status,
+        "checks": checks,
+        "blocking_count": len(blocking),
+        "review_count": len(review),
+        "required_operator_review": bool(blocking or review),
+        "summary": (
+            "Send blocked by deterministic risk checks"
+            if blocking
+            else "Operator review required before send"
+            if review
+            else "No deterministic send risks detected"
+        ),
+    }
+
+
+def _build_final_send_approval_packet(
+    package: dict[str, Any],
+    artifacts: dict[str, str],
+    risk_grade: dict[str, Any],
+) -> dict[str, Any]:
+    source = package.get("source_draft_package") or {}
+    rfq_source = source.get("source_rfq_package") or {}
+    pricing = rfq_source.get("pricing") or {}
+    suggestion = pricing.get("suggestion") or {}
+    line = source.get("draft_line") or {}
+    email_draft = package.get("email_draft") or {}
+    follow_up = package.get("follow_up") or {}
+    attachment_path = artifacts.get("pdf_path", "")
+    pdf_sha256 = _file_sha256(attachment_path) if attachment_path and Path(attachment_path).is_file() else ""
+    recipients = [str(item) for item in (email_draft.get("to") or [])]
+    reference = str(package.get("rehearsal_reference") or "")
+    return {
+        "status": "blocked_pending_risk_review"
+        if risk_grade.get("blocking_count")
+        else "ready_for_explicit_operator_approval",
+        "send_enabled": False,
+        "requires_explicit_operator_approval": True,
+        "real_customer_send_approved": False,
+        "exact_recipient": {
+            "mode": "internal_test_rehearsal",
+            "email": recipients[0] if recipients else "",
+            "customer_recipient_verified": False,
+        },
+        "subject": str(email_draft.get("subject") or ""),
+        "pdf": {
+            "path": attachment_path,
+            "sha256": pdf_sha256,
+            "bytes": Path(attachment_path).stat().st_size
+            if attachment_path and Path(attachment_path).is_file()
+            else 0,
+        },
+        "price": {
+            "part_number": line.get("part_number", ""),
+            "quantity": _float_or_zero(line.get("quantity")),
+            "unit_price": _float_or_zero(line.get("unit_price")),
+            "basis": suggestion.get("basis", ""),
+            "manual_review_required": bool(suggestion.get("manual_review_required")),
+            "red_flags": suggestion.get("red_flags") or [],
+        },
+        "trace": {
+            "lot": line.get("lot", ""),
+            "trace_to": line.get("trace_to", ""),
+            "condition": line.get("condition", ""),
+            "operator_must_verify": True,
+        },
+        "follow_up": {
+            "due_at": follow_up.get("due_at", ""),
+            "owner": follow_up.get("owner", ""),
+            "action": follow_up.get("action", ""),
+        },
+        "risk_grade": {
+            "status": risk_grade.get("status", ""),
+            "blocking_count": risk_grade.get("blocking_count", 0),
+            "review_count": risk_grade.get("review_count", 0),
+        },
+        "callbacks": {
+            "approve_send": {
+                "callback_data": f"quote_send_approve:{reference}",
+                "enabled": False,
+                "reason": "real customer send requires explicit live operator approval",
+            },
+            "reject": {
+                "callback_data": f"quote_send_reject:{reference}",
+                "enabled": True,
+            },
+        },
+    }
+
+
 def _build_approved_quote_send_rehearsal_package(options: CanaryOptions) -> dict[str, Any]:
     draft_package = _build_approved_rfq_draft_package(options)
     draft_artifacts = _write_approved_rfq_draft_artifacts(options, draft_package)
@@ -5722,7 +6141,7 @@ def _build_approved_quote_send_rehearsal_package(options: CanaryOptions) -> dict
             "due_at": follow_up_due_at,
         },
     ]
-    return {
+    package = {
         "schema_version": 1,
         "created_at": datetime.now(timezone.utc).replace(microsecond=0).isoformat(),
         "mode": "approved_quote_send_rehearsal",
@@ -5806,6 +6225,14 @@ def _build_approved_quote_send_rehearsal_package(options: CanaryOptions) -> dict
             "write_methods_called": [],
         },
     }
+    risk_grade = _build_quote_send_risk_grade(package, draft_artifacts)
+    package["risk_grader"] = risk_grade
+    package["final_send_approval_packet"] = _build_final_send_approval_packet(
+        package,
+        draft_artifacts,
+        risk_grade,
+    )
+    return package
 
 
 def _render_approved_send_rehearsal_markdown(package: dict[str, Any]) -> str:
@@ -5813,6 +6240,8 @@ def _render_approved_send_rehearsal_markdown(package: dict[str, Any]) -> str:
     draft_line = source.get("draft_line") or {}
     email_draft = package.get("email_draft") or {}
     follow_up = package.get("follow_up") or {}
+    risk_grade = package.get("risk_grader") or {}
+    approval_packet = package.get("final_send_approval_packet") or {}
     guardrails = package.get("guardrails") or {}
     return "\n".join(
         [
@@ -5825,6 +6254,8 @@ def _render_approved_send_rehearsal_markdown(package: dict[str, Any]) -> str:
             f"- Unit price: ${_float_or_zero(draft_line.get('unit_price')):,.2f}",
             f"- Test recipient: {', '.join(email_draft.get('to') or [])}",
             f"- QAMFORM attachment: {((email_draft.get('attachments') or [{}])[0]).get('path', '')}",
+            f"- PDF SHA256: {((approval_packet.get('pdf') or {}).get('sha256', ''))}",
+            f"- Risk grade: {risk_grade.get('status', '')}",
             f"- Follow-up due: {follow_up.get('due_at', '')}",
             "",
             "## Guardrails",
@@ -5970,6 +6401,8 @@ def _canary_approved_quote_send_rehearsal(options: CanaryOptions) -> CanaryResul
     audit = package.get("audit") or {}
     follow_up = package.get("follow_up") or {}
     exception_surface = package.get("exception_surface") or {}
+    risk_grade = package.get("risk_grader") or {}
+    approval_packet = package.get("final_send_approval_packet") or {}
     to_recipients = [str(item) for item in (email_draft.get("to") or [])]
     audit_events = audit.get("events") if isinstance(audit.get("events"), list) else []
     event_types = {str(event.get("event_type") or "") for event in audit_events if isinstance(event, dict)}
@@ -6007,6 +6440,33 @@ def _canary_approved_quote_send_rehearsal(options: CanaryOptions) -> CanaryResul
         and follow_up.get("customer_facing") is False,
         "exception_surface_ready": exception_surface.get("status") == "prepared"
         and len(exception_surface.get("exceptions") or []) >= 4,
+        "risk_grader_complete": {
+            item.get("name")
+            for item in (risk_grade.get("checks") or [])
+            if isinstance(item, dict)
+        }
+        >= {
+            "missing_qamform",
+            "zero_stock",
+            "blocked_customer",
+            "weird_margin_or_price",
+            "stale_or_unsupported_price",
+            "trace_missing",
+            "lead_time_condition_mismatch",
+        },
+        "final_send_approval_packet_ready": bool(approval_packet.get("subject"))
+        and bool((approval_packet.get("exact_recipient") or {}).get("email"))
+        and bool((approval_packet.get("pdf") or {}).get("sha256"))
+        and bool((approval_packet.get("price") or {}).get("basis"))
+        and bool((approval_packet.get("follow_up") or {}).get("due_at")),
+        "approval_callbacks_guarded": (
+            (approval_packet.get("callbacks") or {}).get("approve_send") or {}
+        ).get("enabled")
+        is False
+        and (
+            (approval_packet.get("callbacks") or {}).get("reject") or {}
+        ).get("enabled")
+        is True,
         "workspace_task_created": bool((package.get("workspace") or {}).get("task_id")),
     }
     failed = {name: value for name, value in checks.items() if not value}
@@ -6027,6 +6487,11 @@ def _canary_approved_quote_send_rehearsal(options: CanaryOptions) -> CanaryResul
             "rehearsal_reference": package.get("rehearsal_reference", ""),
             "recipient_mode": "internal_test_only",
             "real_customer_send": False,
+            "risk_grade": {
+                "status": risk_grade.get("status", ""),
+                "blocking_count": risk_grade.get("blocking_count", 0),
+                "review_count": risk_grade.get("review_count", 0),
+            },
             "failure_class": "missing_evidence" if failed else "",
         },
     )
@@ -6177,6 +6642,7 @@ def run_canary_suite(options: CanaryOptions) -> CanaryReport:
         ("runtime.model_route", 15, lambda: _canary_model_route(options)),
         ("runtime.model_routes", 20, lambda: _canary_model_routes(options)),
         ("contract.codex_worker", 10, lambda: _canary_codex_worker_contract(options)),
+        ("contract.codex_worker_route_audit", 15, lambda: _canary_codex_worker_route_audit(options)),
         ("live.gateway_health", 15, lambda: _canary_gateway_health(options)),
         ("contract.command_registry", 10, _canary_command_registry),
         ("contract.x_scrape", 10, _canary_x_scrape_contract),
@@ -6878,12 +7344,108 @@ def report_to_dict(report: CanaryReport) -> dict[str, Any]:
     }
 
 
-def render_markdown(report: CanaryReport) -> str:
+def _as_name_set(value: Any) -> set[str]:
+    if not isinstance(value, list):
+        return set()
+    return {str(item) for item in value if str(item)}
+
+
+def _build_trend_delta(history_path: Path, payload: dict[str, Any]) -> dict[str, Any]:
+    previous: dict[str, Any] = {}
+    try:
+        for line in reversed(history_path.read_text(encoding="utf-8").splitlines()):
+            if not line.strip():
+                continue
+            loaded = json.loads(line)
+            if isinstance(loaded, dict):
+                previous = loaded
+                break
+    except (OSError, json.JSONDecodeError):
+        previous = {}
+
+    current_failed = {
+        str(result.get("name"))
+        for result in payload.get("results", [])
+        if isinstance(result, dict) and result.get("status") == FAIL and result.get("name")
+    }
+    current_warned = {
+        str(result.get("name"))
+        for result in payload.get("results", [])
+        if isinstance(result, dict) and result.get("status") == WARN and result.get("name")
+    }
+    current_skipped = {
+        str(result.get("name"))
+        for result in payload.get("results", [])
+        if isinstance(result, dict) and result.get("status") == SKIP and result.get("name")
+    }
+    if not previous:
+        return {
+            "status": "first_run",
+            "summary": "No previous history row available for trend diff",
+            "score_delta": None,
+            "percent_delta": None,
+            "overall_score_delta": None,
+            "new_failed": sorted(current_failed),
+            "fixed_failed": [],
+            "new_warned": sorted(current_warned),
+            "fixed_warned": [],
+            "new_skipped": sorted(current_skipped),
+            "fixed_skipped": [],
+        }
+
+    previous_failed = _as_name_set(previous.get("failed"))
+    previous_warned = _as_name_set(previous.get("warned"))
+    previous_skipped = _as_name_set(previous.get("skipped"))
+    score_delta = round(float(payload.get("score") or 0) - float(previous.get("score") or 0), 1)
+    percent_delta = round(float(payload.get("percent") or 0) - float(previous.get("percent") or 0), 2)
+    overall_score_delta = round(
+        float((payload.get("overall_quality") or {}).get("score") or 0)
+        - float(previous.get("overall_score") or 0),
+        1,
+    )
+    new_failed = sorted(current_failed - previous_failed)
+    fixed_failed = sorted(previous_failed - current_failed)
+    new_warned = sorted(current_warned - previous_warned)
+    fixed_warned = sorted(previous_warned - current_warned)
+    new_skipped = sorted(current_skipped - previous_skipped)
+    fixed_skipped = sorted(previous_skipped - current_skipped)
+    summary_parts = [
+        f"score_delta={score_delta:+.1f}",
+        f"percent_delta={percent_delta:+.2f}",
+        f"overall_delta={overall_score_delta:+.1f}",
+    ]
+    if new_failed:
+        summary_parts.append(f"new_failed={','.join(new_failed)}")
+    if fixed_failed:
+        summary_parts.append(f"fixed_failed={','.join(fixed_failed)}")
+    return {
+        "status": "compared",
+        "previous_json_path": previous.get("json_path", ""),
+        "score_delta": score_delta,
+        "percent_delta": percent_delta,
+        "overall_score_delta": overall_score_delta,
+        "new_failed": new_failed,
+        "fixed_failed": fixed_failed,
+        "new_warned": new_warned,
+        "fixed_warned": fixed_warned,
+        "new_skipped": new_skipped,
+        "fixed_skipped": fixed_skipped,
+        "summary": "; ".join(summary_parts),
+    }
+
+
+def _format_trend_list(items: list[str]) -> str:
+    return ", ".join(items) if items else "none"
+
+
+def render_markdown(report: CanaryReport, trend_delta: dict[str, Any] | None = None) -> str:
     generated = time.strftime(
         "%Y-%m-%d %H:%M:%S %Z",
         time.localtime(report.finished_at),
     )
     readiness = readiness_summary(report)
+    quality = quality_summary(report)
+    caps = quality.get("caps") or []
     lines = [
         "# Hermes Capability Metrics",
         "",
@@ -6892,10 +7454,28 @@ def render_markdown(report: CanaryReport) -> str:
         f"Measured gate coverage: {report.score:.1f}/{report.effective_max_score:.1f} ({report.percent:.1f}%)",
         f"Gate: {report.fail_under:.1f}%",
         f"Frontier readiness: {readiness['status'].upper()} ({readiness['passed']}/{readiness['total']} gates passed)",
+        f"Quality ladder: {float(quality.get('score') or 0):.1f}/10",
+        f"Quality caps: {'none' if not caps else '; '.join(str(cap.get('reason', '')) for cap in caps)}",
         "",
         "## Runtime Snapshot",
         "",
     ]
+    if trend_delta:
+        lines.extend(
+            [
+                "## Trend Delta",
+                "",
+                f"- Status: `{trend_delta.get('status', '')}`",
+                f"- Summary: {trend_delta.get('summary', '')}",
+                f"- New failures: {_format_trend_list(trend_delta.get('new_failed') or [])}",
+                f"- Fixed failures: {_format_trend_list(trend_delta.get('fixed_failed') or [])}",
+                f"- New warnings: {_format_trend_list(trend_delta.get('new_warned') or [])}",
+                f"- Fixed warnings: {_format_trend_list(trend_delta.get('fixed_warned') or [])}",
+                f"- New skips: {_format_trend_list(trend_delta.get('new_skipped') or [])}",
+                f"- Fixed skips: {_format_trend_list(trend_delta.get('fixed_skipped') or [])}",
+                "",
+            ]
+        )
     runtime = report.runtime or {}
     wrapper = runtime.get("wrapper", {}) if isinstance(runtime, dict) else {}
     model = runtime.get("model", {}) if isinstance(runtime, dict) else {}
@@ -6946,13 +7526,12 @@ def render_markdown(report: CanaryReport) -> str:
         )
         summary = result.summary.replace("|", "\\|").replace("\n", " ")
         lines.append(f"| `{result.name}` | {result.status.upper()} | {score} | {summary} |")
-    quality = quality_summary(report)
     lines.extend(
         [
             "",
-            "## Legacy Heuristic",
+            "## Quality Dimensions",
             "",
-            "This section is retained for trend compatibility. Readiness gates above are authoritative.",
+            "Readiness gates and raw checks are authoritative; this ladder summarizes operational maturity.",
             "",
             "| Dimension | Score | Summary | Next Increment |",
             "|---|---:|---|---|",
@@ -6967,7 +7546,7 @@ def render_markdown(report: CanaryReport) -> str:
                 next_increment=dimension["next_increment"].replace("|", "\\|"),
             )
         )
-    lines.extend(["", "## Legacy Ladder", ""])
+    lines.extend(["", "## Quality Ladder", ""])
     for item in quality["increments"]:
         lines.append(f"- `{item['target']}` [{item['status']}] {item['increment']}")
     lines.extend(["", "## Details", ""])
@@ -7006,7 +7585,9 @@ def write_report(report: CanaryReport, output_dir: Path) -> CanaryReport:
     report.json_path = str(json_path)
     report.markdown_path = str(markdown_path)
     payload = report_to_dict(report)
-    markdown = render_markdown(report)
+    trend_delta = _build_trend_delta(history_path, payload)
+    payload["trend_delta"] = trend_delta
+    markdown = render_markdown(report, trend_delta=trend_delta)
     json_path.write_text(
         json.dumps(payload, indent=2, sort_keys=True) + "\n",
         encoding="utf-8",
@@ -7038,6 +7619,7 @@ def write_report(report: CanaryReport, output_dir: Path) -> CanaryReport:
             .get("runtime_repo", {})
             .get("short_sha", "")
         ),
+        "trend_delta": trend_delta,
         "failed": [result.name for result in report.results if result.status == FAIL],
         "warned": [result.name for result in report.results if result.status == WARN],
         "skipped": [result.name for result in report.results if result.status == SKIP],
@@ -7049,10 +7631,17 @@ def write_report(report: CanaryReport, output_dir: Path) -> CanaryReport:
 
 def _print_text_summary(report: CanaryReport) -> None:
     readiness = readiness_summary(report)
+    quality = quality_summary(report)
+    caps = quality.get("caps") or []
     print("Hermes Capability Metrics")
     print(f"Status: {report.status.upper()}")
     print(f"Measured gate coverage: {report.score:.1f}/{report.effective_max_score:.1f} ({report.percent:.1f}%)")
     print(f"Frontier readiness: {readiness['status'].upper()} ({readiness['passed']}/{readiness['total']} gates passed)")
+    print(f"Quality ladder: {float(quality.get('score') or 0):.1f}/10")
+    print(
+        "Quality caps: "
+        + ("none" if not caps else "; ".join(str(cap.get("reason", "")) for cap in caps))
+    )
     if report.markdown_path:
         print(f"Markdown: {report.markdown_path}")
     if report.json_path:
