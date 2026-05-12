@@ -7252,6 +7252,18 @@ For more help on a command:
         help="Build an approved-RFQ draft payload, QAMFORM preview, and Telegram approval-card artifact; writes/sends remain disabled",
     )
     canary_parser.add_argument(
+        "--approved-send-rehearsal",
+        action="store_true",
+        default=os.getenv("HERMES_CANARY_APPROVED_SEND_REHEARSAL", "")
+        .strip()
+        .lower()
+        in {"1", "true", "yes", "on"},
+        help=(
+            "Build an approved quote-send rehearsal packet with internal/test "
+            "recipient, audit proof, follow-up schedule, and customer sends disabled"
+        ),
+    )
+    canary_parser.add_argument(
         "--api-key",
         default=os.getenv("HERMES_CANARY_API_KEY", ""),
         help="API key for live /v1/responses canaries",

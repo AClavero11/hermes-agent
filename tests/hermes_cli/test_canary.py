@@ -100,8 +100,17 @@ def test_canary_suite_runs_without_live_gateway(tmp_path):
         result.name == "live.approved_rfq_draft_quote" and result.status == SKIP
         for result in report.results
     )
+    assert "contract.qamform_dependency_health" in names
     assert any(
         result.name == "live.approved_quote_send_rehearsal" and result.status == SKIP
+        for result in report.results
+    )
+    assert any(
+        result.name == "live.approved_send_callback_rehearsal" and result.status == SKIP
+        for result in report.results
+    )
+    assert any(
+        result.name == "live.real_send_drill_approval_boundary" and result.status == SKIP
         for result in report.results
     )
     assert report.effective_max_score > 0
@@ -596,6 +605,95 @@ def test_approved_send_final_packet_includes_risk_grade_and_pdf_hash(tmp_path):
     ).hexdigest()
 
 
+def test_approved_send_callback_rehearsal_blocks_send_paths(tmp_path):
+    package = {
+        "rehearsal_reference": "hermes-canary-send-20260512143000",
+        "final_send_approval_packet": {
+            "callbacks": {
+                "approve_send": {
+                    "callback_data": "quote_send_approve:hermes-canary-send-20260512143000",
+                    "enabled": False,
+                },
+                "reject": {
+                    "callback_data": "quote_send_reject:hermes-canary-send-20260512143000",
+                    "enabled": True,
+                },
+            }
+        },
+    }
+    rehearsal = canary_module._build_approved_send_callback_rehearsal(package)
+    artifacts = canary_module._write_approved_send_callback_rehearsal_artifacts(
+        CanaryOptions(
+            repo_root=Path(__file__).resolve().parents[2],
+            hermes_home=tmp_path,
+            gateway_url="",
+            env_wrapper=None,
+        ),
+        rehearsal,
+    )
+
+    assert rehearsal["approve_state"]["status"] == "approve_blocked_pending_explicit_live_operator_approval"
+    assert rehearsal["approve_state"]["send_enabled"] is False
+    assert rehearsal["reject_state"]["status"] == "rejected_internal_rehearsal"
+    assert rehearsal["duplicate_reject_state"]["status"] == "rejected_internal_rehearsal"
+    assert rehearsal["invalid_state"]["status"] == "invalid_callback_rejected"
+    assert "quote_send.reject_callback_idempotent" in json.dumps(
+        rehearsal["duplicate_reject_state"]
+    )
+    assert Path(artifacts["json_path"]).is_file()
+    assert "quote_send.approve_callback_blocked" in Path(
+        artifacts["audit_path"]
+    ).read_text(encoding="utf-8")
+
+
+def test_real_send_drill_boundary_requires_explicit_approval(tmp_path):
+    pdf_path = tmp_path / "preview.pdf"
+    pdf_path.write_bytes(b"%PDF-1.4\n" + (b"x" * 2048))
+    package = {
+        "rehearsal_reference": "HERMES-CANARY-SEND-BOUNDARY",
+        "email_draft": {
+            "to": ["ac@advanced.aero"],
+        },
+        "follow_up": {
+            "due_at": "2026-05-13T14:30:00+00:00",
+            "owner": "hermes",
+            "action": "Review customer send result",
+        },
+        "final_send_approval_packet": {
+            "subject": "Quote HERMES-CANARY-SEND-BOUNDARY",
+            "pdf": {
+                "path": str(pdf_path),
+                "sha256": hashlib.sha256(pdf_path.read_bytes()).hexdigest(),
+            },
+            "price": {
+                "part_number": "160SG119-3",
+                "quantity": 1,
+                "unit_price": 1250.0,
+            },
+        },
+    }
+
+    boundary = canary_module._build_real_send_drill_approval_boundary(package)
+    artifacts = canary_module._write_real_send_drill_approval_boundary_artifacts(
+        CanaryOptions(
+            repo_root=Path(__file__).resolve().parents[2],
+            hermes_home=tmp_path,
+            gateway_url="",
+            env_wrapper=None,
+        ),
+        boundary,
+    )
+
+    assert boundary["approval_phrase"] == "APPROVE REAL CUSTOMER SEND HERMES-CANARY-SEND-BOUNDARY"
+    assert boundary["delivery_plan"]["execute_enabled"] is False
+    assert boundary["delivery_plan"]["customer_recipient"]["verified"] is False
+    assert boundary["audit_plan"]["write_enabled"] is False
+    assert boundary["guardrails"]["real_customer_send_executed"] is False
+    assert Path(artifacts["approval_path"]).read_text(encoding="utf-8").startswith(
+        "Real customer send drill is prepared"
+    )
+
+
 def test_qamform_preview_falls_back_when_renderer_dependency_missing(monkeypatch, tmp_path):
     home = tmp_path / "home"
     service_dir = home / ".hermes" / "services"
@@ -632,6 +730,50 @@ def test_qamform_preview_falls_back_when_renderer_dependency_missing(monkeypatch
     assert "qrcode" in preview["fallback_reason"]
     assert preview["pdf_bytes"] > 500
     assert pdf_path.read_bytes().startswith(b"%PDF-1.4")
+
+
+def test_qamform_dependency_health_canary_passes_with_real_renderer(monkeypatch, tmp_path):
+    home = tmp_path / "home"
+    service_dir = home / ".hermes" / "services"
+    service_dir.mkdir(parents=True)
+    (service_dir / "quote_pdf.py").write_text(
+        "QAMFORM11 render_quote_pdf _generate_branded_qr qrcode\n",
+        encoding="utf-8",
+    )
+    pdf_path = tmp_path / "preview.pdf"
+    pdf_path.write_bytes(b"%PDF-1.4\n" + (b"x" * 20_000))
+
+    monkeypatch.setattr(canary_module.Path, "home", lambda: home)
+    monkeypatch.setattr(
+        canary_module,
+        "_import_health",
+        lambda module_name, import_name=None: {
+            "module": module_name,
+            "ok": True,
+            "error": "",
+        },
+    )
+    monkeypatch.setattr(
+        canary_module,
+        "_render_approved_rfq_qamform_preview",
+        lambda package, output_dir: {
+            "status": "rendered",
+            "pdf_path": str(pdf_path),
+            "pdf_bytes": pdf_path.stat().st_size,
+        },
+    )
+    options = CanaryOptions(
+        repo_root=Path(__file__).resolve().parents[2],
+        hermes_home=tmp_path,
+        gateway_url="",
+        env_wrapper=None,
+    )
+
+    result = canary_module._canary_qamform_dependency_health(options)
+
+    assert result.status == PASS
+    assert result.details["checks"]["required_python_modules_import"] is True
+    assert result.details["checks"]["real_renderer_output"] is True
 
 
 def test_score_text_case_accepts_final_numeric_answer():
@@ -941,6 +1083,111 @@ def test_quality_score_9_8_requires_approved_send_rehearsal():
     assert business_ops["score"] == 9.8
 
 
+def test_quality_score_9_9_requires_approved_send_callback_rehearsal():
+    now = 1_700_000_000.0
+    report = CanaryReport(
+        started_at=now,
+        finished_at=now + 1,
+        fail_under=80.0,
+        results=[
+            *_quality_foundation_results(),
+            CanaryResult("contract.quote_ops_runtime", PASS, 20, 20, "quote ops runtime passed"),
+            CanaryResult(
+                "live.rfq_dry_run_quote_package",
+                PASS,
+                25,
+                25,
+                "live RFQ dry-run package passed",
+            ),
+            CanaryResult(
+                "live.approved_rfq_draft_quote",
+                PASS,
+                30,
+                30,
+                "approved RFQ draft package passed",
+            ),
+            CanaryResult(
+                "live.approved_quote_send_rehearsal",
+                PASS,
+                40,
+                40,
+                "approved quote-send rehearsal passed",
+            ),
+            CanaryResult(
+                "live.approved_send_callback_rehearsal",
+                PASS,
+                20,
+                20,
+                "approved-send callback rehearsal passed",
+            ),
+        ],
+    )
+
+    summary = quality_summary(report)
+
+    increment = next(item for item in summary["increments"] if item["target"] == "9.9/10")
+    assert increment["status"] == "done"
+    assert next(item for item in summary["increments"] if item["target"] == "10.0/10")["status"] == "open"
+    assert summary["score"] >= 9.9
+    business_ops = next(item for item in summary["dimensions"] if item["name"] == "business_ops")
+    assert business_ops["score"] == 9.9
+
+
+def test_quality_boundary_before_real_customer_send():
+    now = 1_700_000_000.0
+    report = CanaryReport(
+        started_at=now,
+        finished_at=now + 1,
+        fail_under=80.0,
+        results=[
+            *_quality_foundation_results(),
+            CanaryResult("contract.quote_ops_runtime", PASS, 20, 20, "quote ops runtime passed"),
+            CanaryResult(
+                "live.rfq_dry_run_quote_package",
+                PASS,
+                25,
+                25,
+                "live RFQ dry-run package passed",
+            ),
+            CanaryResult(
+                "live.approved_rfq_draft_quote",
+                PASS,
+                30,
+                30,
+                "approved RFQ draft package passed",
+            ),
+            CanaryResult(
+                "live.approved_quote_send_rehearsal",
+                PASS,
+                40,
+                40,
+                "approved quote-send rehearsal passed",
+            ),
+            CanaryResult(
+                "live.approved_send_callback_rehearsal",
+                PASS,
+                20,
+                20,
+                "approved-send callback rehearsal passed",
+            ),
+            CanaryResult(
+                "live.real_send_drill_approval_boundary",
+                PASS,
+                20,
+                20,
+                "real-send boundary passed",
+            ),
+        ],
+    )
+
+    summary = quality_summary(report)
+
+    assert next(item for item in summary["increments"] if item["target"] == "9.95/10")["status"] == "done"
+    assert next(item for item in summary["increments"] if item["target"] == "10.0/10")["status"] == "open"
+    business_ops = next(item for item in summary["dimensions"] if item["name"] == "business_ops")
+    assert business_ops["score"] == 9.95
+
+
 def test_quality_score_does_not_skip_foundation_for_business_gates():
     now = 1_700_000_000.0
     report = CanaryReport(
@@ -971,6 +1218,8 @@ def test_quality_score_does_not_skip_foundation_for_business_gates():
     assert next(item for item in summary["increments"] if item["target"] == "9.0/10")["status"] == "open"
     assert next(item for item in summary["increments"] if item["target"] == "9.7/10")["status"] == "open"
     assert next(item for item in summary["increments"] if item["target"] == "9.8/10")["status"] == "open"
+    assert next(item for item in summary["increments"] if item["target"] == "9.9/10")["status"] == "open"
+    assert next(item for item in summary["increments"] if item["target"] == "9.95/10")["status"] == "open"
     assert summary["score"] < 9.0
 
 

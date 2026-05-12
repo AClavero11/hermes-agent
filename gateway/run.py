@@ -720,14 +720,74 @@ def _read_alexandria_source_snippets(rel_paths: List[str], max_chars: int = 9000
     return alexandria_router.read_alexandria_source_snippets(rel_paths, max_chars=max_chars)
 
 
-def _read_latest_canary_scorecard() -> dict[str, Any]:
-    report_path = _hermes_home / "canary" / "reports" / "latest.json"
+def _canary_report_candidate_paths() -> list[Path]:
+    candidates: list[Path] = []
+    raw_report_path = os.getenv("HERMES_CANARY_REPORT_PATH", "").strip()
+    if raw_report_path:
+        candidates.append(Path(raw_report_path).expanduser())
+
+    homes: list[Path] = [_hermes_home]
+    for env_name in ("HERMES_CANARY_HOME", "HERMES_HOME", "AAC_HERMES_DEEPSEEK_HOME"):
+        raw_home = os.getenv(env_name, "").strip()
+        if raw_home:
+            homes.append(Path(raw_home).expanduser())
+    homes.extend([Path.home() / ".hermes-deepseek", Path.home() / ".hermes"])
+
+    for home in homes:
+        candidates.append(home / "canary" / "reports" / "latest.json")
+
+    unique_candidates: list[Path] = []
+    seen: set[str] = set()
+    for candidate in candidates:
+        try:
+            key = str(candidate.resolve(strict=False))
+        except OSError:
+            key = str(candidate)
+        if key in seen:
+            continue
+        seen.add(key)
+        unique_candidates.append(candidate)
+    return unique_candidates
+
+
+def _load_canary_report_payload(path: Path) -> tuple[dict[str, Any] | None, float]:
     try:
-        payload = json.loads(report_path.read_text(encoding="utf-8"))
+        payload = json.loads(path.read_text(encoding="utf-8"))
     except (OSError, json.JSONDecodeError):
-        return {"path": str(report_path), "found": False}
+        return None, 0.0
     if not isinstance(payload, dict):
-        return {"path": str(report_path), "found": False}
+        return None, 0.0
+    timestamp = payload.get("finished_at")
+    if not isinstance(timestamp, (int, float)):
+        try:
+            timestamp = path.stat().st_mtime
+        except OSError:
+            timestamp = 0.0
+    return payload, float(timestamp)
+
+
+def _read_latest_canary_scorecard() -> dict[str, Any]:
+    candidates = _canary_report_candidate_paths()
+    selected_path: Path | None = None
+    selected_payload: dict[str, Any] | None = None
+    selected_timestamp = -1.0
+    for candidate in candidates:
+        payload, timestamp = _load_canary_report_payload(candidate)
+        if payload is None:
+            continue
+        if timestamp >= selected_timestamp:
+            selected_path = candidate
+            selected_payload = payload
+            selected_timestamp = timestamp
+    if selected_payload is None or selected_path is None:
+        primary_path = candidates[0] if candidates else _hermes_home / "canary" / "reports" / "latest.json"
+        return {
+            "path": str(primary_path),
+            "candidate_paths": [str(path) for path in candidates],
+            "found": False,
+        }
+    report_path = selected_path
+    payload = selected_payload
 
     quality = payload.get("overall_quality", {})
     if not isinstance(quality, dict):
@@ -752,6 +812,7 @@ def _read_latest_canary_scorecard() -> dict[str, Any]:
 
     return {
         "path": str(report_path),
+        "candidate_paths": [str(path) for path in candidates],
         "found": True,
         "status": str(payload.get("status") or "unknown"),
         "points": payload.get("score"),

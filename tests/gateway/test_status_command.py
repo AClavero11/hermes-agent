@@ -716,6 +716,7 @@ def test_build_hermes_direct_answer_for_quality_score(monkeypatch, tmp_path):
     (reports_dir / "latest.json").write_text(
         json.dumps(
             {
+                "finished_at": 9_999_999_999.0,
                 "status": "warn",
                 "score": 190.0,
                 "effective_max_score": 210.0,
@@ -787,6 +788,52 @@ def test_build_hermes_direct_answer_for_quality_score(monkeypatch, tmp_path):
     assert "Trend delta: score_delta=+15.0; fixed_failed=contract.codex_worker" in result
     assert "no single quality score claim" in result
     assert str(reports_dir / "latest.json") in result
+
+
+def test_read_latest_canary_scorecard_uses_freshest_known_home(monkeypatch, tmp_path):
+    import gateway.run as gateway_run
+
+    old_home = tmp_path / "old-home"
+    new_home = tmp_path / "home" / ".hermes-deepseek"
+    for home, finished_at, summary in (
+        (old_home, 1.0, "old scorecard"),
+        (new_home, 2.0, "fresh scorecard"),
+    ):
+        reports_dir = home / "canary" / "reports"
+        reports_dir.mkdir(parents=True)
+        (reports_dir / "latest.json").write_text(
+            json.dumps(
+                {
+                    "finished_at": finished_at,
+                    "status": "warn",
+                    "score": 10.0,
+                    "effective_max_score": 10.0,
+                    "percent": 100.0,
+                    "overall_quality": {"score": 8.5, "caps": []},
+                    "readiness": {
+                        "status": "not_frontier_ready",
+                        "passed": 1,
+                        "total": 2,
+                        "open_gates": [],
+                    },
+                    "results": [
+                        {
+                            "name": "live.approved_quote_send_rehearsal",
+                            "status": "pass",
+                            "summary": summary,
+                        }
+                    ],
+                }
+            ),
+            encoding="utf-8",
+        )
+    monkeypatch.setattr(gateway_run, "_hermes_home", old_home)
+    monkeypatch.setattr(gateway_run.Path, "home", lambda: tmp_path / "home")
+
+    scorecard = gateway_run._read_latest_canary_scorecard()
+
+    assert scorecard["path"] == str(new_home / "canary" / "reports" / "latest.json")
+    assert scorecard["approved_send_summary"] == "fresh scorecard"
 
 
 def test_build_hermes_direct_answer_for_social_link_only():

@@ -5849,6 +5849,112 @@ def _canary_approved_rfq_draft_quote(options: CanaryOptions) -> CanaryResult:
     )
 
 
+def _build_qamform_dependency_probe_package() -> dict[str, Any]:
+    return {
+        "draft_reference": f"HERMES-QAMFORM-HEALTH-{datetime.now(timezone.utc).strftime('%Y%m%d%H%M%S')}",
+        "source_rfq_package": {
+            "scenario": {
+                "rfq_id": "QAMFORM-HEALTH",
+                "customer_name": "Internal Canary Customer",
+            },
+            "pricing": {"suggestion": {"basis": "renderer_dependency_health"}},
+        },
+        "draft_line": {
+            "part_number": "160SG119-3",
+            "description": "Hermes QAMFORM renderer dependency health probe",
+            "quantity": 1,
+            "unit_price": 1250.0,
+            "condition": "SV",
+            "lot": "QAMFORM-HEALTH-LOT",
+        },
+    }
+
+
+def _import_health(module_name: str, import_name: str | None = None) -> dict[str, Any]:
+    target = import_name or module_name
+    previous_dyld_fallback = os.environ.get("DYLD_FALLBACK_LIBRARY_PATH", "")
+    homebrew_lib = "/opt/homebrew/lib"
+    if Path(homebrew_lib).is_dir():
+        paths = [path for path in previous_dyld_fallback.split(":") if path]
+        if homebrew_lib not in paths:
+            os.environ["DYLD_FALLBACK_LIBRARY_PATH"] = ":".join([homebrew_lib, *paths])
+    try:
+        __import__(target)
+        return {"module": module_name, "ok": True, "error": ""}
+    except Exception as exc:
+        return {
+            "module": module_name,
+            "ok": False,
+            "error": f"{type(exc).__name__}: {exc}",
+        }
+    finally:
+        if previous_dyld_fallback:
+            os.environ["DYLD_FALLBACK_LIBRARY_PATH"] = previous_dyld_fallback
+        else:
+            os.environ.pop("DYLD_FALLBACK_LIBRARY_PATH", None)
+
+
+def _canary_qamform_dependency_health(options: CanaryOptions) -> CanaryResult:
+    service_dir = Path.home() / ".hermes" / "services"
+    quote_pdf_path = service_dir / "quote_pdf.py"
+    module_health = {
+        "jinja2": _import_health("jinja2"),
+        "qrcode": _import_health("qrcode"),
+        "PIL": _import_health("PIL", "PIL.Image"),
+        "weasyprint": _import_health("weasyprint"),
+    }
+    try:
+        source_text = quote_pdf_path.read_text(encoding="utf-8")
+    except OSError:
+        source_text = ""
+    preview: dict[str, Any] = {}
+    try:
+        preview = _render_approved_rfq_qamform_preview(
+            _build_qamform_dependency_probe_package(),
+            options.hermes_home / "canary" / "qamform_dependency_health",
+        )
+    except Exception as exc:
+        preview = {
+            "status": "failed",
+            "error": f"{type(exc).__name__}: {exc}",
+        }
+
+    checks = {
+        "quote_pdf_renderer_exists": quote_pdf_path.is_file(),
+        "required_python_modules_import": all(item["ok"] for item in module_health.values()),
+        "renderer_source_mentions_qamform": "QAMFORM11" in source_text
+        and "render_quote_pdf" in source_text,
+        "branded_qr_source_present": "_generate_branded_qr" in source_text
+        and "qrcode" in source_text,
+        "real_renderer_output": preview.get("status") == "rendered"
+        and int(preview.get("pdf_bytes") or 0) > 10_000
+        and Path(str(preview.get("pdf_path") or "")).is_file(),
+        "fallback_not_used": preview.get("status") != "fallback_rendered",
+    }
+    failed = {name: value for name, value in checks.items() if not value}
+    score = round(15.0 * (len(checks) - len(failed)) / len(checks), 1)
+    status = PASS if not failed else WARN
+    return _result(
+        "contract.qamform_dependency_health",
+        status,
+        score,
+        15,
+        (
+            "QAMFORM renderer dependencies and real PDF output are healthy"
+            if not failed
+            else f"{len(checks) - len(failed)}/{len(checks)} QAMFORM dependency checks passed"
+        ),
+        {
+            "checks": checks,
+            "failed": failed,
+            "module_health": module_health,
+            "quote_pdf_path": str(quote_pdf_path),
+            "preview": preview,
+            "failure_class": "qamform_dependency_drift" if failed else "",
+        },
+    )
+
+
 def _approved_send_rehearsal_recipient() -> str:
     return (
         os.getenv("HERMES_CANARY_APPROVED_SEND_REHEARSAL_RECIPIENT", "")
@@ -6364,6 +6470,329 @@ def _attach_approved_send_rehearsal_to_workspace(
     return {"task_id": task["id"], "store_path": str(store.path)}
 
 
+def _build_approved_send_callback_initial_state(package: dict[str, Any]) -> dict[str, Any]:
+    approval_packet = package.get("final_send_approval_packet") or {}
+    callbacks = approval_packet.get("callbacks") or {}
+    return {
+        "schema_version": 1,
+        "reference": str(package.get("rehearsal_reference") or ""),
+        "status": "pending_operator_decision",
+        "send_enabled": False,
+        "external_delivery": False,
+        "customer_email_send": False,
+        "business_writes_enabled": False,
+        "callbacks": callbacks,
+        "decisions": [],
+        "audit_events": [],
+    }
+
+
+def _apply_approved_send_callback_rehearsal(
+    state: dict[str, Any],
+    callback_data: str,
+    *,
+    actor: str = "hermes_canary",
+) -> dict[str, Any]:
+    next_state = json.loads(json.dumps(state))
+    callbacks = next_state.get("callbacks") or {}
+    approve_data = str(((callbacks.get("approve_send") or {}).get("callback_data")) or "")
+    reject_data = str(((callbacks.get("reject") or {}).get("callback_data")) or "")
+    reference = str(next_state.get("reference") or "")
+    created_at = datetime.now(timezone.utc).replace(microsecond=0).isoformat()
+
+    def append_event(event_type: str, status: str, reason: str) -> None:
+        next_state.setdefault("audit_events", []).append(
+            {
+                "event_type": event_type,
+                "created_at": created_at,
+                "actor": actor,
+                "reference": reference,
+                "callback_data": callback_data,
+                "status": status,
+                "reason": reason,
+                "send_enabled": False,
+                "external_delivery": False,
+                "business_writes_enabled": False,
+            }
+        )
+
+    if callback_data == approve_data:
+        approve_enabled = bool((callbacks.get("approve_send") or {}).get("enabled"))
+        if not approve_enabled:
+            next_state["status"] = "approve_blocked_pending_explicit_live_operator_approval"
+            next_state["send_enabled"] = False
+            append_event(
+                "quote_send.approve_callback_blocked",
+                "blocked",
+                "approve callback is disabled in rehearsal mode",
+            )
+            return next_state
+        next_state["status"] = "approve_blocked_missing_real_send_implementation"
+        next_state["send_enabled"] = False
+        append_event(
+            "quote_send.approve_callback_blocked",
+            "blocked",
+            "real send implementation is outside rehearsal canary",
+        )
+        return next_state
+
+    if callback_data == reject_data:
+        if next_state.get("status") == "rejected_internal_rehearsal":
+            append_event(
+                "quote_send.reject_callback_idempotent",
+                "ignored",
+                "rehearsal was already rejected",
+            )
+            return next_state
+        next_state["status"] = "rejected_internal_rehearsal"
+        next_state["send_enabled"] = False
+        next_state.setdefault("decisions", []).append(
+            {
+                "decision": "reject",
+                "actor": actor,
+                "created_at": created_at,
+                "reference": reference,
+            }
+        )
+        append_event(
+            "quote_send.reject_callback_recorded",
+            "recorded",
+            "operator rejected the rehearsal packet",
+        )
+        return next_state
+
+    next_state["status"] = "invalid_callback_rejected"
+    next_state["send_enabled"] = False
+    append_event(
+        "quote_send.invalid_callback_rejected",
+        "rejected",
+        "callback data did not match the rehearsal reference",
+    )
+    return next_state
+
+
+def _build_approved_send_callback_rehearsal(
+    package: dict[str, Any],
+) -> dict[str, Any]:
+    approval_packet = package.get("final_send_approval_packet") or {}
+    callbacks = approval_packet.get("callbacks") or {}
+    approve_data = str(((callbacks.get("approve_send") or {}).get("callback_data")) or "")
+    reject_data = str(((callbacks.get("reject") or {}).get("callback_data")) or "")
+    initial_state = _build_approved_send_callback_initial_state(package)
+    approve_state = _apply_approved_send_callback_rehearsal(initial_state, approve_data)
+    reject_state = _apply_approved_send_callback_rehearsal(initial_state, reject_data)
+    duplicate_reject_state = _apply_approved_send_callback_rehearsal(
+        reject_state,
+        reject_data,
+    )
+    invalid_state = _apply_approved_send_callback_rehearsal(
+        initial_state,
+        f"quote_send_approve:wrong-{package.get('rehearsal_reference', '')}",
+    )
+    return {
+        "schema_version": 1,
+        "reference": package.get("rehearsal_reference", ""),
+        "mode": "approved_send_callback_rehearsal",
+        "callback_data": {
+            "approve_send": approve_data,
+            "reject": reject_data,
+        },
+        "initial_state": initial_state,
+        "approve_state": approve_state,
+        "reject_state": reject_state,
+        "duplicate_reject_state": duplicate_reject_state,
+        "invalid_state": invalid_state,
+        "guardrails": {
+            "real_customer_send": False,
+            "send_enabled": False,
+            "external_delivery": False,
+            "customer_email_send": False,
+            "business_writes_enabled": False,
+            "approval_required_before_real_customer_send": True,
+        },
+    }
+
+
+def _write_approved_send_callback_rehearsal_artifacts(
+    options: CanaryOptions,
+    rehearsal: dict[str, Any],
+) -> dict[str, str]:
+    output_dir = options.hermes_home / "canary" / "approved_send_callback_rehearsals"
+    output_dir.mkdir(parents=True, exist_ok=True)
+    timestamp = datetime.now(timezone.utc).strftime("%Y%m%d-%H%M%S")
+    ref = str(rehearsal.get("reference") or "hermes-canary-callback").lower()
+    slug = "".join(ch if ch.isalnum() else "-" for ch in ref).strip("-")[:80]
+    json_path = output_dir / f"{timestamp}-{slug}.json"
+    audit_path = output_dir / f"{timestamp}-{slug}-audit.jsonl"
+    audit_events = []
+    for key in ("approve_state", "reject_state", "duplicate_reject_state", "invalid_state"):
+        audit_events.extend((rehearsal.get(key) or {}).get("audit_events") or [])
+    json_path.write_text(json.dumps(rehearsal, indent=2, sort_keys=True), encoding="utf-8")
+    audit_path.write_text(
+        "".join(json.dumps(event, sort_keys=True) + "\n" for event in audit_events),
+        encoding="utf-8",
+    )
+    latest_json = output_dir / "latest.json"
+    latest_audit = output_dir / "latest-audit.jsonl"
+    latest_json.write_text(json.dumps(rehearsal, indent=2, sort_keys=True), encoding="utf-8")
+    latest_audit.write_text(audit_path.read_text(encoding="utf-8"), encoding="utf-8")
+    return {
+        "json_path": str(json_path),
+        "audit_path": str(audit_path),
+        "latest_json": str(latest_json),
+        "latest_audit": str(latest_audit),
+    }
+
+
+def _build_real_send_drill_approval_boundary(package: dict[str, Any]) -> dict[str, Any]:
+    reference = str(package.get("rehearsal_reference") or "")
+    approval_packet = package.get("final_send_approval_packet") or {}
+    email_draft = package.get("email_draft") or {}
+    follow_up = package.get("follow_up") or {}
+    return {
+        "schema_version": 1,
+        "created_at": datetime.now(timezone.utc).replace(microsecond=0).isoformat(),
+        "mode": "real_send_drill_approval_boundary",
+        "reference": reference,
+        "status": "awaiting_explicit_operator_approval",
+        "approval_phrase": f"APPROVE REAL CUSTOMER SEND {reference}",
+        "operator_prompt": "\n".join(
+            [
+                "Real customer send drill is prepared but not executed.",
+                f"Reference: {reference}",
+                f"Subject: {approval_packet.get('subject', '')}",
+                f"PDF: {(approval_packet.get('pdf') or {}).get('path', '')}",
+                "Execution requires the exact approval phrase and verified customer recipient.",
+            ]
+        ),
+        "source_final_send_approval_packet": approval_packet,
+        "delivery_plan": {
+            "channel": "email",
+            "draft_subject": approval_packet.get("subject", ""),
+            "internal_rehearsal_recipient": ((email_draft.get("to") or [""])[0]),
+            "customer_recipient": {
+                "email": "",
+                "verified": False,
+                "reason": "customer recipient intentionally omitted from rehearsal drill",
+            },
+            "execute_enabled": False,
+            "external_delivery": False,
+            "customer_email_send": False,
+        },
+        "audit_plan": {
+            "write_enabled": False,
+            "required_events": [
+                "quote_send.operator_approved",
+                "quote_send.customer_email_sent",
+                "quote_send.audit_written",
+                "quote_send.follow_up_scheduled",
+                "quote_send.exception_captured",
+            ],
+            "artifact_targets": [
+                "send_receipt_json",
+                "gmail_message_id",
+                "customer_recipient_snapshot",
+                "follow_up_task",
+                "exception_report",
+            ],
+        },
+        "follow_up_plan": {
+            "status": "prepared_not_scheduled_customer_facing",
+            "due_at": follow_up.get("due_at", ""),
+            "owner": follow_up.get("owner", "hermes"),
+            "action": follow_up.get("action", ""),
+            "write_enabled": False,
+        },
+        "exception_capture": {
+            "status": "prepared",
+            "write_enabled": False,
+            "exceptions": [
+                "missing_explicit_operator_approval_phrase",
+                "unverified_customer_recipient",
+                "gmail_send_failure",
+                "audit_write_failure",
+                "follow_up_schedule_failure",
+                "v11_or_atlas_write_attempt",
+            ],
+        },
+        "abort_plan": {
+            "callback_data": f"quote_send_abort:{reference}",
+            "enabled": True,
+            "effect": "record aborted rehearsal; no external delivery",
+        },
+        "guardrails": {
+            "real_customer_send_executed": False,
+            "execute_enabled": False,
+            "external_delivery": False,
+            "customer_email_send": False,
+            "gmail_send": False,
+            "smtp_send": False,
+            "v11_create_or_write": False,
+            "atlas_create_or_write": False,
+            "requires_explicit_operator_approval": True,
+        },
+    }
+
+
+def _render_real_send_drill_approval_markdown(boundary: dict[str, Any]) -> str:
+    delivery = boundary.get("delivery_plan") or {}
+    audit = boundary.get("audit_plan") or {}
+    guardrails = boundary.get("guardrails") or {}
+    packet = boundary.get("source_final_send_approval_packet") or {}
+    return "\n".join(
+        [
+            "# Hermes Real Send Drill Approval Boundary",
+            "",
+            f"- Reference: {boundary.get('reference', '')}",
+            f"- Status: {boundary.get('status', '')}",
+            f"- Approval phrase: `{boundary.get('approval_phrase', '')}`",
+            f"- Subject: {packet.get('subject', '')}",
+            f"- PDF: {(packet.get('pdf') or {}).get('path', '')}",
+            f"- PDF SHA256: {(packet.get('pdf') or {}).get('sha256', '')}",
+            f"- Internal rehearsal recipient: {delivery.get('internal_rehearsal_recipient', '')}",
+            f"- Customer recipient verified: {((delivery.get('customer_recipient') or {}).get('verified'))}",
+            "",
+            "## Audit Plan",
+            "",
+            *[f"- {event}" for event in audit.get("required_events", [])],
+            "",
+            "## Guardrails",
+            "",
+            *[f"- {key}: {value}" for key, value in sorted(guardrails.items())],
+            "",
+        ]
+    )
+
+
+def _write_real_send_drill_approval_boundary_artifacts(
+    options: CanaryOptions,
+    boundary: dict[str, Any],
+) -> dict[str, str]:
+    output_dir = options.hermes_home / "canary" / "real_send_drill_boundaries"
+    output_dir.mkdir(parents=True, exist_ok=True)
+    timestamp = datetime.now(timezone.utc).strftime("%Y%m%d-%H%M%S")
+    ref = str(boundary.get("reference") or "hermes-real-send-drill").lower()
+    slug = "".join(ch if ch.isalnum() else "-" for ch in ref).strip("-")[:80]
+    json_path = output_dir / f"{timestamp}-{slug}.json"
+    markdown_path = output_dir / f"{timestamp}-{slug}.md"
+    approval_path = output_dir / f"{timestamp}-{slug}-approval-prompt.txt"
+    markdown = _render_real_send_drill_approval_markdown(boundary)
+    json_path.write_text(json.dumps(boundary, indent=2, sort_keys=True), encoding="utf-8")
+    markdown_path.write_text(markdown, encoding="utf-8")
+    approval_path.write_text(str(boundary.get("operator_prompt") or ""), encoding="utf-8")
+    latest_json = output_dir / "latest.json"
+    latest_markdown = output_dir / "latest.md"
+    latest_json.write_text(json_path.read_text(encoding="utf-8"), encoding="utf-8")
+    latest_markdown.write_text(markdown, encoding="utf-8")
+    return {
+        "json_path": str(json_path),
+        "markdown_path": str(markdown_path),
+        "approval_path": str(approval_path),
+        "latest_json": str(latest_json),
+        "latest_markdown": str(latest_markdown),
+    }
+
+
 def _canary_approved_quote_send_rehearsal(options: CanaryOptions) -> CanaryResult:
     if not options.approved_send_rehearsal:
         return _result(
@@ -6492,6 +6921,186 @@ def _canary_approved_quote_send_rehearsal(options: CanaryOptions) -> CanaryResul
                 "blocking_count": risk_grade.get("blocking_count", 0),
                 "review_count": risk_grade.get("review_count", 0),
             },
+            "failure_class": "missing_evidence" if failed else "",
+        },
+    )
+
+
+def _canary_approved_send_callback_rehearsal(options: CanaryOptions) -> CanaryResult:
+    if not options.approved_send_rehearsal:
+        return _result(
+            "live.approved_send_callback_rehearsal",
+            SKIP,
+            0,
+            20,
+            "Approved-send callback rehearsal not enabled; pass --approved-send-rehearsal for callback-state proof",
+            {"enabled": False},
+        )
+
+    try:
+        package = _build_approved_quote_send_rehearsal_package(options)
+        rehearsal = _build_approved_send_callback_rehearsal(package)
+        artifacts = _write_approved_send_callback_rehearsal_artifacts(options, rehearsal)
+    except Exception as exc:
+        return _result(
+            "live.approved_send_callback_rehearsal",
+            FAIL if options.require_live else WARN,
+            0,
+            20,
+            f"Approved-send callback rehearsal failed: {type(exc).__name__}: {exc}",
+            {
+                "enabled": True,
+                "failure_class": "approved_send_callback_rehearsal_failure",
+                "error_type": type(exc).__name__,
+            },
+        )
+
+    guardrails = rehearsal.get("guardrails") or {}
+    approve_state = rehearsal.get("approve_state") or {}
+    reject_state = rehearsal.get("reject_state") or {}
+    duplicate_reject_state = rehearsal.get("duplicate_reject_state") or {}
+    invalid_state = rehearsal.get("invalid_state") or {}
+    callback_data = rehearsal.get("callback_data") or {}
+    audit_path = Path(artifacts["audit_path"])
+    audit_text = audit_path.read_text(encoding="utf-8") if audit_path.is_file() else ""
+    checks = {
+        "callback_data_bound_to_reference": bool(callback_data.get("approve_send"))
+        and str(rehearsal.get("reference") or "") in str(callback_data.get("approve_send") or "")
+        and str(rehearsal.get("reference") or "") in str(callback_data.get("reject") or ""),
+        "approve_callback_blocked": approve_state.get("status")
+        == "approve_blocked_pending_explicit_live_operator_approval"
+        and approve_state.get("send_enabled") is False,
+        "reject_callback_records_decision": reject_state.get("status") == "rejected_internal_rehearsal"
+        and bool(reject_state.get("decisions")),
+        "duplicate_reject_idempotent": duplicate_reject_state.get("status") == "rejected_internal_rehearsal"
+        and "quote_send.reject_callback_idempotent" in json.dumps(duplicate_reject_state),
+        "invalid_callback_rejected": invalid_state.get("status") == "invalid_callback_rejected",
+        "all_paths_send_disabled": all(
+            (state.get("send_enabled") is False)
+            and (state.get("external_delivery") is False)
+            and (state.get("customer_email_send") is False)
+            and (state.get("business_writes_enabled") is False)
+            for state in (approve_state, reject_state, duplicate_reject_state, invalid_state)
+        ),
+        "audit_events_written": audit_path.is_file()
+        and "quote_send.approve_callback_blocked" in audit_text
+        and "quote_send.reject_callback_recorded" in audit_text
+        and "quote_send.invalid_callback_rejected" in audit_text,
+        "artifacts_written": all(Path(artifacts[name]).is_file() for name in ("json_path", "audit_path")),
+        "guardrails_preserve_approval_boundary": guardrails.get("real_customer_send") is False
+        and guardrails.get("approval_required_before_real_customer_send") is True,
+    }
+    failed = {name: value for name, value in checks.items() if not value}
+    score = round(20.0 * (len(checks) - len(failed)) / len(checks), 1)
+    status = PASS if not failed else WARN
+    return _result(
+        "live.approved_send_callback_rehearsal",
+        status,
+        score,
+        20,
+        f"{len(checks) - len(failed)}/{len(checks)} approved-send callback rehearsal checks passed",
+        {
+            "enabled": True,
+            "checks": checks,
+            "failed": failed,
+            "artifact": artifacts,
+            "rehearsal_reference": rehearsal.get("reference", ""),
+            "real_customer_send": False,
+            "failure_class": "missing_evidence" if failed else "",
+        },
+    )
+
+
+def _canary_real_send_drill_approval_boundary(options: CanaryOptions) -> CanaryResult:
+    if not options.approved_send_rehearsal:
+        return _result(
+            "live.real_send_drill_approval_boundary",
+            SKIP,
+            0,
+            20,
+            "Real-send drill approval boundary not enabled; pass --approved-send-rehearsal for boundary proof",
+            {"enabled": False},
+        )
+
+    try:
+        package = _build_approved_quote_send_rehearsal_package(options)
+        boundary = _build_real_send_drill_approval_boundary(package)
+        artifacts = _write_real_send_drill_approval_boundary_artifacts(options, boundary)
+    except Exception as exc:
+        return _result(
+            "live.real_send_drill_approval_boundary",
+            FAIL if options.require_live else WARN,
+            0,
+            20,
+            f"Real-send drill approval boundary failed: {type(exc).__name__}: {exc}",
+            {
+                "enabled": True,
+                "failure_class": "real_send_drill_boundary_failure",
+                "error_type": type(exc).__name__,
+            },
+        )
+
+    delivery = boundary.get("delivery_plan") or {}
+    customer_recipient = delivery.get("customer_recipient") or {}
+    audit = boundary.get("audit_plan") or {}
+    follow_up = boundary.get("follow_up_plan") or {}
+    exceptions = boundary.get("exception_capture") or {}
+    guardrails = boundary.get("guardrails") or {}
+    packet = boundary.get("source_final_send_approval_packet") or {}
+    required_audit_events = set(audit.get("required_events") or [])
+    checks = {
+        "exact_approval_phrase_required": str(boundary.get("approval_phrase") or "").startswith(
+            "APPROVE REAL CUSTOMER SEND "
+        ),
+        "operator_prompt_ready": "not executed" in str(boundary.get("operator_prompt") or "").lower()
+        and str(boundary.get("reference") or "") in str(boundary.get("operator_prompt") or ""),
+        "customer_recipient_not_verified": customer_recipient.get("verified") is False
+        and not str(customer_recipient.get("email") or ""),
+        "delivery_execution_disabled": delivery.get("execute_enabled") is False
+        and delivery.get("external_delivery") is False
+        and delivery.get("customer_email_send") is False,
+        "audit_plan_complete": required_audit_events
+        >= {
+            "quote_send.operator_approved",
+            "quote_send.customer_email_sent",
+            "quote_send.audit_written",
+            "quote_send.follow_up_scheduled",
+            "quote_send.exception_captured",
+        }
+        and audit.get("write_enabled") is False,
+        "follow_up_prepared_not_written": bool(follow_up.get("due_at"))
+        and follow_up.get("write_enabled") is False,
+        "exception_capture_prepared": exceptions.get("status") == "prepared"
+        and len(exceptions.get("exceptions") or []) >= 5
+        and exceptions.get("write_enabled") is False,
+        "final_packet_embedded": bool(packet.get("subject"))
+        and bool((packet.get("pdf") or {}).get("sha256"))
+        and bool((packet.get("price") or {}).get("part_number")),
+        "abort_path_available": (boundary.get("abort_plan") or {}).get("enabled") is True,
+        "no_side_effects_enabled": all(value is False for key, value in guardrails.items() if key != "requires_explicit_operator_approval")
+        and guardrails.get("requires_explicit_operator_approval") is True,
+        "artifacts_written": all(
+            Path(artifacts[name]).is_file()
+            for name in ("json_path", "markdown_path", "approval_path")
+        ),
+    }
+    failed = {name: value for name, value in checks.items() if not value}
+    score = round(20.0 * (len(checks) - len(failed)) / len(checks), 1)
+    status = PASS if not failed else WARN
+    return _result(
+        "live.real_send_drill_approval_boundary",
+        status,
+        score,
+        20,
+        f"{len(checks) - len(failed)}/{len(checks)} real-send drill approval-boundary checks passed",
+        {
+            "enabled": True,
+            "checks": checks,
+            "failed": failed,
+            "artifact": artifacts,
+            "rehearsal_reference": boundary.get("reference", ""),
+            "approval_phrase": boundary.get("approval_phrase", ""),
+            "real_customer_send": False,
             "failure_class": "missing_evidence" if failed else "",
         },
     )
@@ -6673,12 +7282,23 @@ def run_canary_suite(options: CanaryOptions) -> CanaryReport:
         ("contract.aeroxchange_browser_workflow", 20, lambda: _canary_aeroxchange_browser_workflow(options)),
         ("contract.browser_harness", 15, lambda: _canary_browser_harness_contract(options)),
         ("contract.quote_ops_runtime", 20, lambda: _canary_quote_ops_runtime(options)),
+        ("contract.qamform_dependency_health", 15, lambda: _canary_qamform_dependency_health(options)),
         ("live.rfq_dry_run_quote_package", 25, lambda: _canary_rfq_dry_run_quote_package(options)),
         ("live.approved_rfq_draft_quote", 30, lambda: _canary_approved_rfq_draft_quote(options)),
         (
             "live.approved_quote_send_rehearsal",
             40,
             lambda: _canary_approved_quote_send_rehearsal(options),
+        ),
+        (
+            "live.approved_send_callback_rehearsal",
+            20,
+            lambda: _canary_approved_send_callback_rehearsal(options),
+        ),
+        (
+            "live.real_send_drill_approval_boundary",
+            20,
+            lambda: _canary_real_send_drill_approval_boundary(options),
         ),
         ("contract.planner_self_heal", 20, lambda: _canary_planner_self_heal(options)),
     ]
@@ -6880,9 +7500,47 @@ def _quality_dimensions(report: CanaryReport) -> list[QualityDimension]:
     rfq_dry_run_result = _result_by_name(report, "live.rfq_dry_run_quote_package")
     approved_rfq_draft_result = _result_by_name(report, "live.approved_rfq_draft_quote")
     approved_send_rehearsal_result = _result_by_name(report, "live.approved_quote_send_rehearsal")
+    approved_send_callback_result = _result_by_name(report, "live.approved_send_callback_rehearsal")
+    real_send_boundary_result = _result_by_name(report, "live.real_send_drill_approval_boundary")
     business_ops_score = 5.0
     business_ops_summary = "Quote automation runtime is not yet verified."
     if (
+        quote_ops_result
+        and quote_ops_result.status == PASS
+        and rfq_dry_run_result
+        and rfq_dry_run_result.status == PASS
+        and approved_rfq_draft_result
+        and approved_rfq_draft_result.status == PASS
+        and approved_send_rehearsal_result
+        and approved_send_rehearsal_result.status == PASS
+        and approved_send_callback_result
+        and approved_send_callback_result.status == PASS
+        and real_send_boundary_result
+        and real_send_boundary_result.status == PASS
+    ):
+        business_ops_score = 9.95
+        business_ops_summary = (
+            "Real-send drill approval boundary, audit plan, follow-up plan, "
+            "and exception capture pass with delivery disabled."
+        )
+    elif (
+        quote_ops_result
+        and quote_ops_result.status == PASS
+        and rfq_dry_run_result
+        and rfq_dry_run_result.status == PASS
+        and approved_rfq_draft_result
+        and approved_rfq_draft_result.status == PASS
+        and approved_send_rehearsal_result
+        and approved_send_rehearsal_result.status == PASS
+        and approved_send_callback_result
+        and approved_send_callback_result.status == PASS
+    ):
+        business_ops_score = 9.9
+        business_ops_summary = (
+            "Approved-send rehearsal and callback state transitions pass "
+            "with customer sends blocked."
+        )
+    elif (
         quote_ops_result
         and quote_ops_result.status == PASS
         and rfq_dry_run_result
@@ -7032,6 +7690,8 @@ def quality_summary(report: CanaryReport) -> dict[str, Any]:
     rfq_dry_run_done = quote_ops_done and passed("live.rfq_dry_run_quote_package")
     approved_rfq_draft_done = rfq_dry_run_done and passed("live.approved_rfq_draft_quote")
     approved_send_rehearsal_done = approved_rfq_draft_done and passed("live.approved_quote_send_rehearsal")
+    approved_send_callback_done = approved_send_rehearsal_done and passed("live.approved_send_callback_rehearsal")
+    real_send_boundary_done = approved_send_callback_done and passed("live.real_send_drill_approval_boundary")
     increments = [
         {
             "target": "7.0/10",
@@ -7092,6 +7752,16 @@ def quality_summary(report: CanaryReport) -> dict[str, Any]:
             "target": "9.8/10",
             "increment": "Approved-send rehearsal prepares internal email draft, audit proof, follow-up schedule, and exception surface with customer sends blocked",
             "status": "done" if approved_send_rehearsal_done else "open",
+        },
+        {
+            "target": "9.9/10",
+            "increment": "Approved-send callbacks rehearse approve/reject state transitions with sends still disabled",
+            "status": "done" if approved_send_callback_done else "open",
+        },
+        {
+            "target": "9.95/10",
+            "increment": "Real-send drill prepares exact approval boundary, audit plan, follow-up plan, and exception capture without delivery",
+            "status": "done" if real_send_boundary_done else "open",
         },
         {
             "target": "10.0/10",
