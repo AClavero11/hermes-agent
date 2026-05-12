@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import argparse
+import asyncio
 import csv
 import hashlib
 import importlib
@@ -1200,6 +1201,122 @@ def _canary_x_scrape_contract() -> CanaryResult:
             "status_id": status_id,
             "cleaned_preview": cleaned[:200],
         },
+    )
+
+
+def _canary_clean_web_extract_contract() -> CanaryResult:
+    """Verify clean URL extraction stays available without paid web API keys."""
+    from tools import web_tools
+
+    env_keys = (
+        "EXA_API_KEY",
+        "PARALLEL_API_KEY",
+        "FIRECRAWL_API_KEY",
+        "FIRECRAWL_API_URL",
+        "FIRECRAWL_GATEWAY_URL",
+        "TOOL_GATEWAY_DOMAIN",
+        "TOOL_GATEWAY_SCHEME",
+        "TOOL_GATEWAY_USER_TOKEN",
+        "TAVILY_API_KEY",
+        "HERMES_WEB_EXTRACT_JINA_FALLBACK",
+        "HERMES_WEB_EXTRACT_STRICT_BACKEND",
+    )
+    saved_env = {key: os.environ.get(key) for key in env_keys}
+    saved_load_config = web_tools._load_web_config
+    saved_tool_gateway = web_tools._is_tool_gateway_ready
+    saved_firecrawl_client = web_tools._get_firecrawl_client
+    saved_auxiliary = web_tools.check_auxiliary_model
+    saved_policy = web_tools.check_website_access
+    saved_http_get = web_tools.httpx.get
+
+    calls: list[str] = []
+
+    class _FakeReaderResponse:
+        status_code = 200
+        text = "\n".join(
+            [
+                "Title: Clean extraction fixture",
+                "URL Source: https://example.com/hermes-clean-web",
+                "",
+                "Markdown Content:",
+                "Firecrawl-style clean markdown without provider API keys.",
+                "",
+                "Second paragraph with usable signal.",
+            ]
+        )
+
+    def _fake_http_get(url: str, **_: Any) -> _FakeReaderResponse:
+        calls.append(url)
+        return _FakeReaderResponse()
+
+    def _firecrawl_should_not_run() -> None:
+        raise AssertionError("Firecrawl should not run when no extraction backend is configured")
+
+    try:
+        for key in env_keys:
+            os.environ.pop(key, None)
+        os.environ["HERMES_WEB_EXTRACT_JINA_FALLBACK"] = "1"
+
+        web_tools._load_web_config = lambda: {}
+        web_tools._is_tool_gateway_ready = lambda: False
+        web_tools._get_firecrawl_client = _firecrawl_should_not_run
+        web_tools.check_auxiliary_model = lambda: False
+        web_tools.check_website_access = lambda _url: None
+        web_tools.httpx.get = _fake_http_get
+
+        backend = web_tools._get_backend()
+        payload = json.loads(asyncio.run(web_tools.web_extract_tool(
+            ["https://example.com/hermes-clean-web"],
+            use_llm_processing=False,
+        )))
+        first = (payload.get("results") or [{}])[0]
+        checks = {
+            "search_provider_closed_without_api_keys": web_tools.check_web_api_key() is False,
+            "extract_available_without_api_keys": web_tools.check_web_extract_available() is True,
+            "jina_fallback_selected": web_tools._should_use_jina_reader(backend) is True,
+            "reader_called": calls == ["https://r.jina.ai/https://example.com/hermes-clean-web"],
+            "metadata_removed": "URL Source:" not in str(first.get("content") or ""),
+            "clean_content_returned": "clean markdown without provider API keys" in str(first.get("content") or ""),
+        }
+    except Exception as exc:
+        return _result(
+            "contract.clean_web_extract",
+            FAIL,
+            0,
+            15,
+            f"Clean web extraction fallback failed: {type(exc).__name__}: {exc}",
+            {"calls": calls},
+        )
+    finally:
+        for key, value in saved_env.items():
+            if value is None:
+                os.environ.pop(key, None)
+            else:
+                os.environ[key] = value
+        web_tools._load_web_config = saved_load_config
+        web_tools._is_tool_gateway_ready = saved_tool_gateway
+        web_tools._get_firecrawl_client = saved_firecrawl_client
+        web_tools.check_auxiliary_model = saved_auxiliary
+        web_tools.check_website_access = saved_policy
+        web_tools.httpx.get = saved_http_get
+
+    failed = {name: value for name, value in checks.items() if not value}
+    if failed:
+        return _result(
+            "contract.clean_web_extract",
+            FAIL,
+            0,
+            15,
+            "Clean web extraction fallback contract failed",
+            {"checks": checks, "failed": failed, "payload": payload, "calls": calls},
+        )
+    return _result(
+        "contract.clean_web_extract",
+        PASS,
+        15,
+        15,
+        "No-key clean web extraction is available through Jina Reader",
+        {"checks": checks, "backend": backend, "preview": first.get("content", "")[:200]},
     )
 
 
@@ -7255,6 +7372,7 @@ def run_canary_suite(options: CanaryOptions) -> CanaryReport:
         ("live.gateway_health", 15, lambda: _canary_gateway_health(options)),
         ("contract.command_registry", 10, _canary_command_registry),
         ("contract.x_scrape", 10, _canary_x_scrape_contract),
+        ("contract.clean_web_extract", 15, _canary_clean_web_extract_contract),
         ("contract.workspace_store", 10, _canary_workspace_store),
         ("contract.workflow_registry", 15, _canary_workflow_registry),
         ("contract.goal_workspace", 15, _canary_goal_workspace_contract),

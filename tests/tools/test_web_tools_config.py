@@ -305,6 +305,18 @@ class TestBackendSelection:
         with patch("tools.web_tools._load_web_config", return_value={"backend": "tavily"}):
             assert _get_backend() == "tavily"
 
+    def test_config_jina_reader(self):
+        """web.backend=jina selects the no-key clean reader extractor."""
+        from tools.web_tools import _get_backend
+        with patch("tools.web_tools._load_web_config", return_value={"backend": "jina"}):
+            assert _get_backend() == "jina"
+
+    def test_config_reader_alias(self):
+        """web.backend=reader is accepted as an alias for Jina Reader."""
+        from tools.web_tools import _get_backend
+        with patch("tools.web_tools._load_web_config", return_value={"backend": "reader"}):
+            assert _get_backend() == "jina"
+
     def test_config_tavily_overrides_env_keys(self):
         """web.backend=tavily in config → 'tavily' even if Firecrawl key set."""
         from tools.web_tools import _get_backend
@@ -474,6 +486,77 @@ class TestWebSearchErrorHandling:
         assert "exception_type" not in result
         assert "exception_chain" not in result
         assert "traceback" not in result
+
+
+class TestWebExtractReaderFallback:
+    """Regression coverage for API-light clean URL extraction."""
+
+    def setup_method(self):
+        for key in (
+            "EXA_API_KEY",
+            "PARALLEL_API_KEY",
+            "FIRECRAWL_API_KEY",
+            "FIRECRAWL_API_URL",
+            "FIRECRAWL_GATEWAY_URL",
+            "TOOL_GATEWAY_DOMAIN",
+            "TOOL_GATEWAY_SCHEME",
+            "TOOL_GATEWAY_USER_TOKEN",
+            "TAVILY_API_KEY",
+            "HERMES_WEB_EXTRACT_JINA_FALLBACK",
+            "HERMES_WEB_EXTRACT_STRICT_BACKEND",
+        ):
+            os.environ.pop(key, None)
+
+    @pytest.mark.asyncio
+    async def test_extract_uses_jina_reader_without_provider_keys(self):
+        import tools.web_tools
+
+        response = MagicMock()
+        response.status_code = 200
+        response.text = "\n".join(
+            [
+                "Title: Useful page",
+                "URL Source: https://example.com/research",
+                "",
+                "Markdown Content:",
+                "Clean page signal.",
+                "",
+                "Second paragraph.",
+            ]
+        )
+
+        with patch("tools.web_tools._load_web_config", return_value={}), \
+             patch("tools.web_tools._is_tool_gateway_ready", return_value=False), \
+             patch("tools.web_tools._get_firecrawl_client", side_effect=AssertionError("Firecrawl should not run")), \
+             patch("tools.web_tools.check_auxiliary_model", return_value=False), \
+             patch("tools.web_tools.check_website_access", return_value=None), \
+             patch("tools.interrupt.is_interrupted", return_value=False), \
+             patch("tools.web_tools.httpx.get", return_value=response) as mock_get:
+            result = json.loads(await tools.web_tools.web_extract_tool(
+                ["https://example.com/research"],
+                use_llm_processing=False,
+            ))
+
+        assert result["results"][0]["title"] == "Useful page"
+        assert result["results"][0]["content"] == "Clean page signal.\n\nSecond paragraph."
+        assert result["results"][0]["error"] is None
+        mock_get.assert_called_once()
+        assert mock_get.call_args.args[0] == "https://r.jina.ai/https://example.com/research"
+
+    def test_web_extract_available_without_provider_keys(self):
+        from tools.web_tools import check_web_api_key, check_web_extract_available
+
+        with patch("tools.web_tools._load_web_config", return_value={}), \
+             patch("tools.web_tools._is_tool_gateway_ready", return_value=False):
+            assert check_web_api_key() is False
+            assert check_web_extract_available() is True
+
+    def test_strict_backend_keeps_reader_fallback_closed(self):
+        from tools.web_tools import _should_use_jina_reader
+
+        with patch.dict(os.environ, {"HERMES_WEB_EXTRACT_STRICT_BACKEND": "1"}), \
+             patch("tools.web_tools._is_backend_available", return_value=False):
+            assert _should_use_jina_reader("firecrawl") is False
 
 
 class TestCheckWebApiKey:

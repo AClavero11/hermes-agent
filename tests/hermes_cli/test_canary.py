@@ -40,6 +40,7 @@ def test_canary_suite_runs_without_live_gateway(tmp_path):
     assert "runtime.model_routes" in names
     assert "contract.codex_worker" in names
     assert "contract.codex_worker_route_audit" in names
+    assert "contract.clean_web_extract" in names
     assert "contract.workspace_store" in names
     assert "contract.workflow_registry" in names
     assert "contract.goal_workspace" in names
@@ -520,6 +521,15 @@ def test_report_markdown_contains_metrics_tables(tmp_path):
     assert payload["effective_max_score"] == report.effective_max_score
     assert payload["readiness"]["total"] >= 8
     assert any(result.status == PASS for result in report.results)
+
+
+def test_clean_web_extract_contract_passes_without_api_tokens():
+    result = canary_module._canary_clean_web_extract_contract()
+
+    assert result.status == PASS
+    assert result.details["checks"]["search_provider_closed_without_api_keys"] is True
+    assert result.details["checks"]["extract_available_without_api_keys"] is True
+    assert "clean markdown without provider API keys" in result.details["preview"]
 
 
 def test_codex_worker_route_audit_canary_passes_without_api_tokens(tmp_path):

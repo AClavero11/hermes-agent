@@ -47,7 +47,6 @@ import re
 import asyncio
 from typing import List, Dict, Any, Optional
 import httpx
-from firecrawl import Firecrawl
 from agent.auxiliary_client import (
     async_call_llm,
     extract_content_or_reasoning,
@@ -62,8 +61,16 @@ from tools.managed_tool_gateway import (
 from tools.tool_backend_helpers import managed_nous_tools_enabled, prefers_gateway
 from tools.url_safety import is_safe_url
 from tools.website_policy import check_website_access
+from tools.registry import registry, tool_error
 
 logger = logging.getLogger(__name__)
+
+try:
+    from firecrawl import Firecrawl
+    _FIRECRAWL_IMPORT_ERROR: Exception | None = None
+except Exception as exc:
+    Firecrawl = None  # type: ignore[assignment]
+    _FIRECRAWL_IMPORT_ERROR = exc
 
 
 # ─── Backend Selection ────────────────────────────────────────────────────────
@@ -88,7 +95,9 @@ def _get_backend() -> str:
     keys manually without running setup.
     """
     configured = (_load_web_config().get("backend") or "").lower().strip()
-    if configured in ("parallel", "firecrawl", "tavily", "exa"):
+    if configured in ("parallel", "firecrawl", "tavily", "exa", "jina", "reader"):
+        if configured == "reader":
+            return "jina"
         return configured
 
     # Fallback for manual / legacy config — pick the highest-priority
@@ -104,11 +113,13 @@ def _get_backend() -> str:
         if available:
             return backend
 
-    return "firecrawl"  # default (backward compat)
+    return "firecrawl"  # default (backward compat; extraction may fall back to Jina Reader)
 
 
 def _is_backend_available(backend: str) -> bool:
     """Return True when the selected backend is currently usable."""
+    if backend in ("jina", "reader"):
+        return _jina_reader_enabled()
     if backend == "exa":
         return _has_env("EXA_API_KEY")
     if backend == "parallel":
@@ -118,6 +129,159 @@ def _is_backend_available(backend: str) -> bool:
     if backend == "tavily":
         return _has_env("TAVILY_API_KEY")
     return False
+
+
+# ─── No-Key Clean Reader Fallback ────────────────────────────────────────────
+
+JINA_READER_ORIGIN = os.getenv("JINA_READER_ORIGIN", "https://r.jina.ai").rstrip("/")
+JINA_READER_TIMEOUT = float(os.getenv("JINA_READER_TIMEOUT", "20") or 20)
+JINA_READER_MAX_CHARS = int(os.getenv("JINA_READER_MAX_CHARS", "60000") or 60000)
+
+
+def _env_truthy(name: str, default: str = "1") -> bool:
+    value = os.getenv(name, default).strip().lower()
+    return value not in {"0", "false", "no", "off"}
+
+
+def _jina_reader_enabled() -> bool:
+    """Return True when the no-key clean-reader fallback is allowed."""
+    return _env_truthy("HERMES_WEB_EXTRACT_JINA_FALLBACK", "1")
+
+
+def _strict_web_backend_enabled() -> bool:
+    """Return True when extraction must fail instead of falling back."""
+    return _env_truthy("HERMES_WEB_EXTRACT_STRICT_BACKEND", "0")
+
+
+def _should_use_jina_reader(backend: str) -> bool:
+    """Use Jina Reader when selected or when the configured extract backend is absent."""
+    normalized = (backend or "").lower().strip()
+    if normalized in {"jina", "reader"}:
+        return _jina_reader_enabled()
+    if _strict_web_backend_enabled() or not _jina_reader_enabled():
+        return False
+    return not _is_backend_available(normalized)
+
+
+def _jina_reader_url(url: str) -> str:
+    """Build the Jina Reader URL for a target page."""
+    return f"{JINA_READER_ORIGIN}/{url}"
+
+
+def _title_from_jina_reader_markdown(raw: str, fallback_url: str) -> str:
+    """Extract a page title from Jina Reader markdown."""
+    for line in raw.splitlines():
+        stripped = line.strip()
+        if stripped.lower().startswith("title:"):
+            return stripped.split(":", 1)[1].strip()
+        if stripped.startswith("# "):
+            return stripped.lstrip("#").strip()
+    return fallback_url
+
+
+def _clean_jina_reader_markdown(raw: str) -> str:
+    """Trim reader metadata/chrome while preserving clean markdown content."""
+    cleaned_lines: list[str] = []
+    skip_prefixes = (
+        "Title:",
+        "URL Source:",
+        "Markdown Content:",
+        "Warning:",
+        "Published Time:",
+    )
+    for line in str(raw or "").splitlines():
+        stripped = line.strip()
+        if not stripped:
+            if cleaned_lines and cleaned_lines[-1] != "":
+                cleaned_lines.append("")
+            continue
+        if any(stripped.startswith(prefix) for prefix in skip_prefixes):
+            continue
+        cleaned_lines.append(line)
+
+    content = "\n".join(cleaned_lines).strip()
+    content = re.sub(r"!\[[^\]]*]\(data:image/[^)]+\)", "[BASE64_IMAGE_REMOVED]", content)
+    content = re.sub(r"\n{3,}", "\n\n", content)
+    if len(content) > JINA_READER_MAX_CHARS:
+        content = (
+            content[:JINA_READER_MAX_CHARS]
+            + f"\n\n[Reader content truncated at {JINA_READER_MAX_CHARS:,} chars.]"
+        )
+    return content
+
+
+async def _jina_reader_extract(urls: List[str]) -> List[Dict[str, Any]]:
+    """Extract clean markdown via Jina Reader without provider API keys."""
+    from tools.interrupt import is_interrupted
+
+    results: List[Dict[str, Any]] = []
+    for url in urls:
+        if is_interrupted():
+            results.append({"url": url, "error": "Interrupted", "title": ""})
+            continue
+
+        blocked = check_website_access(url)
+        if blocked:
+            logger.info("Blocked Jina reader extract for %s by rule %s", blocked["host"], blocked["rule"])
+            results.append({
+                "url": url,
+                "title": "",
+                "content": "",
+                "raw_content": "",
+                "error": blocked["message"],
+                "blocked_by_policy": {
+                    "host": blocked["host"],
+                    "rule": blocked["rule"],
+                    "source": blocked["source"],
+                },
+            })
+            continue
+
+        try:
+            reader_url = _jina_reader_url(url)
+            response = await asyncio.to_thread(
+                httpx.get,
+                reader_url,
+                headers={"Accept": "text/markdown", "X-No-Cache": "true"},
+                timeout=JINA_READER_TIMEOUT,
+                follow_redirects=True,
+            )
+            if response.status_code >= 400:
+                results.append({
+                    "url": url,
+                    "title": "",
+                    "content": "",
+                    "raw_content": "",
+                    "error": f"Jina Reader returned HTTP {response.status_code}",
+                    "metadata": {"sourceURL": url, "extractor": "jina_reader"},
+                })
+                continue
+
+            raw = response.text or ""
+            content = _clean_jina_reader_markdown(raw)
+            results.append({
+                "url": url,
+                "title": _title_from_jina_reader_markdown(raw, url),
+                "content": content,
+                "raw_content": content,
+                "metadata": {
+                    "sourceURL": url,
+                    "extractor": "jina_reader",
+                    "api_key_required": False,
+                },
+            })
+        except Exception as exc:
+            logger.debug("Jina reader extraction failed for %s: %s", url, exc)
+            results.append({
+                "url": url,
+                "title": "",
+                "content": "",
+                "raw_content": "",
+                "error": f"Jina Reader extraction failed: {exc}",
+                "metadata": {"sourceURL": url, "extractor": "jina_reader"},
+            })
+
+    return results
 
 # ─── Firecrawl Client ────────────────────────────────────────────────────────
 
@@ -235,6 +399,9 @@ def _get_firecrawl_client():
 
     if _firecrawl_client is not None and _firecrawl_client_config == client_config:
         return _firecrawl_client
+
+    if Firecrawl is None:
+        raise ValueError(f"Firecrawl package unavailable: {_FIRECRAWL_IMPORT_ERROR}")
 
     _firecrawl_client = Firecrawl(**kwargs)
     _firecrawl_client_config = client_config
@@ -1241,7 +1408,11 @@ async def web_extract_tool(
         else:
             backend = _get_backend()
 
-            if backend == "parallel":
+            if _should_use_jina_reader(backend):
+                logger.info("Using Jina Reader web extraction fallback for %d URL(s)", len(safe_urls))
+                results = await _jina_reader_extract(safe_urls)
+                debug_call_data["processing_applied"].append("jina_reader_fallback")
+            elif backend == "parallel":
                 results = await _parallel_extract(safe_urls)
             elif backend == "exa":
                 results = _exa_extract(safe_urls)
@@ -1927,6 +2098,11 @@ def check_web_api_key() -> bool:
     return any(_is_backend_available(backend) for backend in ("exa", "parallel", "firecrawl", "tavily"))
 
 
+def check_web_extract_available() -> bool:
+    """Check whether URL extraction can run with a provider or no-key reader fallback."""
+    return check_web_api_key() or _jina_reader_enabled()
+
+
 def check_auxiliary_model() -> bool:
     """Check if an auxiliary text model is available for LLM content processing."""
     client, _, _ = _resolve_web_extract_auxiliary()
@@ -2043,8 +2219,6 @@ if __name__ == "__main__":
 # ---------------------------------------------------------------------------
 # Registry
 # ---------------------------------------------------------------------------
-from tools.registry import registry, tool_error
-
 WEB_SEARCH_SCHEMA = {
     "name": "web_search",
     "description": "Search the web for information on any topic. Returns up to 5 relevant results with titles, URLs, and descriptions.",
@@ -2062,7 +2236,7 @@ WEB_SEARCH_SCHEMA = {
 
 WEB_EXTRACT_SCHEMA = {
     "name": "web_extract",
-    "description": "Extract content from web page URLs. Returns page content in markdown format. Also works with PDF URLs (arxiv papers, documents, etc.) — pass the PDF link directly and it converts to markdown text. Pages under 5000 chars return full markdown; larger pages are LLM-summarized and capped at ~5000 chars per page. Pages over 2M chars are refused. If a URL fails or times out, use the browser tool to access it instead.",
+    "description": "Extract clean markdown from web page URLs. Uses configured providers when available, otherwise falls back to no-key Jina Reader extraction for API-light clean web data. Also works with PDF URLs (arxiv papers, documents, etc.) when the active extractor supports them. Pages under 5000 chars return full markdown; larger pages are LLM-summarized only when an auxiliary model is available. Pages over 2M chars are refused. If a URL fails or needs interaction/login, use the browser tool instead.",
     "parameters": {
         "type": "object",
         "properties": {
@@ -2093,7 +2267,7 @@ registry.register(
     schema=WEB_EXTRACT_SCHEMA,
     handler=lambda args, **kw: web_extract_tool(
         args.get("urls", [])[:5] if isinstance(args.get("urls"), list) else [], "markdown"),
-    check_fn=check_web_api_key,
+    check_fn=check_web_extract_available,
     requires_env=_web_requires_env(),
     is_async=True,
     emoji="📄",
