@@ -3540,6 +3540,94 @@ def _canary_scorecard_trend(options: CanaryOptions) -> CanaryResult:
     )
 
 
+def _canary_brain_retrieval(options: CanaryOptions) -> CanaryResult:
+    from gateway import context_router
+
+    max_age_days = float(os.getenv("HERMES_BRAIN_INDEX_MAX_AGE_DAYS", "14") or 14)
+    health = context_router.brain_retrieval_health(max_age_days=max_age_days)
+    failed: dict[str, Any] = {}
+    warned: dict[str, Any] = {}
+    passed: list[str] = []
+
+    if health.get("missing_commands"):
+        failed["commands"] = {"missing": health["missing_commands"], "commands": health.get("commands")}
+    else:
+        passed.append("commands")
+
+    if not health.get("lsh_first"):
+        failed["routing_order"] = {"retrieval_order": health.get("retrieval_order")}
+    else:
+        passed.append("lsh_first")
+
+    if health.get("qmd_expansion_default"):
+        failed["qmd_mode"] = {
+            "qmd_mode": health.get("qmd_mode"),
+            "qmd_command": health.get("qmd_command"),
+        }
+    else:
+        passed.append("qmd_non_expanding_default")
+
+    stale_indexes = list(health.get("stale_indexes") or [])
+    if stale_indexes:
+        warned["stale_indexes"] = {
+            "stale": stale_indexes,
+            "max_age_days": max_age_days,
+            "indexes": health.get("indexes"),
+        }
+    else:
+        passed.append("fresh_indexes")
+
+    context = context_router.collect_alexandria_context(
+        "Look in Alexandria for Hermes Studio status and current architecture.",
+        qmd_timeout=min(options.timeout, 5.0),
+        alex_timeout=min(options.timeout, 8.0),
+        v11_timeout=min(options.timeout, 8.0),
+    )
+    if not context.get("retrieval_succeeded"):
+        failed["live_retrieval"] = {
+            "errors": context.get("errors"),
+            "retrieval_plan": context.get("retrieval_plan"),
+        }
+    else:
+        passed.append("live_retrieval")
+
+    source_paths = list(context.get("source_paths") or [])
+    if not source_paths:
+        warned["source_paths"] = "live retrieval returned output but no source paths"
+    else:
+        passed.append("source_paths")
+
+    if failed:
+        status = FAIL
+    elif warned:
+        status = WARN
+    else:
+        status = PASS
+    total_checks = 6
+    passed_count = len(passed)
+    if failed:
+        score = max(0.0, round(20.0 * passed_count / total_checks, 1) - 6.0)
+    elif warned:
+        score = round(20.0 * passed_count / total_checks, 1)
+    else:
+        score = 20.0
+    return _result(
+        "contract.brain_retrieval",
+        status,
+        score,
+        20,
+        f"{passed_count}/{total_checks} LSH/QMD brain retrieval checks passed",
+        {
+            "passed": passed,
+            "failed": failed,
+            "warned": warned,
+            "health": health,
+            "source_paths": source_paths[:10],
+            "retrieval_plan": context.get("retrieval_plan"),
+        },
+    )
+
+
 def _canary_aac_workflow_goldens(options: CanaryOptions) -> CanaryResult:
     from gateway import context_router
     from hermes_cli.workspace import WorkspaceStore
@@ -5714,6 +5802,7 @@ def run_canary_suite(options: CanaryOptions) -> CanaryReport:
         ("contract.auto_think_candidate_schema", 15, lambda: _canary_auto_think_candidate_schema(options)),
         ("live.x_scrape", 10, lambda: _canary_live_x_scrape(options)),
         ("contract.scorecard_trend", 10, lambda: _canary_scorecard_trend(options)),
+        ("contract.brain_retrieval", 20, lambda: _canary_brain_retrieval(options)),
         ("contract.aac_workflows", 15, lambda: _canary_aac_workflow_goldens(options)),
         ("contract.memory_grounding", 20, lambda: _canary_memory_grounding(options)),
         ("contract.business_os_brief", 20, lambda: _canary_business_os_brief(options)),

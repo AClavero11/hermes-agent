@@ -8,9 +8,11 @@ import json
 import logging
 import os
 import re
+import shutil
 import subprocess
+import time
 from pathlib import Path
-from typing import List
+from typing import Any, List
 
 
 logger = logging.getLogger(__name__)
@@ -133,6 +135,7 @@ PART_NUMBER_RE = re.compile(
 
 URL_RE = re.compile(r"https?://\S+", re.IGNORECASE)
 HEALTH_PROBE_RE = re.compile(r"^(?:ping|pong|status\??|health\??|healthy|ok\??|okay\??)$", re.IGNORECASE)
+DEFAULT_BRAIN_INDEX_MAX_AGE_DAYS = 14.0
 
 
 _ALEXANDRIA_CONTEXT_TERMS = CONTEXT_TERMS
@@ -385,6 +388,82 @@ def _run_retrieval_step(label: str, args: List[str], timeout: float, errors: Lis
     return ""
 
 
+def _brain_qmd_mode() -> str:
+    value = os.getenv("HERMES_BRAIN_QMD_MODE", "support").strip().lower()
+    if value in {"0", "false", "no", "off", "disabled"}:
+        return "off"
+    if value in {"expand", "expanded", "deep"}:
+        return "expand"
+    return "support"
+
+
+def _qmd_context_command(query: str) -> tuple[str, List[str]]:
+    mode = _brain_qmd_mode()
+    if mode == "off":
+        return "", []
+    if mode == "expand":
+        return "qmd-expanded", ["qmd", "query", query, "-n", "4", "--json"]
+    return "qmd-search", ["qmd", "search", query, "-n", "4", "--json"]
+
+
+def _index_age_days(path: Path, *, now: float | None = None) -> float | None:
+    try:
+        stat = path.expanduser().stat()
+    except OSError:
+        return None
+    timestamp = time.time() if now is None else now
+    return max(0.0, (timestamp - stat.st_mtime) / 86400.0)
+
+
+def brain_retrieval_health(
+    *,
+    now: float | None = None,
+    max_age_days: float = DEFAULT_BRAIN_INDEX_MAX_AGE_DAYS,
+    index_paths: dict[str, Path] | None = None,
+) -> dict[str, Any]:
+    """Return deterministic health for the local Hermes brain retrieval layer."""
+    env = _alexandria_context_env()
+    path_env = env.get("PATH", "")
+    indexes = index_paths or {
+        "alexandria_lsh": Path.home() / ".alexandria_lsh_index.msgpack",
+        "v11_lsh": Path.home() / ".v11_lsh_index.msgpack",
+        "qmd": Path.home() / ".cache" / "qmd" / "index.sqlite",
+    }
+    commands = {
+        "alex-search": shutil.which("alex-search", path=path_env),
+        "v11-search": shutil.which("v11-search", path=path_env),
+        "qmd": shutil.which("qmd", path=path_env),
+    }
+    index_status: dict[str, dict[str, Any]] = {}
+    for name, path in indexes.items():
+        age = _index_age_days(Path(path), now=now)
+        index_status[name] = {
+            "path": str(path),
+            "present": age is not None,
+            "age_days": round(age, 2) if age is not None else None,
+            "fresh": age is not None and age <= max_age_days,
+        }
+    qmd_label, qmd_command = _qmd_context_command("health")
+    retrieval_order = ["alex-search"]
+    if qmd_command:
+        retrieval_order.append(qmd_label)
+    retrieval_order.append("v11-search")
+    missing_commands = sorted(name for name, path in commands.items() if not path)
+    stale_indexes = sorted(name for name, status in index_status.items() if not status["fresh"])
+    return {
+        "commands": commands,
+        "missing_commands": missing_commands,
+        "indexes": index_status,
+        "stale_indexes": stale_indexes,
+        "max_age_days": max_age_days,
+        "qmd_mode": _brain_qmd_mode(),
+        "qmd_command": qmd_command,
+        "retrieval_order": retrieval_order,
+        "lsh_first": bool(retrieval_order and retrieval_order[0] == "alex-search"),
+        "qmd_expansion_default": bool(qmd_command and len(qmd_command) > 1 and qmd_command[1] == "query"),
+    }
+
+
 def _unique_paths(paths: List[str]) -> List[str]:
     unique: List[str] = []
     seen = set()
@@ -400,8 +479,8 @@ def _unique_paths(paths: List[str]) -> List[str]:
 def collect_alexandria_context(
     message: str,
     *,
-    qmd_timeout: float = 12.0,
-    alex_timeout: float = 14.0,
+    qmd_timeout: float = 5.0,
+    alex_timeout: float = 8.0,
     v11_timeout: float = 14.0,
 ) -> dict:
     """Collect Alexandria/V11 source context and return a prompt-ready block."""
@@ -410,6 +489,7 @@ def collect_alexandria_context(
         "source_paths": [],
         "retrieval_succeeded": False,
         "errors": [],
+        "retrieval_plan": {},
     }
     if not _message_requests_alexandria_context(message):
         return result
@@ -420,26 +500,31 @@ def collect_alexandria_context(
     errors: List[str] = []
     raw_search_outputs: List[str] = []
     search_outputs: List[tuple[str, str, int]] = []
+    retrieval_order: List[str] = []
 
-    qmd_output = _run_retrieval_step(
-        "qmd semantic search",
-        ["qmd", "query", query, "-n", "4"],
-        qmd_timeout,
+    alex_output = _run_retrieval_step(
+        "alex-search",
+        ["alex-search", query, "-n", "5", "--format", "json"],
+        alex_timeout,
         errors,
     )
-    if qmd_output:
-        raw_search_outputs.append(qmd_output)
-        search_outputs.append(("QMD semantic search", qmd_output, 6000))
-    else:
-        alex_output = _run_retrieval_step(
-            "alex-search",
-            ["alex-search", query, "-n", "5", "--format", "json"],
-            alex_timeout,
+    retrieval_order.append("alex-search")
+    if alex_output:
+        raw_search_outputs.append(alex_output)
+        search_outputs.append(("Alexandria LSH search", alex_output, 5000))
+
+    qmd_label, qmd_args = _qmd_context_command(query)
+    if qmd_args:
+        qmd_output = _run_retrieval_step(
+            qmd_label,
+            qmd_args,
+            qmd_timeout,
             errors,
         )
-        if alex_output:
-            raw_search_outputs.append(alex_output)
-            search_outputs.append(("Alexandria LSH search", alex_output, 5000))
+        retrieval_order.append(qmd_label)
+        if qmd_output:
+            raw_search_outputs.append(qmd_output)
+            search_outputs.append(("QMD semantic search (non-expanding)", qmd_output, 5000))
 
     if any(term in lowered for term in V11_TERMS) or PART_NUMBER_RE.search(routing_text):
         v11_output = _run_retrieval_step(
@@ -448,6 +533,7 @@ def collect_alexandria_context(
             v11_timeout,
             errors,
         )
+        retrieval_order.append("v11-search")
         if v11_output:
             raw_search_outputs.append(v11_output)
             search_outputs.append(("V11 search", v11_output, 4000))
@@ -507,6 +593,12 @@ def collect_alexandria_context(
     result["source_paths"] = source_paths
     result["retrieval_succeeded"] = retrieval_succeeded
     result["errors"] = errors
+    result["retrieval_plan"] = {
+        "order": retrieval_order,
+        "qmd_mode": _brain_qmd_mode(),
+        "qmd_expansion_default": _brain_qmd_mode() == "expand",
+        "verification": "source snippets are read from resolved Alexandria paths before action",
+    }
     return result
 
 

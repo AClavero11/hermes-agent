@@ -51,6 +51,68 @@ def test_collect_alexandria_context_returns_source_paths(monkeypatch):
     assert "advanced/pricing/CONTEXT.md" in result["source_paths"]
 
 
+def test_collect_alexandria_context_uses_lsh_before_non_expanding_qmd(monkeypatch):
+    calls = []
+
+    def _fake_run(args, timeout=20.0):
+        calls.append(args)
+        if args[0] == "alex-search":
+            return json.dumps({"results": [{"rel_path": "advanced/czar/CONTEXT.md"}]})
+        if args[0] == "qmd":
+            return "qmd://alexandria/advanced/operations/CONTEXT.md:1\nHermes operations"
+        return ""
+
+    monkeypatch.delenv("HERMES_BRAIN_QMD_MODE", raising=False)
+    monkeypatch.setattr(context_router, "_run_alexandria_context_command", _fake_run)
+    monkeypatch.setattr(context_router, "_read_alexandria_source_snippets", lambda paths: "")
+    monkeypatch.setattr(
+        context_router,
+        "_read_hermes_release_context_snippet",
+        lambda message, max_chars=5000: "",
+    )
+
+    result = context_router.collect_alexandria_context("look in Alexandria for Hermes")
+
+    assert calls[0][0] == "alex-search"
+    assert calls[1][:2] == ["qmd", "search"]
+    assert ["qmd", "query"] not in [call[:2] for call in calls]
+    assert result["retrieval_plan"]["order"][:2] == ["alex-search", "qmd-search"]
+    assert result["retrieval_plan"]["qmd_expansion_default"] is False
+    assert "advanced/czar/CONTEXT.md" in result["source_paths"]
+    assert "advanced/operations/CONTEXT.md" in result["source_paths"]
+
+
+def test_brain_retrieval_health_reports_freshness_and_order(monkeypatch, tmp_path):
+    now = 1_700_000_000.0
+    fresh_index = tmp_path / "fresh.msgpack"
+    stale_index = tmp_path / "stale.msgpack"
+    fresh_index.write_text("fresh", encoding="utf-8")
+    stale_index.write_text("stale", encoding="utf-8")
+    monkeypatch.setattr(context_router.shutil, "which", lambda name, path=None: f"/bin/{name}")
+    monkeypatch.delenv("HERMES_BRAIN_QMD_MODE", raising=False)
+    old_time = now - 30 * 86400
+    fresh_time = now - 2 * 86400
+    import os
+
+    os.utime(fresh_index, (fresh_time, fresh_time))
+    os.utime(stale_index, (old_time, old_time))
+
+    health = context_router.brain_retrieval_health(
+        now=now,
+        max_age_days=14,
+        index_paths={
+            "alexandria_lsh": fresh_index,
+            "v11_lsh": fresh_index,
+            "qmd": stale_index,
+        },
+    )
+
+    assert health["retrieval_order"] == ["alex-search", "qmd-search", "v11-search"]
+    assert health["lsh_first"] is True
+    assert health["qmd_expansion_default"] is False
+    assert health["stale_indexes"] == ["qmd"]
+
+
 def test_collect_alexandria_context_retrieval_succeeded_flag(monkeypatch):
     monkeypatch.setattr(context_router, "_read_alexandria_source_snippets", lambda paths: "")
     monkeypatch.setattr(
